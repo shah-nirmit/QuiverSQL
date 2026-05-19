@@ -1,0 +1,7 @@
+id,name,department_id,role,salary,location
+1,Alice Rao,10,Data Engineer,98000,New York
+2,Bob Chen,20,Account Executive,72000,Chicago
+3,Carla Mendes,10,Analytics Engineer,91000,Austin
+4,Dev Patel,30,Marketing Manager,83000,San Francisco
+5,Emma Brooks,40,People Partner,76000,Chicago
+6,Finn Morgan,10,Platform Engineer,105000,Seattle

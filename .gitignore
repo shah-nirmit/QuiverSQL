@@ -1,0 +1,20 @@
+# Node / VS Code extension
+/qsql-vscode/node_modules/
+/qsql-vscode/out/
+/qsql-vscode/.vscode-test/
+*.vsix
+
+# Rust
+/qsql-workspace/target/
+
+# Local editor and OS state
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs and local environment
+*.log
+.env
+.env.*
+!.env.example

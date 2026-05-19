@@ -1,0 +1,4 @@
+{"id":10,"name":"Engineering","budget":1250000.0,"office":"New York"}
+{"id":20,"name":"Sales","budget":520000.0,"office":"Chicago"}
+{"id":30,"name":"Marketing","budget":410000.0,"office":"San Francisco"}
+{"id":40,"name":"People","budget":260000.0,"office":"Chicago"}

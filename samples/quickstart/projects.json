@@ -1,0 +1,4 @@
+{"project_id":1001,"department_id":10,"project_name":"Atlas","status":"active","priority":1}
+{"project_id":1002,"department_id":10,"project_name":"Beacon","status":"planning","priority":2}
+{"project_id":2001,"department_id":20,"project_name":"Compass","status":"active","priority":2}
+{"project_id":3001,"department_id":30,"project_name":"Launchpad","status":"paused","priority":3}

@@ -1,0 +1,133 @@
+{
+  "name": "qsql-vscode",
+  "displayName": "QuiverSQL Developer Tools",
+  "description": "Developer-first, Arrow-native query virtualization layer for VS Code",
+  "version": "0.1.0-alpha.0",
+  "license": "Apache-2.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "qsql.pingDaemon",
+        "title": "QuiverSQL: Ping Daemon"
+      },
+      {
+        "command": "qsql.executeQueryUI",
+        "title": "QuiverSQL: Execute Query",
+        "icon": "$(play)"
+      },
+      {
+        "command": "qsql.attachFile",
+        "title": "QuiverSQL: Attach File as Table"
+      },
+      {
+        "command": "qsql.attachSQLite",
+        "title": "QuiverSQL: Attach SQLite Table"
+      },
+      {
+        "command": "qsql.connectWizard",
+        "title": "QuiverSQL: Connect Data Source",
+        "icon": "$(add)"
+      },
+      {
+        "command": "qsql.visualizePlan",
+        "title": "QuiverSQL: Explain Plan",
+        "icon": "$(search)"
+      },
+      {
+        "command": "qsql.showVersion",
+        "title": "QuiverSQL: Show Version"
+      }
+    ],
+    "configuration": {
+      "title": "QuiverSQL",
+      "properties": {
+        "qsql.daemonPath": {
+          "type": "string",
+          "default": "",
+          "description": "Absolute path to the qsql-daemon binary. When empty, QuiverSQL tries a bundled binary and then the local debug build."
+        }
+      }
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "qsql.connectWizard",
+          "when": "view == qsqlDataSources",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "qsql.executeQueryUI",
+          "when": "resourceLangId == sql",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "qsql.executeQueryUI",
+          "when": "resourceLangId == sql",
+          "group": "1_modification"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "qsql.executeQueryUI",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == sql"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "qsql-explorer",
+          "title": "QuiverSQL Explorer",
+          "icon": "media/qsql-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "qsql-explorer": [
+        {
+          "id": "qsqlDataSources",
+          "name": "Data Sources",
+          "type": "tree"
+        },
+        {
+          "id": "qsqlLineage",
+          "name": "Query Lineage",
+          "type": "tree"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "typecheck": "tsc -p ./ --noEmit",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts",
+    "test:scanner": "npm run compile && node out/test/detectQueries.test.js"
+  },
+  "devDependencies": {
+    "@types/vscode": "1.120.0",
+    "@types/node": "18.19.130",
+    "typescript": "5.9.3",
+    "@typescript-eslint/eslint-plugin": "7.18.0",
+    "@typescript-eslint/parser": "7.18.0",
+    "eslint": "8.57.1"
+  }
+}

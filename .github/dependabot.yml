@@ -1,0 +1,14 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /qsql-workspace
+    schedule:
+      interval: weekly
+  - package-ecosystem: npm
+    directory: /qsql-vscode
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

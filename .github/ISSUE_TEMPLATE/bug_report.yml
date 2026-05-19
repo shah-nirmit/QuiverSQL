@@ -1,0 +1,42 @@
+name: Bug Report
+description: Report a reproducible QuiverSQL problem.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve QuiverSQL.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps To Reproduce
+      description: Include sample data shape or SQL where possible.
+      placeholder: |
+        1. Attach ...
+        2. Run ...
+        3. See ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Commit Or Version
+      placeholder: commit hash or version
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: OS, VS Code version, Rust version, Node version

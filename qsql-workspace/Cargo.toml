@@ -1,0 +1,14 @@
+[workspace]
+members = [
+    "qsql-core",
+    "qsql-daemon",
+    "qsql-connectors"
+]
+resolver = "2"
+
+[profile.dev]
+# Disable debug info generation to massively speed up linking for large crates like DataFusion
+debug = 0
+# Minimal optimization to speed up proc-macro execution
+opt-level = 1
+
