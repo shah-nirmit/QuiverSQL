@@ -1,3 +1,4 @@
+use dql_connectors::sqlite::SqliteTableProvider;
 use dql_core::{init_core, DqlEngine};
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
@@ -93,6 +94,29 @@ async fn handle_request(req: RpcRequest, engine: Arc<DqlEngine>) -> RpcResponse 
                 }
             } else {
                 Err("Missing params for register_file".to_string())
+            }
+        },
+        "register_sqlite" => {
+            if let Some(params) = req.params {
+                let db_path = params.get("db_path").and_then(|v| v.as_str()).unwrap_or("");
+                let table_name = params.get("table_name").and_then(|v| v.as_str()).unwrap_or("");
+                let alias = params.get("alias").and_then(|v| v.as_str()).unwrap_or(table_name);
+
+                if db_path.is_empty() || table_name.is_empty() {
+                    Err("Missing db_path or table_name".to_string())
+                } else {
+                    match SqliteTableProvider::try_new(db_path, table_name) {
+                        Ok(provider) => {
+                            match engine.register_table(alias, Arc::new(provider)) {
+                                Ok(msg) => Ok(serde_json::Value::String(msg)),
+                                Err(e) => Err(e),
+                            }
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            } else {
+                Err("Missing params for register_sqlite".to_string())
             }
         },
         _ => Err("Method not found".to_string()),

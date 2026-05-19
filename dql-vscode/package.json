@@ -27,9 +27,25 @@
       {
         "command": "dql.attachFile",
         "title": "DQL: Attach File as Table"
+      },
+      {
+        "command": "dql.attachSQLite",
+        "title": "DQL: Attach SQLite Table"
+      },
+      {
+        "command": "dql.connectWizard",
+        "title": "DQL: Connect Data Source",
+        "icon": "$(add)"
       }
     ],
     "menus": {
+      "view/title": [
+        {
+          "command": "dql.connectWizard",
+          "when": "view == dqlDataSources",
+          "group": "navigation"
+        }
+      ],
       "editor/title": [
         {
           "command": "dql.executeQueryUI",
@@ -52,7 +68,25 @@
         "mac": "cmd+enter",
         "when": "editorTextFocus && editorLangId == sql"
       }
-    ]
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "dql-explorer",
+          "title": "DQL Explorer",
+          "icon": "media/dql-icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "dql-explorer": [
+        {
+          "id": "dqlDataSources",
+          "name": "Data Sources",
+          "type": "tree"
+        }
+      ]
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

@@ -74,4 +74,18 @@ impl DqlEngine {
         }
         Ok(format!("Successfully registered '{}' as a virtual table.", table_name))
     }
+
+    /// Registers any DataFusion `TableProvider` under a given name.
+    /// Used by `dql-connectors` to inject remote sources (SQLite, Postgres, etc.)
+    /// into the shared DataFusion session without creating a circular dependency.
+    pub fn register_table(
+        &self,
+        table_name: &str,
+        provider: std::sync::Arc<dyn datafusion::datasource::TableProvider>,
+    ) -> Result<String, String> {
+        self.ctx
+            .register_table(table_name, provider)
+            .map_err(|e| format!("Failed to register table '{}': {}", table_name, e))?;
+        Ok(format!("Successfully registered '{}' as a federated table.", table_name))
+    }
 }

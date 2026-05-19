@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="none">
+  <!-- Database cylinder body -->
+  <ellipse cx="8" cy="4.5" rx="5.5" ry="1.8" stroke="currentColor" stroke-width="1.4"/>
+  <line x1="2.5" y1="4.5" x2="2.5" y2="11.5" stroke="currentColor" stroke-width="1.4"/>
+  <line x1="13.5" y1="4.5" x2="13.5" y2="11.5" stroke="currentColor" stroke-width="1.4"/>
+  <ellipse cx="8" cy="11.5" rx="5.5" ry="1.8" stroke="currentColor" stroke-width="1.4"/>
+  <!-- Middle stripe to suggest layers -->
+  <path d="M2.5 8 C2.5 8.99 4.97 9.8 8 9.8 C11.03 9.8 13.5 8.99 13.5 8" stroke="currentColor" stroke-width="1.1" fill="none"/>
+</svg>
