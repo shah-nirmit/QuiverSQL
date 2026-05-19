@@ -1,0 +1,45 @@
+{
+  "name": "dql-vscode",
+  "displayName": "DQL Developer Tools",
+  "description": "Developer-first, Arrow-native query virtualization layer for VS Code",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "dql.pingDaemon",
+        "title": "DQL: Ping Daemon"
+      },
+      {
+        "command": "dql.executeQuery",
+        "title": "DQL: Execute Query"
+      },
+      {
+        "command": "dql.attachFile",
+        "title": "DQL: Attach File as Table"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "18.x",
+    "typescript": "^5.3.3",
+    "@typescript-eslint/eslint-plugin": "^7.1.1",
+    "@typescript-eslint/parser": "^7.1.1",
+    "eslint": "^8.57.0"
+  }
+}
