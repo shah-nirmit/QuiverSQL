@@ -29,6 +29,29 @@ impl DqlEngine {
         Ok(formatted)
     }
 
+    /// Executes a SQL query and returns the result as a JSON string.
+    pub async fn execute_sql_to_json(&self, sql: &str) -> Result<serde_json::Value, String> {
+        let df = self.ctx.sql(sql).await.map_err(|e| e.to_string())?;
+        let batches = df.collect().await.map_err(|e| e.to_string())?;
+        
+        if batches.is_empty() {
+            return Ok(serde_json::json!([]));
+        }
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+            for batch in &batches {
+                writer.write(batch).map_err(|e| e.to_string())?;
+            }
+            writer.finish().map_err(|e| e.to_string())?;
+        }
+
+        let json_str = String::from_utf8(buf).map_err(|e| e.to_string())?;
+        let val: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
+        Ok(val)
+    }
+
     /// Registers a local file as a virtual table in the DataFusion context.
     pub async fn register_file(&self, table_name: &str, file_path: &str, format: &str) -> Result<String, String> {
         match format.to_lowercase().as_str() {
