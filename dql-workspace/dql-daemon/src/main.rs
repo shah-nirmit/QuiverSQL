@@ -119,6 +119,20 @@ async fn handle_request(req: RpcRequest, engine: Arc<DqlEngine>) -> RpcResponse 
                 Err("Missing params for register_sqlite".to_string())
             }
         },
+        "get_lineage" => {
+            if let Some(params) = req.params {
+                if let Some(sql) = params.as_str() {
+                    match engine.get_query_lineage(sql).await {
+                        Ok(lineage) => Ok(serde_json::to_value(lineage).unwrap()),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err("Invalid params: expected SQL string".to_string())
+                }
+            } else {
+                Err("Missing params for get_lineage".to_string())
+            }
+        },
         _ => Err("Method not found".to_string()),
     };
 

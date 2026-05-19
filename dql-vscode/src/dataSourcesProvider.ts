@@ -62,6 +62,10 @@ export class DataSourcesProvider
 
     private sources: RegisteredSource[] = [];
 
+    public getSources(): RegisteredSource[] {
+        return this.sources;
+    }
+
     /** Register or update a data source entry. */
     register(source: RegisteredSource): void {
         // Replace if same table name already exists
