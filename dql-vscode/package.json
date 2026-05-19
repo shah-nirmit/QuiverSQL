@@ -84,6 +84,11 @@
           "id": "dqlDataSources",
           "name": "Data Sources",
           "type": "tree"
+        },
+        {
+          "id": "dqlLineage",
+          "name": "Query Lineage",
+          "type": "tree"
         }
       ]
     }
@@ -93,7 +98,8 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src --ext ts"
+    "lint": "eslint src --ext ts",
+    "test:scanner": "npm run compile && node out/test/detectQueries.test.js"
   },
   "devDependencies": {
     "@types/vscode": "^1.85.0",

@@ -1,15 +1,16 @@
 import * as vscode from 'vscode';
 import { DaemonClient } from './daemonClient';
 import { DataSourcesProvider } from './dataSourcesProvider';
+import { LineageProvider } from './lineageProvider';
 
 let daemonClient: DaemonClient | undefined;
 
-interface DetectedQuery {
+export interface DetectedQuery {
     sql: string;
     range: vscode.Range;
 }
 
-function detectQueries(document: vscode.TextDocument): DetectedQuery[] {
+export function detectQueries(document: vscode.TextDocument): DetectedQuery[] {
     const queries: DetectedQuery[] = [];
     const text = document.getText();
     
@@ -29,12 +30,16 @@ function detectQueries(document: vscode.TextDocument): DetectedQuery[] {
             if (char === '\n') {
                 inLineComment = false;
             }
-        } else if (inBlockComment) {
+            continue;
+        }
+        if (inBlockComment) {
             if (char === '*' && nextChar === '/') {
                 inBlockComment = false;
                 i++; // skip '/'
             }
-        } else if (inSingleQuote) {
+            continue;
+        }
+        if (inSingleQuote) {
             if (char === "'") {
                 if (nextChar === "'") {
                     currentSql += "'";
@@ -102,6 +107,21 @@ function detectQueries(document: vscode.TextDocument): DetectedQuery[] {
 }
 
 
+class DqlPlanProvider implements vscode.TextDocumentContentProvider {
+    private plans = new Map<string, string>();
+    private _onDidChange = new vscode.EventEmitter<vscode.Uri>();
+    readonly onDidChange = this._onDidChange.event;
+
+    public setPlan(uri: vscode.Uri, planText: string) {
+        this.plans.set(uri.toString(), planText);
+        this._onDidChange.fire(uri);
+    }
+
+    provideTextDocumentContent(uri: vscode.Uri): string {
+        return this.plans.get(uri.toString()) || 'No plan compiled yet.';
+    }
+}
+
 export async function activate(context: vscode.ExtensionContext) {
     console.log('Activating DQL Developer Tools...');
 
@@ -109,12 +129,133 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider('dqlDataSources', dataSourcesProvider);
 
     daemonClient = new DaemonClient(context);
+
+    const lineageProvider = new LineageProvider(daemonClient, dataSourcesProvider);
+    vscode.window.registerTreeDataProvider('dqlLineage', lineageProvider);
+
+    function refreshLineage(editor: vscode.TextEditor | undefined) {
+        if (!editor || editor.document.languageId !== 'sql') {
+            lineageProvider.clear();
+            return;
+        }
+        const queries = detectQueries(editor.document);
+        if (queries.length > 0) {
+            const cursor = editor.selection.active;
+            const matchingQuery = queries.find(q => q.range.contains(cursor));
+            if (matchingQuery) {
+                lineageProvider.update(matchingQuery.sql);
+            } else {
+                lineageProvider.update(queries[0].sql);
+            }
+        } else {
+            const text = editor.document.getText();
+            lineageProvider.update(text);
+        }
+    }
+
     try {
         await daemonClient.start();
         vscode.window.showInformationMessage('DQL Daemon started successfully.');
+        refreshLineage(vscode.window.activeTextEditor);
     } catch (e) {
         console.error('Failed to start DQL Daemon', e);
     }
+
+    const planProvider = new DqlPlanProvider();
+    context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider('dql-plan', planProvider)
+    );
+
+    let visualizePlanCommand = vscode.commands.registerCommand('dql.visualizePlan', async (sqlArg?: any) => {
+        if (!daemonClient) {
+            vscode.window.showErrorMessage('Daemon is not running.');
+            return;
+        }
+
+        let sql = typeof sqlArg === 'string' ? sqlArg : '';
+        if (!sql) {
+            const editor = vscode.window.activeTextEditor;
+            if (editor) {
+                const selection = editor.selection;
+                if (!selection.isEmpty) {
+                    sql = editor.document.getText(selection);
+                } else {
+                    const queries = detectQueries(editor.document);
+                    if (queries.length > 0) {
+                        const cursor = editor.selection.active;
+                        const matchingQuery = queries.find(q => q.range.contains(cursor));
+                        if (matchingQuery) {
+                            sql = matchingQuery.sql;
+                        } else {
+                            sql = queries[0].sql;
+                        }
+                    } else {
+                        sql = editor.document.getText();
+                    }
+                }
+            }
+        }
+
+        if (!sql.trim()) {
+            vscode.window.showErrorMessage('No SQL query found to visualize.');
+            return;
+        }
+
+        try {
+            const explainSql = `EXPLAIN ${sql.trim().replace(/;$/, '')}`;
+            const result = await daemonClient.sendRequest('execute_json', explainSql) as any[];
+
+            if (!result || result.length === 0) {
+                vscode.window.showErrorMessage('Failed to generate query execution plan.');
+                return;
+            }
+
+            let planText = `DQL QUERY PLAN VISUALIZATION\n`;
+            planText += `=============================\n\n`;
+            planText += `QUERY:\n------\n${sql.trim()}\n\n`;
+
+            for (const row of result) {
+                const planType = row.plan_type || 'PLAN';
+                const planDetail = row.plan || '';
+                planText += `${planType.toUpperCase()}:\n`;
+                planText += `${'-'.repeat(planType.length + 1)}\n`;
+                planText += `${planDetail}\n\n`;
+            }
+
+            const planUri = vscode.Uri.parse(`dql-plan://plan/query-${Date.now()}.txt`);
+            planProvider.setPlan(planUri, planText);
+
+            const doc = await vscode.workspace.openTextDocument(planUri);
+            await vscode.window.showTextDocument(doc, {
+                viewColumn: vscode.ViewColumn.Beside,
+                preserveFocus: false
+            });
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to compile execution plan: ${e.message || JSON.stringify(e)}`);
+        }
+    });
+
+    // Dynamic Lineage Event Listeners
+    const activeEditorSub = vscode.window.onDidChangeActiveTextEditor(editor => {
+        refreshLineage(editor);
+    });
+
+    const selectionSub = vscode.window.onDidChangeTextEditorSelection(event => {
+        refreshLineage(event.textEditor);
+    });
+
+    let debounceTimer: NodeJS.Timeout | undefined;
+    const documentEditSub = vscode.workspace.onDidChangeTextDocument(event => {
+        if (vscode.window.activeTextEditor && event.document === vscode.window.activeTextEditor.document) {
+            if (debounceTimer) {
+                clearTimeout(debounceTimer);
+            }
+            debounceTimer = setTimeout(() => {
+                refreshLineage(vscode.window.activeTextEditor);
+            }, 500);
+        }
+    });
+
 
     let pingCommand = vscode.commands.registerCommand('dql.pingDaemon', async () => {
         if (!daemonClient) {
@@ -132,13 +273,13 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    let executeCommandUI = vscode.commands.registerCommand('dql.executeQueryUI', async (sqlArg?: string) => {
+    let executeCommandUI = vscode.commands.registerCommand('dql.executeQueryUI', async (sqlArg?: any) => {
         if (!daemonClient) {
             vscode.window.showErrorMessage('Daemon is not running.');
             return;
         }
 
-        let sql = sqlArg || '';
+        let sql = typeof sqlArg === 'string' ? sqlArg : '';
         if (!sql) {
             const editor = vscode.window.activeTextEditor;
             if (editor) {
@@ -409,25 +550,41 @@ export async function activate(context: vscode.ExtensionContext) {
     const codeLensProvider = vscode.languages.registerCodeLensProvider('sql', {
         provideCodeLenses(document: vscode.TextDocument, _token: vscode.CancellationToken) {
             const queries = detectQueries(document);
-            return queries.map(q => {
+            const lenses: vscode.CodeLens[] = [];
+            queries.forEach(q => {
                 const range = new vscode.Range(q.range.start.line, 0, q.range.start.line, 0);
-                return new vscode.CodeLens(range, {
+                lenses.push(new vscode.CodeLens(range, {
                     title: "▶ Run Query",
                     tooltip: `Execute: ${q.sql.substring(0, 60)}${q.sql.length > 60 ? '...' : ''}`,
                     command: "dql.executeQueryUI",
                     arguments: [q.sql]
-                });
+                }));
+                lenses.push(new vscode.CodeLens(range, {
+                    title: "🔍 Explain Plan",
+                    tooltip: `Visualize plan for: ${q.sql.substring(0, 60)}${q.sql.length > 60 ? '...' : ''}`,
+                    command: "dql.visualizePlan",
+                    arguments: [q.sql]
+                }));
             });
+            return lenses;
         }
     });
 
     context.subscriptions.push(pingCommand);
     context.subscriptions.push(executeCommandUI);
+    context.subscriptions.push(visualizePlanCommand);
     context.subscriptions.push(attachFileCommand);
     context.subscriptions.push(attachSQLiteCommand);
     context.subscriptions.push(connectWizardCommand);
     context.subscriptions.push(codeLensProvider);
-    context.subscriptions.push({ dispose: () => daemonClient?.stop() });
+    context.subscriptions.push(activeEditorSub);
+    context.subscriptions.push(selectionSub);
+    context.subscriptions.push(documentEditSub);
+    context.subscriptions.push({ dispose: () => {
+        if (debounceTimer) clearTimeout(debounceTimer);
+        daemonClient?.stop();
+    }});
+
 }
 
 export function deactivate() {
