@@ -49,7 +49,6 @@ async fn main() {
 async fn handle_request(req: RpcRequest, engine: Arc<DqlEngine>) -> RpcResponse {
     let result = match req.method.as_str() {
         "ping" => Ok(serde_json::json!("pong")),
-        "echo" => Ok(req.params.unwrap_or(serde_json::json!(""))),
         "execute" => {
             if let Some(params) = req.params {
                 if let Some(sql) = params.as_str() {
@@ -62,6 +61,20 @@ async fn handle_request(req: RpcRequest, engine: Arc<DqlEngine>) -> RpcResponse 
                 }
             } else {
                 Err("Missing params for execute".to_string())
+            }
+        },
+        "execute_json" => {
+            if let Some(params) = req.params {
+                if let Some(sql) = params.as_str() {
+                    match engine.execute_sql_to_json(sql).await {
+                        Ok(res) => Ok(res),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    Err("Invalid params: expected SQL string".to_string())
+                }
+            } else {
+                Err("Missing params for execute_json".to_string())
             }
         },
         "register_file" => {

@@ -55,9 +55,13 @@ export class DaemonClient {
                 this.process = undefined;
             });
 
-            // If we successfully spawn, resolve immediately. 
-            // In a real implementation we might wait for a specific "ready" message.
-            setTimeout(resolve, 500); 
+            this.process.on('spawn', () => {
+                // Resolve as soon as the OS confirms the process has spawned
+                resolve();
+            });
+
+            // Fallback for older Node versions
+            setTimeout(resolve, 100);
         });
     }
 

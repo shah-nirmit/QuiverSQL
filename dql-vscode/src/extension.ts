@@ -30,33 +30,51 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
-    let executeCommand = vscode.commands.registerCommand('dql.executeQuery', async () => {
+    let executeCommandUI = vscode.commands.registerCommand('dql.executeQueryUI', async () => {
         if (!daemonClient) {
             vscode.window.showErrorMessage('Daemon is not running.');
             return;
         }
 
-        const sql = await vscode.window.showInputBox({
-            prompt: 'Enter SQL Query',
-            placeHolder: 'SELECT 1 as num, \'test\' as str'
-        });
+        let sql = '';
+        const editor = vscode.window.activeTextEditor;
+        if (editor) {
+            const selection = editor.selection;
+            if (!selection.isEmpty) {
+                sql = editor.document.getText(selection);
+            } else {
+                sql = editor.document.getText();
+            }
+        }
 
-        if (!sql) return;
+        if (!sql.trim()) {
+            const input = await vscode.window.showInputBox({
+                prompt: 'Enter SQL Query (UI Grid)',
+                placeHolder: 'SELECT * FROM employees LIMIT 100'
+            });
+            if (!input) return;
+            sql = input;
+        }
 
+        const start = Date.now();
         try {
-            const start = Date.now();
-            const result = await daemonClient.sendRequest('execute', sql);
+            const result = await daemonClient.sendRequest('execute_json', sql);
             const duration = Date.now() - start;
             
-            // Show result in an output channel instead of a toast because it could be large
-            const outputChannel = vscode.window.createOutputChannel('DQL Results');
-            outputChannel.appendLine(`-- Executed in ${duration}ms`);
-            outputChannel.appendLine(sql);
-            outputChannel.appendLine(result);
-            outputChannel.show();
+            // Show result in the rich Webview Data Grid
+            const { ResultGridPanel } = await import('./webviewPanel');
+            ResultGridPanel.createOrShow(context.extensionUri);
+            if (ResultGridPanel.currentPanel) {
+                ResultGridPanel.currentPanel.updateData(result as any[], duration);
+            }
 
         } catch (e: any) {
-            vscode.window.showErrorMessage(`Query failed: ${e.message || JSON.stringify(e)}`);
+            const duration = Date.now() - start;
+            const { ResultGridPanel } = await import('./webviewPanel');
+            ResultGridPanel.createOrShow(context.extensionUri);
+            if (ResultGridPanel.currentPanel) {
+                ResultGridPanel.currentPanel.updateError(e.message || JSON.stringify(e), duration);
+            }
         }
     });
 
@@ -100,9 +118,24 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    // CodeLens Provider to make it feel like ossdbtools
+    const codeLensProvider = vscode.languages.registerCodeLensProvider('sql', {
+        provideCodeLenses(_document: vscode.TextDocument, _token: vscode.CancellationToken) {
+            // Provide a CodeLens at the top of the file
+            const range = new vscode.Range(0, 0, 0, 0);
+            const lens = new vscode.CodeLens(range, {
+                title: "▶ Run Query",
+                tooltip: "Execute this SQL query using DQL",
+                command: "dql.executeQueryUI"
+            });
+            return [lens];
+        }
+    });
+
     context.subscriptions.push(pingCommand);
-    context.subscriptions.push(executeCommand);
+    context.subscriptions.push(executeCommandUI);
     context.subscriptions.push(attachFileCommand);
+    context.subscriptions.push(codeLensProvider);
     context.subscriptions.push({ dispose: () => daemonClient?.stop() });
 }
 

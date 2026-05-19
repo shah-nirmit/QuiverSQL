@@ -9,7 +9,9 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onLanguage:sql"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
@@ -18,12 +20,37 @@
         "title": "DQL: Ping Daemon"
       },
       {
-        "command": "dql.executeQuery",
-        "title": "DQL: Execute Query"
+        "command": "dql.executeQueryUI",
+        "title": "DQL: Execute Query",
+        "icon": "$(play)"
       },
       {
         "command": "dql.attachFile",
         "title": "DQL: Attach File as Table"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "dql.executeQueryUI",
+          "when": "resourceLangId == sql",
+          "group": "navigation"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "dql.executeQueryUI",
+          "when": "resourceLangId == sql",
+          "group": "1_modification"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "dql.executeQueryUI",
+        "key": "ctrl+enter",
+        "mac": "cmd+enter",
+        "when": "editorTextFocus && editorLangId == sql"
       }
     ]
   },
