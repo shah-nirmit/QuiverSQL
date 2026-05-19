@@ -325,3 +325,53 @@ fn json_rows_to_record_batch(
 
     RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_temp_sqlite(suffix: &str) -> String {
+        let path = std::env::temp_dir().join(format!("test_dql_sqlite_{}.db", suffix));
+        // Remove old db if exists
+        let _ = std::fs::remove_file(&path);
+        
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, active BOOLEAN)", []).unwrap();
+        conn.execute("INSERT INTO products (name, price, active) VALUES ('Apple', 1.20, 1)", []).unwrap();
+        conn.execute("INSERT INTO products (name, price, active) VALUES ('Banana', 0.80, 0)", []).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_connector() {
+        let path = create_temp_sqlite("conn");
+        let connector = SqliteConnector::new(&path);
+        let res = connector.execute_query("SELECT name, price FROM products ORDER BY price DESC").await.unwrap();
+        
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0]["name"], "Apple");
+        assert_eq!(res[0]["price"], 1.20);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_sqlite_table_provider_schema() {
+        let path = create_temp_sqlite("schema");
+        let provider = SqliteTableProvider::try_new(&path, "products").unwrap();
+        let schema = provider.schema();
+
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(*schema.field(0).data_type(), DataType::Int64);
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
+        assert_eq!(schema.field(2).name(), "price");
+        assert_eq!(*schema.field(2).data_type(), DataType::Float64);
+        assert_eq!(schema.field(3).name(), "active");
+        assert_eq!(*schema.field(3).data_type(), DataType::Boolean);
+
+        let _ = std::fs::remove_file(path);
+    }
+}
+
