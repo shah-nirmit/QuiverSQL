@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.1.0-alpha.0 - Unreleased
+## 0.1.1-alpha.0 - Unreleased
 
 - Initial alpha prototype.
 - Added DataFusion-backed Rust daemon.
@@ -10,3 +10,4 @@ All notable changes to this project will be documented in this file.
 - Added SQLite table registration.
 - Added VS Code extension commands, source explorer, result grid, explain panel, and basic lineage tree.
 - Added quickstart samples and open-source project metadata.
+- Added Phase 0 baseline JSON-RPC integration tests, benchmark harness, and scanner/webview escaping coverage.

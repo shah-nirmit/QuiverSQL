@@ -292,7 +292,7 @@ export class ResultGridPanel {
             
             <div id="messages" class="tab-content active">
                 <div class="messages-view">
-                    <span class="error-text">Msg 1, Level 16, State 1, Line 1<br/>${escapeHtml(errorMsg).replace(/\n/g, '<br/>')}</span><br/><br/>
+                    <span class="error-text">Msg 1, Level 16, State 1, Line 1<br/>${formatErrorMessage(errorMsg)}</span><br/><br/>
                     <span class="duration-text">Total execution time: 00:00:00.${durationMs.toString().padStart(3, '0')}</span>
                 </div>
             </div>
@@ -312,7 +312,7 @@ export class ResultGridPanel {
     }
 }
 
-function formatCellValue(value: any): string {
+export function formatCellValue(value: any): string {
     if (value === null || value === undefined) {
         return '<em>null</em>';
     }
@@ -324,7 +324,11 @@ function formatCellValue(value: any): string {
     return escapeHtml(String(value));
 }
 
-function escapeHtml(value: string): string {
+export function formatErrorMessage(errorMsg: string): string {
+    return escapeHtml(errorMsg).replace(/\n/g, '<br/>');
+}
+
+export function escapeHtml(value: string): string {
     return value
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')

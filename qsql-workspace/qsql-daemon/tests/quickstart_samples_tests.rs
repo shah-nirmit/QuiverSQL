@@ -1,10 +1,10 @@
 use qsql_connectors::sqlite::SqliteTableProvider;
 use qsql_core::engine::QsqlEngine;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 fn sample_path(file_name: &str) -> String {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    std::env::current_dir()
+        .expect("current_dir")
         .parent()
         .and_then(|p| p.parent())
         .expect("repository root")

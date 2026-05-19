@@ -18,3 +18,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Local planning/task files
+/current_phase_task.md
+/implementation_plan.md

@@ -34,6 +34,7 @@ Module.prototype.require = function (packageName: string, ...args: any[]) {
 
 // Now import detectQueries and interfaces from extension
 import { detectQueries, DetectedQuery } from '../extension';
+import { escapeHtml, formatCellValue, formatErrorMessage } from '../webviewPanel';
 
 // -------------------------------------------------------------
 // 2. Mock vscode.TextDocument implementation
@@ -131,6 +132,67 @@ function testSemicolonInsideQuotes() {
     console.log("OK testSemicolonInsideQuotes passed!");
 }
 
+function testTrailingQueryWithoutSemicolon() {
+    const sql = "\n\nSELECT id, name\nFROM employees";
+    const result = runDetect(sql);
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0].sql, "SELECT id, name\nFROM employees");
+    assert.strictEqual(result[0].range.start.line, 2);
+    assert.strictEqual(result[0].range.start.character, 0);
+    console.log("OK testTrailingQueryWithoutSemicolon passed!");
+}
+
+function testEscapedSingleQuotesWithSemicolon() {
+    const sql = "SELECT 'it''s; still one query' AS message FROM logs;";
+    const result = runDetect(sql);
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0].sql, "SELECT 'it''s; still one query' AS message FROM logs;");
+    console.log("OK testEscapedSingleQuotesWithSemicolon passed!");
+}
+
+function testSemicolonsInsideComments() {
+    const sql = "SELECT 1; -- ignored; semicolon\n/* ignored; block; comment */\nSELECT 2;";
+    const result = runDetect(sql);
+    assert.strictEqual(result.length, 2);
+    assert.strictEqual(result[0].sql, "SELECT 1;");
+    assert.strictEqual(result[1].sql, "SELECT 2;");
+    console.log("OK testSemicolonsInsideComments passed!");
+}
+
+function testRangeForIndentedQueryAfterComment() {
+    const sql = "-- leading comment\n   SELECT name FROM employees;";
+    const result = runDetect(sql);
+    assert.strictEqual(result.length, 1);
+    assert.strictEqual(result[0].sql, "SELECT name FROM employees;");
+    assert.strictEqual(result[0].range.start.line, 1);
+    assert.strictEqual(result[0].range.start.character, 3);
+    console.log("OK testRangeForIndentedQueryAfterComment passed!");
+}
+
+function testEscapeHtml() {
+    assert.strictEqual(
+        escapeHtml(`<script data-name="qsql">alert('x') & more</script>`),
+        '&lt;script data-name=&quot;qsql&quot;&gt;alert(&#39;x&#39;) &amp; more&lt;/script&gt;'
+    );
+    console.log("OK testEscapeHtml passed!");
+}
+
+function testFormatCellValue() {
+    assert.strictEqual(formatCellValue(null), '<em>null</em>');
+    assert.strictEqual(formatCellValue(undefined), '<em>null</em>');
+    assert.strictEqual(formatCellValue('<b>Alice</b>'), '&lt;b&gt;Alice&lt;/b&gt;');
+    assert.strictEqual(formatCellValue({ tag: '<unsafe>' }), '{&quot;tag&quot;:&quot;&lt;unsafe&gt;&quot;}');
+    console.log("OK testFormatCellValue passed!");
+}
+
+function testFormatErrorMessage() {
+    assert.strictEqual(
+        formatErrorMessage("line 1 <bad>\nline 2 & worse"),
+        'line 1 &lt;bad&gt;<br/>line 2 &amp; worse'
+    );
+    console.log("OK testFormatErrorMessage passed!");
+}
+
 // -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
@@ -142,6 +204,13 @@ function runAll() {
         testEscapedLineComments();
         testEscapedBlockComments();
         testSemicolonInsideQuotes();
+        testTrailingQueryWithoutSemicolon();
+        testEscapedSingleQuotesWithSemicolon();
+        testSemicolonsInsideComments();
+        testRangeForIndentedQueryAfterComment();
+        testEscapeHtml();
+        testFormatCellValue();
+        testFormatErrorMessage();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

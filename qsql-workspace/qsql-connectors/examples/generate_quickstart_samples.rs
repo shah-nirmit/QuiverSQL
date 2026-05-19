@@ -10,14 +10,15 @@ use parquet::arrow::ArrowWriter;
 use rusqlite::{params, Connection};
 use std::error::Error;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    let repo_root = std::env::current_dir()
+        .expect("current_dir")
         .parent()
         .and_then(|p| p.parent())
-        .ok_or("failed to resolve repository root")?
+        .expect("repository root")
         .to_path_buf();
     let sample_dir = repo_root.join("samples").join("quickstart");
 
