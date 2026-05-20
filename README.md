@@ -1,13 +1,13 @@
 # QuiverSQL
 
-**Current version:** `0.1.4-alpha.0`<br>
+**Current version:** `0.2.0-alpha.0`<br>
 **Release status:** alpha prototype
 
 QuiverSQL is a developer-first, Arrow-native query virtualization layer: lighter than Dremio, Denodo, Trino, and Starburst; broader than DuckDB or Apache DataFusion alone; and focused first on interactive SQL over files plus heterogeneous databases from VS Code.
 
 The project is currently an alpha prototype. The intended product direction is a Q3 2026 interactive launch for the VSIX and translation engine, followed by API and CLI hardening toward Q4 2027.
 
-QuiverSQL is local-first today: a TypeScript VS Code extension talks to a Rust daemon over JSON-RPC, the daemon embeds DataFusion, and results move through Arrow/DataFusion into a VS Code result grid. This repository is not production ready yet, but it now contains the core shape of the original architecture: local SQL execution, file-backed virtual tables, SQLite federation, basic explain output, and basic lineage.
+QuiverSQL is local-first today: a TypeScript VS Code extension talks to a Rust daemon over JSON-RPC, the daemon embeds DataFusion, and results move through Arrow/DataFusion into a VS Code result grid. This repository is not production ready yet, but it now contains the core shape of the original architecture: local SQL execution, file-backed virtual tables, SQLite and SQL database federation, paged result delivery, source replay, basic explain output, and basic lineage.
 
 ## Product Thesis
 
@@ -91,10 +91,10 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] Parquet
 - [x] NDJSON / newline-delimited JSON
 - [x] SQLite
+- [x] Postgres
+- [x] MySQL / MariaDB
 - [ ] Excel `.xlsx`
 - [ ] Fixed-width files
-- [ ] Postgres
-- [ ] MySQL / MariaDB
 - [ ] SQL Server
 - [ ] Oracle
 - [ ] Snowflake
@@ -108,27 +108,33 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] DataFusion-backed SQL execution
 - [x] Attach local files as virtual tables
 - [x] Attach SQLite tables as virtual tables
+- [x] Attach Postgres tables as virtual tables
+- [x] Attach MySQL / MariaDB tables as virtual tables
 - [x] Query editor command and CodeLens run action
 - [x] JSON result delivery
+- [x] Paged JSON result delivery
 - [x] VS Code result grid
 - [x] Basic DataFusion `EXPLAIN`
 - [x] Basic table/column lineage from resolved logical plans
-- [x] Basic joins across registered file and SQLite tables
+- [x] Basic joins across registered file, SQLite, Postgres, and MySQL/MariaDB tables
 - [x] Quickstart sample data
-- [ ] Persisted virtual catalog
-- [ ] Source profiles with capability metadata
-- [ ] VS Code SecretStorage / OS keychain integration
-- [ ] Predicate pushdown
-- [ ] Projection pushdown
-- [ ] Limit pushdown
+- [x] Runtime virtual catalog
+- [x] Persisted VS Code source profiles
+- [x] Source profiles with capability metadata
+- [x] VS Code SecretStorage / OS keychain integration
+- [x] Query cancellation and timeout support
+- [x] Predicate pushdown for supported SQL connector filters
+- [x] Projection pushdown for SQL connectors
+- [x] Limit pushdown for SQL connectors
+- [ ] Sort / top-k pushdown
 - [ ] Aggregate pushdown
 - [ ] Cost-aware federated optimizer
 - [ ] Join placement strategy
 - [ ] Temp-table or broadcast strategy for cross-source joins
 - [ ] Connector-specific SQL translation output
 - [ ] OpenLineage-compatible run events
-- [ ] Paged/streaming result grid
-- [ ] Query cancellation and timeouts
+- [x] Paged result grid
+- [ ] Streaming result grid without full result collection
 - [ ] Public CLI
 - [ ] Public API
 - [ ] Packaged VSIX and daemon installers
@@ -143,23 +149,25 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 | CSV files | Supported now | Registered as virtual tables through DataFusion. |
 | Parquet files | Supported now | Registered as virtual tables through DataFusion. |
 | NDJSON / JSON files | Supported now | Uses DataFusion's NDJSON reader. `.json` samples are newline-delimited JSON. |
-| SQLite tables | Supported now | SQLite tables can be registered through a DataFusion `TableProvider`. |
+| SQLite tables | Supported now | SQLite tables register through a DataFusion `TableProvider` with projection/filter/limit SQL pushdown. |
+| Postgres tables | Supported now | Tables can be registered through the daemon and VS Code wizard. Live tests are env-gated with `QSQL_POSTGRES_URL`. |
+| MySQL / MariaDB tables | Supported now | Tables can be registered through a shared MySQL/MariaDB connector. Live tests are env-gated with `QSQL_MYSQL_URL`. |
 | Quickstart sample data | Supported now | CSV, NDJSON, JSON, Parquet, and SQLite samples live in `samples/quickstart/`. |
-| Federated joins | Partial | Local DataFusion can join registered file and SQLite tables, but remote pushdown and join placement are early. |
+| Runtime catalog | Supported now | Daemon tracks source metadata, schema, status, and connector capabilities. |
+| Persisted source replay | Supported now | VS Code stores source profiles and replays them on activation. Database connection strings are stored in SecretStorage. |
+| Projection/filter/limit pushdown | Supported now | Implemented for SQLite, Postgres, MySQL, and MariaDB for supported simple filters. Aggregates, joins, and sort/top-k are not pushed yet. |
+| Query paging | Supported now | `query_start`, `query_page`, and `query_cancel` provide paged JSON result delivery and cancellation. |
+| Federated joins | Partial | Local DataFusion can join registered file and SQL tables, but join placement and cross-source cost planning are early. |
 | Explain plan | Partial | DataFusion `EXPLAIN` output is available; connector translation explain is planned. |
 | Lineage | Partial | Basic table/column lineage from resolved logical plans exists; OpenLineage-compatible events are planned. |
 | Daemon discovery | Partial | `qsql.daemonPath` is configurable; packaged binaries and installers are planned. |
-| Result grid | Partial | Current grid renders JSON rows; paging, cancellation, and streaming UX are planned. |
+| Result grid | Partial | Current grid supports paged JSON results and cancellation; true streaming/Arrow IPC pages are planned. |
 | Excel `.xlsx` | Planned | Part of the original file-provider goal. |
 | Fixed-width files | Planned | Expected to require explicit schema/layout files first. |
-| Postgres connector | Planned | First likely network RDBMS connector after SQLite hardening. |
-| MySQL / MariaDB connector | Planned | Connector trait and SQL emitter work needed first. |
 | SQL Server connector | Planned | Connector trait and SQL emitter work needed first. |
-| Projection/filter/limit pushdown | Planned | Needed to make federation efficient and explainable. |
+| Sort / top-k pushdown | Planned | Next SQL pushdown expansion: simple column `ORDER BY` plus optional `LIMIT`. |
 | Aggregate pushdown and join placement | Planned | Needed for serious cross-source federation. |
 | Temp-table or broadcast join strategy | Planned | Needed for larger cross-source joins. |
-| Persisted virtual catalog | Planned | Source profiles, schemas, stats, and capabilities are not persisted yet. |
-| Secrets and auth storage | Planned | VS Code SecretStorage / OS keychain integration is planned. |
 | OpenLineage events | Planned | QuiverSQL-specific logical lineage exists first; OpenLineage sink comes later. |
 | Public CLI / API | Planned | Designed early, hardened toward Q4 2027. |
 | Marketplace VSIX / installers | Not started | The repo is currently source-first for contributors. |
@@ -168,10 +176,10 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 
 The current implementation maps to the first alpha slice of the original delivery plan:
 
-- `qsql-core`: DataFusion session, SQL execution, JSON/string result conversion, file registration, table-provider registration, and basic lineage.
-- `qsql-connectors`: SQLite connector plus DataFusion table provider; connector trait for future sources.
-- `qsql-daemon`: stdio JSON-RPC daemon with `ping`, `execute`, `execute_json`, `register_file`, `register_sqlite`, and `get_lineage`.
-- `qsql-vscode`: VS Code extension with data-source explorer, connect wizard, query execution, result grid, explain panel, and lineage tree.
+- `qsql-core`: DataFusion session, SQL execution, paged JSON result models, cancellation, file registration, table-provider registration, runtime catalog, and basic lineage.
+- `qsql-connectors`: shared SQL pushdown provider layer plus SQLite, Postgres, and MySQL/MariaDB connectors.
+- `qsql-daemon`: stdio JSON-RPC daemon with health/version, execution, paging/cancellation, source catalog, file/SQLite/Postgres/MySQL/MariaDB registration, and lineage.
+- `qsql-vscode`: VS Code extension with data-source explorer, SecretStorage-backed source replay, connect wizard, query execution, paged result grid, explain panel, and lineage tree.
 - `samples/quickstart`: fictional, committed sample data across the formats currently supported.
 
 ## Quickstart
@@ -254,6 +262,23 @@ WHERE o.shipped = true
 ORDER BY o.amount DESC;
 ```
 
+### Try SQL Database Connectors
+
+Postgres, MySQL, and MariaDB support is available through the VS Code connect wizard and daemon RPC methods. The current SQL connector scope is intentionally narrow: table registration, schema introspection, `SELECT` scans, projection pushdown, supported basic filter pushdown, and limit pushdown.
+
+Connection strings are stored by the VS Code extension in SecretStorage. Daemon catalog responses redact credentials.
+
+Example local test URLs:
+
+```text
+QSQL_POSTGRES_URL=postgres://qsql_test:qsql_test@localhost:5432/qsql_test
+QSQL_MYSQL_URL=mysql://qsql_test:qsql_test@localhost:3306/qsql_test
+```
+
+The optional live connector tests are ignored when those environment variables are missing and run automatically when the variables are set.
+
+For Docker setup, shell-specific environment variable syntax, and live-test commands, see [SQL Connector Testing](docs/SQL_CONNECTOR_TESTING.md).
+
 ### Regenerate Samples
 
 The committed sample files are small, fictional, and safe to keep in the repository. To regenerate them:
@@ -272,6 +297,7 @@ cd qsql-workspace
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace
+cargo test --locked --workspace --features postgres,mysql
 ```
 
 VS Code extension:
@@ -281,7 +307,7 @@ cd qsql-vscode
 npm ci
 npm run typecheck
 npm run lint
-npm run test:scanner
+npm run test
 ```
 
 ## Versioning
@@ -294,19 +320,24 @@ QuiverSQL uses SemVer. The current alpha version is recorded in:
 - `qsql-vscode/package-lock.json`
 - `CHANGELOG.md`
 
-During the alpha period, versions use prerelease labels such as `0.1.0-alpha.0`. Breaking changes can still happen before the first stable release, but version bumps should still describe the user-visible change clearly in the changelog.
+During the alpha period, versions use prerelease labels such as `0.2.0-alpha.0`. Breaking changes can still happen before the first stable release, but version bumps should still describe the user-visible change clearly in the changelog.
 
 The daemon exposes a JSON-RPC `version` method with product, daemon, core, connector, and RPC protocol versions. The VS Code extension also includes `QuiverSQL: Show Version`, which displays the extension version and daemon component versions when the daemon is available.
 
 ## Roadmap
 
-| Phase | Goal | Major Work |
+| Phase | Status | Major Work |
 | --- | --- | --- |
-| Phase 0 | GitHub-ready alpha | Open-source docs, Apache-2.0 license, CI, samples, formatting, linting, reproducible setup. |
-| Phase 1 | Stabilize MVP contracts | `SourceProfile`, `TableRef`, daemon RPC schema, VS Code settings, result/error envelope. |
-| Phase 2 | Make federation honest | Projection/filter/limit pushdown, connector capabilities, Postgres connector, better explain output. |
-| Phase 3 | Improve UX depth | Persistent profiles, paged results, safer webview rendering, cancellation, richer lineage. |
-| Phase 4 | Resume original architecture goals | Excel/fixed-width providers, OpenLineage events, temp/broadcast joins, installers, future CLI/API. |
+| Phase 0 | Complete | Baseline correctness, JSON-RPC tests, benchmark harness, quickstart fixtures, scanner/webview tests. |
+| Phase 1 | Complete | Typed contracts, structured JSON-RPC errors, capability metadata, serde golden tests. |
+| Phase 2 | Complete | `query_start`, `query_page`, `query_cancel`, first-page metadata, paged grid, cancellation/timeouts. |
+| Phase 3 | Complete | Runtime catalog, persisted source profiles, activation replay, SecretStorage-backed credentials. |
+| Phase 4 | Complete | SQL emission hooks, SQLite/Postgres/MySQL/MariaDB connectors, projection/filter/limit pushdown. |
+| Phase 5 | Current | Large local data, memory guards, generated large fixtures, and simple SQL sort/top-k pushdown. |
+| Phase 6 | Planned | Fixed-width file provider and wizard support. |
+| Phase 7 | Planned | Arrow IPC result pages with JSON fallback. |
+| Phase 8 | Planned | Richer explain, lineage graph, metrics visibility, and full-scan warnings. |
+| Phase 9 | Planned | Packaging, release artifacts, benchmark report gates, and installer smoke tests. |
 
 ## Contributing
 

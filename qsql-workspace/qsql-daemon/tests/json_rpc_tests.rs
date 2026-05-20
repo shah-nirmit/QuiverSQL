@@ -1,3 +1,4 @@
+use qsql_connectors::RemoteConnector;
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -32,9 +33,7 @@ impl RpcHarness {
         self.stdin.flush().expect("flush request");
 
         let mut response = String::new();
-        self.stdout
-            .read_line(&mut response)
-            .expect("read response");
+        self.stdout.read_line(&mut response).expect("read response");
 
         serde_json::from_str(response.trim()).expect("valid json response")
     }
@@ -93,20 +92,25 @@ fn invalid_params_returns_json_rpc_error() {
     let mut rpc = RpcHarness::spawn();
 
     // Passing wrong param field "query" instead of "sql"
-    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"query":"SELECT 1"},"id":4}"#);
+    let response =
+        rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"query":"SELECT 1"},"id":4}"#);
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 4);
     assert!(response.get("result").is_none() || response["result"].is_null());
     assert_eq!(response["error"]["code"], -32602);
-    assert!(response["error"]["message"].as_str().unwrap().contains("Invalid params"));
+    assert!(response["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Invalid params"));
 }
 
 #[test]
 fn execute_query_succeeds_with_structured_params() {
     let mut rpc = RpcHarness::spawn();
 
-    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"sql":"SELECT 1"},"id":5}"#);
+    let response =
+        rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"sql":"SELECT 1"},"id":5}"#);
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 5);
@@ -118,7 +122,8 @@ fn execute_query_succeeds_with_structured_params() {
 fn execute_json_succeeds_with_structured_params() {
     let mut rpc = RpcHarness::spawn();
 
-    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute_json","params":{"sql":"SELECT 1"},"id":6}"#);
+    let response = rpc
+        .request(r#"{"jsonrpc":"2.0","method":"execute_json","params":{"sql":"SELECT 1"},"id":6}"#);
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 6);
@@ -217,7 +222,10 @@ fn query_start_invalid_page_size_returns_invalid_params() {
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 13);
     assert_eq!(response["error"]["code"], -32602);
-    assert_eq!(response["error"]["message"], "page_size must be greater than zero");
+    assert_eq!(
+        response["error"]["message"],
+        "page_size must be greater than zero"
+    );
 }
 
 #[test]
@@ -267,7 +275,6 @@ fn invalid_json_returns_parse_error_with_null_id() {
     assert_eq!(response["error"]["message"], "Parse error");
 }
 
-
 #[test]
 fn list_sources_initially_empty() {
     let mut rpc = RpcHarness::spawn();
@@ -279,8 +286,8 @@ fn list_sources_initially_empty() {
 }
 
 fn create_temp_csv() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
@@ -300,15 +307,17 @@ fn create_temp_sqlite() -> String {
     let path = std::env::temp_dir().join(format!("test_jsonrpc_{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let conn = Connection::open(&path).unwrap();
-    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-    conn.execute("INSERT INTO items (name) VALUES ('Widget')", []).unwrap();
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", [])
+        .unwrap();
+    conn.execute("INSERT INTO items (name) VALUES ('Widget')", [])
+        .unwrap();
     path.to_str().unwrap().to_string()
 }
 
 #[test]
 fn catalog_lifecycle_test() {
     let mut rpc = RpcHarness::spawn();
-    
+
     // 1. Initial list_sources is empty
     let list_res = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":100}"#);
     assert_eq!(list_res["result"].as_array().unwrap().len(), 0);
@@ -357,7 +366,9 @@ fn catalog_lifecycle_test() {
     assert_eq!(get_res_err["error"]["code"], -32004);
 
     // 6. remove_source successfully deregisters
-    let remove_res = rpc.request(r#"{"jsonrpc":"2.0","method":"remove_source","params":{"name":"employees"},"id":106}"#);
+    let remove_res = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"remove_source","params":{"name":"employees"},"id":106}"#,
+    );
     assert_eq!(remove_res["result"]["name"], "employees");
     assert_eq!(remove_res["result"]["removed"], true);
 
@@ -368,4 +379,113 @@ fn catalog_lifecycle_test() {
     // Clean up
     let _ = std::fs::remove_file(csv_path);
     let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
+fn sql_connector_registration_rejects_invalid_params() {
+    let mut rpc = RpcHarness::spawn();
+
+    let missing_connection = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"register_postgres","params":{"table_name":"users","alias":"users"},"id":200}"#,
+    );
+    assert_eq!(missing_connection["jsonrpc"], "2.0");
+    assert_eq!(missing_connection["id"], 200);
+    assert_eq!(missing_connection["error"]["code"], -32602);
+
+    let missing_table = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"register_mysql","params":{"connection_string":"mysql://user:secret@localhost/db"},"id":201}"#,
+    );
+    assert_eq!(missing_table["jsonrpc"], "2.0");
+    assert_eq!(missing_table["id"], 201);
+    assert_eq!(missing_table["error"]["code"], -32602);
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(qsql_live_postgres_tests),
+    ignore = "requires a live Postgres database and QSQL_POSTGRES_URL"
+)]
+async fn optional_postgres_registration_redacts_credentials() {
+    let url = std::env::var("QSQL_POSTGRES_URL")
+        .expect("QSQL_POSTGRES_URL must be set to run Postgres live tests");
+    let connector = qsql_connectors::postgres::PostgresConnector::new(url.clone());
+    connector
+        .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_pg (id INT, name TEXT)")
+        .await
+        .unwrap();
+    connector
+        .execute_query("TRUNCATE qsql_phase4_rpc_pg")
+        .await
+        .unwrap();
+    connector
+        .execute_query("INSERT INTO qsql_phase4_rpc_pg VALUES (1, 'Alice')")
+        .await
+        .unwrap();
+
+    let mut rpc = RpcHarness::spawn();
+
+    let setup_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"register_postgres","params":{{"connection_string":{:?},"schema":"public","table_name":"qsql_phase4_rpc_pg","alias":"rpc_pg"}},"id":210}}"#,
+        url
+    );
+    let register = rpc.request(&setup_req);
+    if register.get("error").is_some() && !register["error"].is_null() {
+        panic!("register_postgres failed: {register}");
+    }
+
+    let list = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":211}"#);
+    let source = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["name"] == "rpc_pg")
+        .unwrap();
+    assert_eq!(source["kind"], "postgres");
+    assert_eq!(source["connection_details"]["connection"], "<redacted>");
+    assert!(!source.to_string().contains(&url));
+}
+
+#[tokio::test]
+#[cfg_attr(
+    not(qsql_live_mysql_tests),
+    ignore = "requires a live MySQL database and QSQL_MYSQL_URL"
+)]
+async fn optional_mysql_registration_redacts_credentials() {
+    let url = std::env::var("QSQL_MYSQL_URL")
+        .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+    let connector = qsql_connectors::mysql::MySqlConnector::mysql(url.clone());
+    connector
+        .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_mysql (id INT, name TEXT)")
+        .await
+        .unwrap();
+    connector
+        .execute_query("TRUNCATE TABLE qsql_phase4_rpc_mysql")
+        .await
+        .unwrap();
+    connector
+        .execute_query("INSERT INTO qsql_phase4_rpc_mysql VALUES (1, 'Alice')")
+        .await
+        .unwrap();
+
+    let mut rpc = RpcHarness::spawn();
+
+    let setup_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"register_mysql","params":{{"connection_string":{:?},"table_name":"qsql_phase4_rpc_mysql","alias":"rpc_mysql"}},"id":220}}"#,
+        url
+    );
+    let register = rpc.request(&setup_req);
+    if register.get("error").is_some() && !register["error"].is_null() {
+        panic!("register_mysql failed: {register}");
+    }
+
+    let list = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":221}"#);
+    let source = list["result"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["name"] == "rpc_mysql")
+        .unwrap();
+    assert_eq!(source["kind"], "mysql");
+    assert_eq!(source["connection_details"]["connection"], "<redacted>");
+    assert!(!source.to_string().contains(&url));
 }

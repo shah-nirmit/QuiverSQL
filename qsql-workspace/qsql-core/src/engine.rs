@@ -5,13 +5,21 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::{
-    build_query_page, normalize_page_size, PerformanceMetrics, QueryError, QueryExecutionResult,
-    QueryPage, Schema as QsqlSchema, SchemaField, CatalogSource,
+    build_query_page, normalize_page_size, CatalogSource, PerformanceMetrics, QueryError,
+    QueryExecutionResult, QueryPage, Schema as QsqlSchema, SchemaField,
 };
 
 pub struct QsqlEngine {
     ctx: SessionContext,
     pub catalog: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, CatalogSource>>>,
+}
+
+pub struct ExecutePageOptions {
+    pub page_index: usize,
+    pub page_size: usize,
+    pub warning: Option<String>,
+    pub cancellation_token: CancellationToken,
+    pub timeout_ms: Option<u64>,
 }
 
 impl QsqlEngine {
@@ -31,7 +39,9 @@ impl QsqlEngine {
     }
 
     pub fn remove_source(&self, name: &str) -> Result<bool, String> {
-        let deregistered = self.ctx.deregister_table(name)
+        let deregistered = self
+            .ctx
+            .deregister_table(name)
             .map_err(|e| e.to_string())?
             .is_some();
         let mut catalog = self.catalog.lock().unwrap();
@@ -90,22 +100,18 @@ impl QsqlEngine {
         &self,
         query_id: &str,
         sql: &str,
-        page_index: usize,
-        page_size: usize,
-        warning: Option<String>,
-        cancellation_token: CancellationToken,
-        timeout_ms: Option<u64>,
+        options: ExecutePageOptions,
     ) -> Result<QueryPage, QueryError> {
-        let (page_size, size_warning) = normalize_page_size(Some(page_size))?;
-        let warning = warning.or(size_warning);
+        let (page_size, size_warning) = normalize_page_size(Some(options.page_size))?;
+        let warning = options.warning.or(size_warning);
         let result = self
-            .execute_sql_collect(sql, cancellation_token, timeout_ms)
+            .execute_sql_collect(sql, options.cancellation_token, options.timeout_ms)
             .await?;
 
         Ok(build_query_page(
             query_id.to_string(),
             &result,
-            page_index,
+            options.page_index,
             page_size,
             warning,
         ))
@@ -119,6 +125,10 @@ impl QsqlEngine {
         cancellation_token: CancellationToken,
         timeout_ms: Option<u64>,
     ) -> Result<QueryExecutionResult, QueryError> {
+        if cancellation_token.is_cancelled() {
+            return Err(query_cancelled_error());
+        }
+
         if timeout_ms == Some(0) {
             return Err(query_timeout_error(0));
         }
@@ -212,7 +222,11 @@ impl QsqlEngine {
             _ => unreachable!(),
         }
 
-        let df = self.ctx.table(table_name).await.map_err(|e| e.to_string())?;
+        let df = self
+            .ctx
+            .table(table_name)
+            .await
+            .map_err(|e| e.to_string())?;
         let arrow_schema: &datafusion::arrow::datatypes::Schema = df.schema().as_ref();
         let qsql_schema = arrow_schema_to_qsql_schema(arrow_schema);
 
@@ -407,6 +421,20 @@ pub struct QueryLineage {
     pub relations: Vec<LineageInfo>,
 }
 
+pub fn arrow_schema_to_qsql_schema(schema: &datafusion::arrow::datatypes::Schema) -> QsqlSchema {
+    QsqlSchema {
+        fields: schema
+            .fields()
+            .iter()
+            .map(|field| SchemaField {
+                name: field.name().to_string(),
+                data_type: field.data_type().to_string(),
+                nullable: field.is_nullable(),
+            })
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -487,11 +515,13 @@ mod tests {
             .execute_sql_to_page(
                 "q_test",
                 "SELECT id, name FROM employees ORDER BY id",
-                0,
-                1,
-                None,
-                CancellationToken::new(),
-                None,
+                ExecutePageOptions {
+                    page_index: 0,
+                    page_size: 1,
+                    warning: None,
+                    cancellation_token: CancellationToken::new(),
+                    timeout_ms: None,
+                },
             )
             .await
             .unwrap();
@@ -516,11 +546,13 @@ mod tests {
             .execute_sql_to_page(
                 "q_clamp",
                 "SELECT 1 AS value",
-                0,
-                crate::models::MAX_PAGE_SIZE + 1,
-                None,
-                CancellationToken::new(),
-                None,
+                ExecutePageOptions {
+                    page_index: 0,
+                    page_size: crate::models::MAX_PAGE_SIZE + 1,
+                    warning: None,
+                    cancellation_token: CancellationToken::new(),
+                    timeout_ms: None,
+                },
             )
             .await
             .unwrap();
@@ -536,11 +568,13 @@ mod tests {
             .execute_sql_to_page(
                 "q_empty",
                 "SELECT 1 AS value WHERE false",
-                0,
-                100,
-                None,
-                CancellationToken::new(),
-                None,
+                ExecutePageOptions {
+                    page_index: 0,
+                    page_size: 100,
+                    warning: None,
+                    cancellation_token: CancellationToken::new(),
+                    timeout_ms: None,
+                },
             )
             .await
             .unwrap();
@@ -557,25 +591,21 @@ mod tests {
         token.cancel();
 
         let err = engine
-            .execute_sql_to_page("q_cancel", "SELECT 1", 0, 100, None, token, None)
+            .execute_sql_to_page(
+                "q_cancel",
+                "SELECT 1",
+                ExecutePageOptions {
+                    page_index: 0,
+                    page_size: 100,
+                    warning: None,
+                    cancellation_token: token,
+                    timeout_ms: None,
+                },
+            )
             .await
             .unwrap_err();
 
         assert_eq!(err.code, -32002);
         assert_eq!(err.message, "Query cancelled");
-    }
-}
-
-pub fn arrow_schema_to_qsql_schema(schema: &datafusion::arrow::datatypes::Schema) -> QsqlSchema {
-    QsqlSchema {
-        fields: schema
-            .fields()
-            .iter()
-            .map(|field| SchemaField {
-                name: field.name().to_string(),
-                data_type: field.data_type().to_string(),
-                nullable: field.is_nullable(),
-            })
-            .collect(),
     }
 }

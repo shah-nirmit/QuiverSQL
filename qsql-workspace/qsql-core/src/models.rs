@@ -130,7 +130,9 @@ pub struct QueryExecutionResult {
     pub metrics: PerformanceMetrics,
 }
 
-pub fn normalize_page_size(page_size: Option<usize>) -> Result<(usize, Option<String>), QueryError> {
+pub fn normalize_page_size(
+    page_size: Option<usize>,
+) -> Result<(usize, Option<String>), QueryError> {
     match page_size {
         Some(0) => Err(QueryError {
             code: -32602,
@@ -177,7 +179,6 @@ pub fn build_query_page(
         warning,
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSource {

@@ -4,7 +4,7 @@ use serde_json::json;
 #[test]
 fn test_source_kind_golden() {
     let source_kind = SourceKind::FixedWidth;
-    let serialized = serde_json::to_value(&source_kind).unwrap();
+    let serialized = serde_json::to_value(source_kind).unwrap();
     assert_eq!(serialized, json!("fixed_width"));
 
     let deserialized: SourceKind = serde_json::from_value(json!("fixed_width")).unwrap();
@@ -23,7 +23,7 @@ fn test_source_kind_golden() {
     ];
 
     for (kind, expected) in all_kinds {
-        assert_eq!(serde_json::to_value(&kind).unwrap(), json!(expected));
+        assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected));
         let de: SourceKind = serde_json::from_value(json!(expected)).unwrap();
         assert_eq!(de, kind);
     }
@@ -36,7 +36,7 @@ fn test_source_profile_golden() {
         kind: SourceKind::Csv,
         connection_details: json!({ "path": "/data/file.csv" }),
     };
-    
+
     let expected = json!({
         "name": "my_csv",
         "kind": "csv",
@@ -232,7 +232,10 @@ fn test_query_error_golden() {
         "code": 5000,
         "message": "Internal server error"
     });
-    assert_eq!(serde_json::to_value(&no_details).unwrap(), expected_no_details);
+    assert_eq!(
+        serde_json::to_value(&no_details).unwrap(),
+        expected_no_details
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "qsql-daemon"
-version = "0.1.4-alpha.0"
+version = "0.2.0-alpha.0"
 edition = "2021"
 
 [dependencies]
@@ -11,6 +11,11 @@ serde_json = "1.0"
 tokio = { version = "1.36", features = ["full"] }
 tokio-util = "0.7"
 datafusion = "44.0.0"
+
+[features]
+default = []
+postgres = ["qsql-connectors/postgres", "qsql-core/postgres"]
+mysql = ["qsql-connectors/mysql", "qsql-core/mysql"]
 
 [dev-dependencies]
 criterion = "0.5"

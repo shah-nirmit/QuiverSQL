@@ -129,6 +129,7 @@ Module.prototype.require = function (packageName: string, ...args: any[]) {
 // 2. Import elements to test
 import { DaemonClient } from '../daemonClient';
 import { QueryError, QueryPage } from '../models';
+import { SourceManager } from '../sourceManager';
 
 // Helper to instantiate and start DaemonClient
 async function createClient(): Promise<DaemonClient> {
@@ -483,11 +484,69 @@ async function testSourceCatalogMethods() {
     console.log("OK: testSourceCatalogMethods passed!");
 }
 
+async function testSourceManagerSqlSecretReplay() {
+    console.log("Running: testSourceManagerSqlSecretReplay");
+    let storedProfiles: any[] | undefined;
+    const secrets = new Map<string, string>();
+    const requests: Array<{ method: string; params: any }> = [];
+    const context: any = {
+        globalState: {
+            get: (_key: string) => storedProfiles,
+            update: async (_key: string, value: any[]) => {
+                storedProfiles = value;
+            }
+        },
+        secrets: {
+            store: async (key: string, value: string) => {
+                secrets.set(key, value);
+            },
+            get: async (key: string) => secrets.get(key),
+            delete: async (key: string) => {
+                secrets.delete(key);
+            }
+        }
+    };
+    const daemon: any = {
+        sendRequest: async (method: string, params: any) => {
+            requests.push({ method, params });
+            return "ok";
+        }
+    };
+
+    const manager = new SourceManager(context, daemon);
+    await manager.addSource(
+        "pg_users",
+        "postgres",
+        { tableName: "users", schema: "public" },
+        "postgres://user:secret@localhost:5432/db"
+    );
+
+    const profiles = manager.getProfiles();
+    assert.strictEqual(profiles.length, 1);
+    assert.strictEqual(profiles[0].kind, "postgres");
+    assert.strictEqual((profiles[0].details as any).connectionString, undefined);
+    assert.ok(profiles[0].secretKey);
+
+    await manager.replaySources();
+    assert.strictEqual(requests.length, 1);
+    assert.strictEqual(requests[0].method, "register_postgres");
+    assert.strictEqual(requests[0].params.alias, "pg_users");
+    assert.strictEqual(requests[0].params.table_name, "users");
+    assert.strictEqual(requests[0].params.schema, "public");
+    assert.strictEqual(requests[0].params.connection_string, "postgres://user:secret@localhost:5432/db");
+
+    await manager.removeSource("pg_users");
+    assert.strictEqual(manager.getProfiles().length, 0);
+    assert.strictEqual(secrets.size, 0);
+    console.log("OK: testSourceManagerSqlSecretReplay passed!");
+}
+
 async function runAll() {
     console.log("Starting QuiverSQL VS Code Client Unit Tests...\n");
     try {
         await testSuccessfulQuery();
         await testSourceCatalogMethods();
+        await testSourceManagerSqlSecretReplay();
         await testPagedQueryHelpersSendExpectedRpc();
         await testStandardErrorBubble();
         await testErrorWithDetails();
