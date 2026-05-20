@@ -1,18 +1,30 @@
 use qsql_connectors::sqlite::SqliteTableProvider;
 use qsql_core::engine::QsqlEngine;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 fn sample_path(file_name: &str) -> String {
-    std::env::current_dir()
-        .expect("current_dir")
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("repository root")
+    repo_root()
         .join("samples")
         .join("quickstart")
         .join(file_name)
         .to_string_lossy()
         .into_owned()
+}
+
+fn repo_root() -> PathBuf {
+    let mut starts = vec![std::env::current_dir().expect("current_dir")];
+    starts.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    for start in starts {
+        for candidate in start.ancestors() {
+            if candidate.join("samples").join("quickstart").exists() {
+                return candidate.to_path_buf();
+            }
+        }
+    }
+
+    panic!("failed to resolve repository root");
 }
 
 #[tokio::test]

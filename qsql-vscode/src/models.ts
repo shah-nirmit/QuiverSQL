@@ -40,9 +40,14 @@ export interface Schema {
 }
 
 export interface QueryPage {
+    query_id: string;
+    schema: Schema;
     page_index: number;
+    page_size: number;
     is_last: boolean;
     data: Record<string, any>[];
+    metrics: PerformanceMetrics;
+    warning?: string;
 }
 
 export interface QueryHandle {
@@ -63,5 +68,29 @@ export interface ExplainResult {
 export interface PerformanceMetrics {
     planning_time_ms: number;
     execution_time_ms: number;
+    first_page_time_ms: number;
     rows_produced: number;
+    rows_returned: number;
+}
+
+export interface QueryStartRequest {
+    sql: string;
+    page_size?: number;
+    timeout_ms?: number;
+}
+
+export interface QueryPageRequest {
+    query_id: string;
+    page_index?: number;
+    page_size?: number;
+}
+
+export interface QueryCancelRequest {
+    query_id: string;
+}
+
+export interface QueryCancelResult {
+    query_id: string;
+    cancelled: boolean;
+    message: string;
 }

@@ -62,6 +62,14 @@ const childProcessMock = {
                     }
                 }
             },
+            emitClose: (code: number) => {
+                const closeHandlers = events.get('close');
+                if (closeHandlers) {
+                    for (const handler of closeHandlers) {
+                        handler(code);
+                    }
+                }
+            },
             emitStdout: (data: string) => {
                 const dataHandlers = stdoutEvents.get('data');
                 if (dataHandlers) {
@@ -152,9 +160,24 @@ async function testSuccessfulQuery() {
     mockProcessInstance.onRequestWritten = (data: string) => {
         const req = JSON.parse(data.trim());
         const mockResult: QueryPage = {
+            query_id: "q_1",
+            schema: {
+                fields: [
+                    { name: "id", data_type: "Int64", nullable: false },
+                    { name: "name", data_type: "Utf8", nullable: true }
+                ]
+            },
             page_index: 0,
+            page_size: 1000,
             is_last: true,
-            data: [{ id: 1, name: "Alice" }, { id: 2, name: "Bob" }]
+            data: [{ id: 1, name: "Alice" }, { id: 2, name: "Bob" }],
+            metrics: {
+                planning_time_ms: 1,
+                execution_time_ms: 2,
+                first_page_time_ms: 3,
+                rows_produced: 2,
+                rows_returned: 2
+            }
         };
         const res = {
             jsonrpc: "2.0",
@@ -173,6 +196,89 @@ async function testSuccessfulQuery() {
     
     client.stop();
     console.log("OK: testSuccessfulQuery passed!");
+}
+
+async function testPagedQueryHelpersSendExpectedRpc() {
+    console.log("Running: testPagedQueryHelpersSendExpectedRpc");
+    const client = await createClient();
+    const methods: string[] = [];
+
+    mockProcessInstance.onRequestWritten = (data: string) => {
+        const req = JSON.parse(data.trim());
+        methods.push(req.method);
+
+        if (req.method === 'query_start') {
+            assert.strictEqual(req.params.sql, "SELECT * FROM users");
+            assert.strictEqual(req.params.page_size, 250);
+            assert.strictEqual(req.params.timeout_ms, 5000);
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: makeQueryPage("q_1", 0),
+                id: req.id
+            }) + "\n");
+            return;
+        }
+
+        if (req.method === 'query_page') {
+            assert.strictEqual(req.params.query_id, "q_1");
+            assert.strictEqual(req.params.page_index, 1);
+            assert.strictEqual(req.params.page_size, 250);
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: makeQueryPage("q_1", 1),
+                id: req.id
+            }) + "\n");
+            return;
+        }
+
+        if (req.method === 'query_cancel') {
+            assert.strictEqual(req.params.query_id, "q_1");
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: {
+                    query_id: "q_1",
+                    cancelled: true,
+                    message: "Query cancellation requested"
+                },
+                id: req.id
+            }) + "\n");
+        }
+    };
+
+    const firstPage = await client.startQuery("SELECT * FROM users", { pageSize: 250, timeoutMs: 5000 });
+    assert.strictEqual(firstPage.query_id, "q_1");
+
+    const secondPage = await client.getQueryPage("q_1", 1, 250);
+    assert.strictEqual(secondPage.page_index, 1);
+
+    const cancelResult = await client.cancelQuery("q_1");
+    assert.strictEqual(cancelResult.cancelled, true);
+    assert.deepStrictEqual(methods, ['query_start', 'query_page', 'query_cancel']);
+
+    client.stop();
+    console.log("OK: testPagedQueryHelpersSendExpectedRpc passed!");
+}
+
+async function testPendingRequestsRejectedOnDaemonClose() {
+    console.log("Running: testPendingRequestsRejectedOnDaemonClose");
+    const client = await createClient();
+
+    mockProcessInstance.onRequestWritten = (_data: string) => {
+        process.nextTick(() => {
+            mockProcessInstance.emitClose(17);
+        });
+    };
+
+    try {
+        await client.sendRequest('query_start', { sql: "SELECT * FROM slow" });
+        assert.fail("Should have rejected pending request when daemon closed");
+    } catch (err: any) {
+        const queryError = err as QueryError;
+        assert.strictEqual(queryError.code, -32010);
+        assert.strictEqual(queryError.message, "QuiverSQL Daemon exited with code 17");
+    }
+
+    console.log("OK: testPendingRequestsRejectedOnDaemonClose passed!");
 }
 
 async function testStandardErrorBubble() {
@@ -272,6 +378,29 @@ async function testErrorWithStringDataDetails() {
     console.log("OK: testErrorWithStringDataDetails passed!");
 }
 
+function makeQueryPage(queryId: string, pageIndex: number): QueryPage {
+    return {
+        query_id: queryId,
+        schema: {
+            fields: [
+                { name: "id", data_type: "Int64", nullable: false },
+                { name: "name", data_type: "Utf8", nullable: true }
+            ]
+        },
+        page_index: pageIndex,
+        page_size: 250,
+        is_last: pageIndex > 0,
+        data: [{ id: pageIndex + 1, name: pageIndex === 0 ? "Alice" : "Bob" }],
+        metrics: {
+            planning_time_ms: 1,
+            execution_time_ms: 2,
+            first_page_time_ms: 3,
+            rows_produced: 2,
+            rows_returned: 1
+        }
+    };
+}
+
 // -------------------------------------------------------------
 // 4. Run Suite
 // -------------------------------------------------------------
@@ -279,9 +408,11 @@ async function runAll() {
     console.log("Starting QuiverSQL VS Code Client Unit Tests...\n");
     try {
         await testSuccessfulQuery();
+        await testPagedQueryHelpersSendExpectedRpc();
         await testStandardErrorBubble();
         await testErrorWithDetails();
         await testErrorWithStringDataDetails();
+        await testPendingRequestsRejectedOnDaemonClose();
         console.log("\nALL CLIENT TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

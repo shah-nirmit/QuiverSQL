@@ -1,6 +1,6 @@
 # QuiverSQL
 
-**Current version:** `0.1.2-alpha.0`<br>
+**Current version:** `0.1.3-alpha.0`<br>
 **Release status:** alpha prototype
 
 QuiverSQL is a developer-first, Arrow-native query virtualization layer: lighter than Dremio, Denodo, Trino, and Starburst; broader than DuckDB or Apache DataFusion alone; and focused first on interactive SQL over files plus heterogeneous databases from VS Code.

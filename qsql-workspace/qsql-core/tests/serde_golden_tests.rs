@@ -131,21 +131,57 @@ fn test_schema_field_and_schema_golden() {
 #[test]
 fn test_query_page_golden() {
     let page = QueryPage {
+        query_id: "q_123".to_string(),
+        schema: Schema {
+            fields: vec![SchemaField {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+        },
         page_index: 2,
+        page_size: 100,
         is_last: true,
         data: vec![
             json!({ "id": 1, "name": "Alice" }),
             json!({ "id": 2, "name": "Bob" }),
         ],
+        metrics: PerformanceMetrics {
+            planning_time_ms: 3,
+            execution_time_ms: 8,
+            first_page_time_ms: 11,
+            rows_produced: 202,
+            rows_returned: 2,
+        },
+        warning: Some("Page size was clamped.".to_string()),
     };
 
     let expected = json!({
+        "query_id": "q_123",
+        "schema": {
+            "fields": [
+                {
+                    "name": "id",
+                    "data_type": "Int64",
+                    "nullable": false
+                }
+            ]
+        },
         "page_index": 2,
+        "page_size": 100,
         "is_last": true,
         "data": [
             { "id": 1, "name": "Alice" },
             { "id": 2, "name": "Bob" }
-        ]
+        ],
+        "metrics": {
+            "planning_time_ms": 3,
+            "execution_time_ms": 8,
+            "first_page_time_ms": 11,
+            "rows_produced": 202,
+            "rows_returned": 2
+        },
+        "warning": "Page size was clamped."
     });
 
     assert_eq!(serde_json::to_value(&page).unwrap(), expected);
@@ -221,16 +257,77 @@ fn test_performance_metrics_golden() {
     let metrics = PerformanceMetrics {
         planning_time_ms: 12,
         execution_time_ms: 45,
+        first_page_time_ms: 57,
         rows_produced: 1500,
+        rows_returned: 1000,
     };
 
     let expected = json!({
         "planning_time_ms": 12,
         "execution_time_ms": 45,
-        "rows_produced": 1500
+        "first_page_time_ms": 57,
+        "rows_produced": 1500,
+        "rows_returned": 1000
     });
 
     assert_eq!(serde_json::to_value(&metrics).unwrap(), expected);
     let deserialized: PerformanceMetrics = serde_json::from_value(expected).unwrap();
     assert_eq!(deserialized, metrics);
+}
+
+#[test]
+fn test_query_requests_and_cancel_result_golden() {
+    let start = QueryStartRequest {
+        sql: "SELECT * FROM employees".to_string(),
+        page_size: Some(500),
+        timeout_ms: Some(10_000),
+    };
+    let start_expected = json!({
+        "sql": "SELECT * FROM employees",
+        "page_size": 500,
+        "timeout_ms": 10000
+    });
+    assert_eq!(serde_json::to_value(&start).unwrap(), start_expected);
+    let start_de: QueryStartRequest = serde_json::from_value(start_expected).unwrap();
+    assert_eq!(start_de, start);
+
+    let page = QueryPageRequest {
+        query_id: "q_1".to_string(),
+        page_index: Some(1),
+        page_size: Some(500),
+    };
+    let page_expected = json!({
+        "query_id": "q_1",
+        "page_index": 1,
+        "page_size": 500
+    });
+    assert_eq!(serde_json::to_value(&page).unwrap(), page_expected);
+    let page_de: QueryPageRequest = serde_json::from_value(page_expected).unwrap();
+    assert_eq!(page_de, page);
+
+    let cancel = QueryCancelRequest {
+        query_id: "q_1".to_string(),
+    };
+    let cancel_expected = json!({ "query_id": "q_1" });
+    assert_eq!(serde_json::to_value(&cancel).unwrap(), cancel_expected);
+    let cancel_de: QueryCancelRequest = serde_json::from_value(cancel_expected).unwrap();
+    assert_eq!(cancel_de, cancel);
+
+    let cancel_result = QueryCancelResult {
+        query_id: "q_1".to_string(),
+        cancelled: true,
+        message: "Query cancelled".to_string(),
+    };
+    let cancel_result_expected = json!({
+        "query_id": "q_1",
+        "cancelled": true,
+        "message": "Query cancelled"
+    });
+    assert_eq!(
+        serde_json::to_value(&cancel_result).unwrap(),
+        cancel_result_expected
+    );
+    let cancel_result_de: QueryCancelResult =
+        serde_json::from_value(cancel_result_expected).unwrap();
+    assert_eq!(cancel_result_de, cancel_result);
 }

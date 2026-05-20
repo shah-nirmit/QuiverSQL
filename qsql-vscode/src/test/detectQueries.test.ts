@@ -34,7 +34,14 @@ Module.prototype.require = function (packageName: string, ...args: any[]) {
 
 // Now import detectQueries and interfaces from extension
 import { detectQueries, DetectedQuery } from '../extension';
-import { escapeHtml, formatCellValue, formatErrorMessage } from '../webviewPanel';
+import {
+    escapeHtml,
+    formatCellValue,
+    formatErrorMessage,
+    getQueryPageColumns,
+    renderQueryPageHtml
+} from '../webviewPanel';
+import { QueryPage } from '../models';
 
 // -------------------------------------------------------------
 // 2. Mock vscode.TextDocument implementation
@@ -193,6 +200,65 @@ function testFormatErrorMessage() {
     console.log("OK testFormatErrorMessage passed!");
 }
 
+function testPagedGridRendering() {
+    const page: QueryPage = {
+        query_id: 'q_1',
+        schema: {
+            fields: [
+                { name: 'id', data_type: 'Int64', nullable: false },
+                { name: 'name', data_type: 'Utf8', nullable: true }
+            ]
+        },
+        page_index: 0,
+        page_size: 1,
+        is_last: false,
+        data: [{ id: 1, name: '<Alice>' }],
+        metrics: {
+            planning_time_ms: 1,
+            execution_time_ms: 2,
+            first_page_time_ms: 3,
+            rows_produced: 2,
+            rows_returned: 1
+        },
+        warning: 'Requested page_size 10001 exceeded the maximum 10000; using 10000.'
+    };
+
+    assert.deepStrictEqual(getQueryPageColumns(page), ['id', 'name']);
+
+    const html = renderQueryPageHtml(page, 12);
+    assert.ok(html.includes('Next Page'));
+    assert.ok(html.includes('Cancel'));
+    assert.ok(html.includes('Page 1'));
+    assert.ok(html.includes('&lt;Alice&gt;'));
+    assert.ok(html.includes('Requested page_size 10001 exceeded'));
+    assert.ok(html.includes('1 row(s) returned on this page, 2 total row(s) produced'));
+    console.log("OK testPagedGridRendering passed!");
+}
+
+function testPagedGridEmptyState() {
+    const page: QueryPage = {
+        query_id: 'q_empty',
+        schema: { fields: [{ name: 'value', data_type: 'Int64', nullable: true }] },
+        page_index: 0,
+        page_size: 1000,
+        is_last: true,
+        data: [],
+        metrics: {
+            planning_time_ms: 0,
+            execution_time_ms: 1,
+            first_page_time_ms: 1,
+            rows_produced: 0,
+            rows_returned: 0
+        }
+    };
+
+    const html = renderQueryPageHtml(page, 2);
+    assert.ok(html.includes('No rows returned.'));
+    assert.ok(html.includes('Next Page</button>') || html.includes('Next Page'));
+    assert.ok(html.includes('disabled'));
+    console.log("OK testPagedGridEmptyState passed!");
+}
+
 // -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
@@ -211,6 +277,8 @@ function runAll() {
         testEscapeHtml();
         testFormatCellValue();
         testFormatErrorMessage();
+        testPagedGridRendering();
+        testPagedGridEmptyState();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

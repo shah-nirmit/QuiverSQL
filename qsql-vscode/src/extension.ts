@@ -336,14 +336,43 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const start = Date.now();
         try {
-            const result = await daemonClient.sendRequest<any[]>('execute_json', { sql: sql });
-            const duration = Date.now() - start;
-            
-            // Show result in the rich Webview Data Grid
             const { ResultGridPanel } = await import('./webviewPanel');
             ResultGridPanel.createOrShow(context.extensionUri);
             if (ResultGridPanel.currentPanel) {
-                ResultGridPanel.currentPanel.updateData(result as any[], duration);
+                ResultGridPanel.currentPanel.updateLoading('Running query...');
+                ResultGridPanel.currentPanel.setPagingHandlers({
+                    onNextPage: async (queryId, pageIndex, pageSize) => {
+                        if (!daemonClient || !ResultGridPanel.currentPanel) {
+                            return;
+                        }
+                        const pageStart = Date.now();
+                        try {
+                            ResultGridPanel.currentPanel.updateLoading('Loading next page...');
+                            const page = await daemonClient.getQueryPage(queryId, pageIndex, pageSize);
+                            ResultGridPanel.currentPanel.updatePage(page, Date.now() - pageStart);
+                        } catch (e: any) {
+                            ResultGridPanel.currentPanel.updateError(e.message || JSON.stringify(e), Date.now() - pageStart);
+                        }
+                    },
+                    onCancel: async (queryId) => {
+                        if (!daemonClient || !ResultGridPanel.currentPanel) {
+                            return;
+                        }
+                        const cancelStart = Date.now();
+                        try {
+                            const result = await daemonClient.cancelQuery(queryId);
+                            ResultGridPanel.currentPanel.updateError(result.message, Date.now() - cancelStart);
+                        } catch (e: any) {
+                            ResultGridPanel.currentPanel.updateError(e.message || JSON.stringify(e), Date.now() - cancelStart);
+                        }
+                    }
+                });
+            }
+            const result = await daemonClient.startQuery(sql);
+            const duration = Date.now() - start;
+
+            if (ResultGridPanel.currentPanel) {
+                ResultGridPanel.currentPanel.updatePage(result, duration);
             }
 
         } catch (e: any) {

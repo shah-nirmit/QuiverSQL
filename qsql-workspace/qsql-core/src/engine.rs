@@ -1,6 +1,13 @@
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::execution::options::{CsvReadOptions, NdJsonReadOptions, ParquetReadOptions};
 use datafusion::prelude::*;
+use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
+
+use crate::models::{
+    build_query_page, normalize_page_size, PerformanceMetrics, QueryError, QueryExecutionResult,
+    QueryPage, Schema as QsqlSchema, SchemaField,
+};
 
 pub struct QsqlEngine {
     ctx: SessionContext,
@@ -50,6 +57,91 @@ impl QsqlEngine {
         let json_str = String::from_utf8(buf).map_err(|e| e.to_string())?;
         let val: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| e.to_string())?;
         Ok(val)
+    }
+
+    /// Executes a SQL query and returns a page-oriented result with schema and metrics.
+    pub async fn execute_sql_to_page(
+        &self,
+        query_id: &str,
+        sql: &str,
+        page_index: usize,
+        page_size: usize,
+        warning: Option<String>,
+        cancellation_token: CancellationToken,
+        timeout_ms: Option<u64>,
+    ) -> Result<QueryPage, QueryError> {
+        let (page_size, size_warning) = normalize_page_size(Some(page_size))?;
+        let warning = warning.or(size_warning);
+        let result = self
+            .execute_sql_collect(sql, cancellation_token, timeout_ms)
+            .await?;
+
+        Ok(build_query_page(
+            query_id.to_string(),
+            &result,
+            page_index,
+            page_size,
+            warning,
+        ))
+    }
+
+    /// Executes a SQL query and returns all rows plus schema/metrics.
+    /// The daemon uses this to cache row data for subsequent JSON pages.
+    pub async fn execute_sql_collect(
+        &self,
+        sql: &str,
+        cancellation_token: CancellationToken,
+        timeout_ms: Option<u64>,
+    ) -> Result<QueryExecutionResult, QueryError> {
+        if timeout_ms == Some(0) {
+            return Err(query_timeout_error(0));
+        }
+
+        let execution = async {
+            let planning_start = Instant::now();
+            let df = self.ctx.sql(sql).await.map_err(query_execution_error)?;
+            let schema = dataframe_schema_to_qsql_schema(df.schema());
+            let planning_time_ms = elapsed_ms(planning_start);
+
+            let execution_start = Instant::now();
+            let batches = df.collect().await.map_err(query_execution_error)?;
+            let execution_time_ms = elapsed_ms(execution_start);
+
+            let data = record_batches_to_json_rows(&batches)?;
+            let rows_produced = data.len() as u64;
+
+            Ok(QueryExecutionResult {
+                schema,
+                data,
+                metrics: PerformanceMetrics {
+                    planning_time_ms,
+                    execution_time_ms,
+                    first_page_time_ms: planning_time_ms + execution_time_ms,
+                    rows_produced,
+                    rows_returned: rows_produced,
+                },
+            })
+        };
+
+        match timeout_ms {
+            Some(timeout_ms) => {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => Err(query_cancelled_error()),
+                    result = tokio::time::timeout(Duration::from_millis(timeout_ms), execution) => {
+                        match result {
+                            Ok(result) => result,
+                            Err(_) => Err(query_timeout_error(timeout_ms)),
+                        }
+                    }
+                }
+            }
+            None => {
+                tokio::select! {
+                    _ = cancellation_token.cancelled() => Err(query_cancelled_error()),
+                    result = execution => result,
+                }
+            }
+        }
     }
 
     /// Registers a local file as a virtual table in the DataFusion context.
@@ -173,6 +265,69 @@ impl QsqlEngine {
     }
 }
 
+fn elapsed_ms(start: Instant) -> u64 {
+    start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn query_execution_error(error: impl ToString) -> QueryError {
+    QueryError {
+        code: -32001,
+        message: error.to_string(),
+        details: None,
+    }
+}
+
+fn query_cancelled_error() -> QueryError {
+    QueryError {
+        code: -32002,
+        message: "Query cancelled".to_string(),
+        details: None,
+    }
+}
+
+fn query_timeout_error(timeout_ms: u64) -> QueryError {
+    QueryError {
+        code: -32003,
+        message: format!("Query timed out after {timeout_ms}ms"),
+        details: None,
+    }
+}
+
+fn dataframe_schema_to_qsql_schema(schema: &datafusion::common::DFSchema) -> QsqlSchema {
+    QsqlSchema {
+        fields: schema
+            .fields()
+            .iter()
+            .map(|field| SchemaField {
+                name: field.name().to_string(),
+                data_type: field.data_type().to_string(),
+                nullable: field.is_nullable(),
+            })
+            .collect(),
+    }
+}
+
+fn record_batches_to_json_rows(
+    batches: &[datafusion::arrow::record_batch::RecordBatch],
+) -> Result<Vec<serde_json::Value>, QueryError> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = datafusion::arrow::json::ArrayWriter::new(&mut buf);
+        for batch in batches {
+            writer.write(batch).map_err(query_execution_error)?;
+        }
+        writer.finish().map_err(query_execution_error)?;
+    }
+
+    let json_str = String::from_utf8(buf).map_err(query_execution_error)?;
+    let val: serde_json::Value = serde_json::from_str(&json_str).map_err(query_execution_error)?;
+    Ok(val.as_array().cloned().unwrap_or_default())
+}
+
 fn file_extension_filter(file_path: &str, default_extension: &str) -> String {
     std::path::Path::new(file_path)
         .extension()
@@ -203,9 +358,18 @@ pub struct QueryLineage {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn create_temp_csv() -> String {
-        let path = std::env::temp_dir().join("test_qsql_emp.csv");
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "test_qsql_emp_{}_{}.csv",
+            std::process::id(),
+            nanos
+        ));
         let mut file = std::fs::File::create(&path).unwrap();
         writeln!(file, "id,name,department,salary").unwrap();
         writeln!(file, "1,Alice,Engineering,100000").unwrap();
@@ -255,5 +419,96 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("non_existent"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_to_page_includes_schema_and_metadata() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine
+            .register_file("employees", &csv_path, "csv")
+            .await
+            .unwrap();
+
+        let page = engine
+            .execute_sql_to_page(
+                "q_test",
+                "SELECT id, name FROM employees ORDER BY id",
+                0,
+                1,
+                None,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.query_id, "q_test");
+        assert_eq!(page.page_index, 0);
+        assert_eq!(page.page_size, 1);
+        assert!(!page.is_last);
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.schema.fields.len(), 2);
+        assert_eq!(page.schema.fields[0].name, "id");
+        assert_eq!(page.metrics.rows_produced, 2);
+        assert_eq!(page.metrics.rows_returned, 1);
+
+        let _ = std::fs::remove_file(csv_path);
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_to_page_clamps_large_page_size() {
+        let engine = QsqlEngine::new();
+        let page = engine
+            .execute_sql_to_page(
+                "q_clamp",
+                "SELECT 1 AS value",
+                0,
+                crate::models::MAX_PAGE_SIZE + 1,
+                None,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.page_size, crate::models::MAX_PAGE_SIZE);
+        assert!(page.warning.unwrap().contains("exceeded the maximum"));
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_to_page_empty_result_is_last() {
+        let engine = QsqlEngine::new();
+        let page = engine
+            .execute_sql_to_page(
+                "q_empty",
+                "SELECT 1 AS value WHERE false",
+                0,
+                100,
+                None,
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(page.data.len(), 0);
+        assert!(page.is_last);
+        assert_eq!(page.metrics.rows_produced, 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_sql_to_page_returns_cancellation_error() {
+        let engine = QsqlEngine::new();
+        let token = CancellationToken::new();
+        token.cancel();
+
+        let err = engine
+            .execute_sql_to_page("q_cancel", "SELECT 1", 0, 100, None, token, None)
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code, -32002);
+        assert_eq!(err.message, "Query cancelled");
     }
 }

@@ -3,7 +3,13 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { QueryError } from './models';
+import {
+    QueryCancelResult,
+    QueryError,
+    QueryPage,
+    QueryPageRequest,
+    QueryStartRequest
+} from './models';
 
 let requestIdCounter = 0;
 
@@ -64,6 +70,11 @@ export class DaemonClient {
             this.process.on('close', (code) => {
                 console.log(`QuiverSQL Daemon exited with code ${code}`);
                 this.process = undefined;
+                this.rejectPendingRequests({
+                    code: -32010,
+                    message: `QuiverSQL Daemon exited with code ${code}`,
+                    details: undefined
+                });
             });
 
             this.process.on('spawn', () => {
@@ -186,10 +197,39 @@ export class DaemonClient {
         });
     }
 
+    public startQuery(sql: string, options: { pageSize?: number; timeoutMs?: number } = {}): Promise<QueryPage> {
+        const request: QueryStartRequest = {
+            sql,
+            page_size: options.pageSize,
+            timeout_ms: options.timeoutMs
+        };
+        return this.sendRequest<QueryPage>('query_start', request);
+    }
+
+    public getQueryPage(queryId: string, pageIndex?: number, pageSize?: number): Promise<QueryPage> {
+        const request: QueryPageRequest = {
+            query_id: queryId,
+            page_index: pageIndex,
+            page_size: pageSize
+        };
+        return this.sendRequest<QueryPage>('query_page', request);
+    }
+
+    public cancelQuery(queryId: string): Promise<QueryCancelResult> {
+        return this.sendRequest<QueryCancelResult>('query_cancel', { query_id: queryId });
+    }
+
     public stop() {
         if (this.process) {
             this.process.kill();
             this.process = undefined;
         }
+    }
+
+    private rejectPendingRequests(error: QueryError): void {
+        for (const { reject } of this.pendingRequests.values()) {
+            reject(error);
+        }
+        this.pendingRequests.clear();
     }
 }
