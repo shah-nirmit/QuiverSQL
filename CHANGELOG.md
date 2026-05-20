@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.1.4-alpha.0 - Unreleased
+## 0.2.0-alpha.0 - Unreleased
+
+- Added a shared SQL pushdown layer for projection, basic filters, and limits using DataFusion SQL unparsing.
+- Reworked SQLite scans to generate pushed-down SQL instead of always scanning `SELECT *`.
+- Added Postgres and MySQL/MariaDB connectors with schema introspection, table registration, and env-gated live tests.
+- Added daemon registration methods for Postgres, MySQL, and MariaDB with credential redaction in catalog responses.
+- Extended the VS Code connect wizard and source replay to support SQL database profiles backed by SecretStorage.
+
+## 0.1.4-alpha.0 - 2026-05-20
 
 - Introduced a thread-safe, persistent data source catalog inside the Rust daemon supporting CSV, Parquet, and SQLite.
 - Added `list_sources`, `remove_source`, and `get_source_metadata` JSON-RPC endpoints to the daemon control plane.

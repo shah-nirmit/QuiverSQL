@@ -36,7 +36,7 @@ fn test_source_profile_golden() {
         kind: SourceKind::Csv,
         connection_details: json!({ "path": "/data/file.csv" }),
     };
-    
+
     let expected = json!({
         "name": "my_csv",
         "kind": "csv",
@@ -232,7 +232,10 @@ fn test_query_error_golden() {
         "code": 5000,
         "message": "Internal server error"
     });
-    assert_eq!(serde_json::to_value(&no_details).unwrap(), expected_no_details);
+    assert_eq!(
+        serde_json::to_value(&no_details).unwrap(),
+        expected_no_details
+    );
 }
 
 #[test]

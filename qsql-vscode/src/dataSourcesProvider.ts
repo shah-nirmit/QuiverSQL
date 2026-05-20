@@ -146,7 +146,7 @@ export class DataSourcesProvider
                     const replayErr = this.sourceManager.replayErrors.get(profile.name) || 'Replay failed / Offline';
                     mergedSources.push({
                         name: profile.name,
-                        kind: profile.kind === 'file' ? (profile.details.format as any) : 'sqlite',
+                        kind: profile.kind === 'file' ? (profile.details.format as any) : profile.kind as any,
                         connection_details: profile.details,
                         status: 'error',
                         error: replayErr

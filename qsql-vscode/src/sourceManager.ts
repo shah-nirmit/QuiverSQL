@@ -3,12 +3,13 @@ import { DaemonClient } from './daemonClient';
 
 export interface PersistentSourceProfile {
     name: string;
-    kind: 'file' | 'sqlite';
+    kind: 'file' | 'sqlite' | 'postgres' | 'mysql' | 'mariadb';
     details: {
         path?: string;      // for file
         format?: string;    // for file
         dbPath?: string;    // for sqlite
         tableName?: string; // for sqlite table name
+        schema?: string;    // for SQL database schema/database
     };
     secretKey?: string;
 }
@@ -41,7 +42,7 @@ export class SourceManager {
      */
     public async addSource(
         name: string,
-        kind: 'file' | 'sqlite',
+        kind: PersistentSourceProfile['kind'],
         details: PersistentSourceProfile['details'],
         secret?: string
     ): Promise<void> {
@@ -106,6 +107,23 @@ export class SourceManager {
                         table_name: profile.details.tableName,
                         alias: profile.name
                     });
+                } else if (profile.kind === 'postgres') {
+                    await this.daemonClient.sendRequest('register_postgres', {
+                        connection_string: _password,
+                        table_name: profile.details.tableName,
+                        schema: profile.details.schema,
+                        alias: profile.name
+                    });
+                } else if (profile.kind === 'mysql' || profile.kind === 'mariadb') {
+                    await this.daemonClient.sendRequest(
+                        profile.kind === 'mariadb' ? 'register_mariadb' : 'register_mysql',
+                        {
+                            connection_string: _password,
+                            table_name: profile.details.tableName,
+                            schema: profile.details.schema,
+                            alias: profile.name
+                        }
+                    );
                 }
                 this.replayErrors.delete(profile.name);
             } catch (e: any) {

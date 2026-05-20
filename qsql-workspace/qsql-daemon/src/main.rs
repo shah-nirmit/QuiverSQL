@@ -1,12 +1,15 @@
+use datafusion::datasource::TableProvider;
+use qsql_connectors::mysql::MySqlTableProvider;
+use qsql_connectors::postgres::PostgresTableProvider;
+use qsql_connectors::sql::SqlDialectKind;
 use qsql_connectors::sqlite::SqliteTableProvider;
 use qsql_connectors::RemoteConnector;
-use datafusion::datasource::TableProvider;
-use qsql_core::models::{
-    build_query_page, normalize_page_size, QueryCancelRequest, QueryCancelResult, QueryError,
-    QueryExecutionResult, QueryPageRequest, QueryStartRequest, CatalogSource, RemoveSourceRequest,
-    RemoveSourceResult, GetSourceMetadataRequest, SourceKind,
-};
 use qsql_core::engine::arrow_schema_to_qsql_schema;
+use qsql_core::models::{
+    build_query_page, normalize_page_size, CatalogSource, GetSourceMetadataRequest,
+    QueryCancelRequest, QueryCancelResult, QueryError, QueryExecutionResult, QueryPageRequest,
+    QueryStartRequest, RemoveSourceRequest, RemoveSourceResult, SourceKind,
+};
 use qsql_core::{init_core, QsqlEngine, QSQL_CORE_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +55,22 @@ struct RegisterSqliteRequest {
     db_path: String,
     table_name: String,
     alias: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RegisterPostgresRequest {
+    connection_string: String,
+    table_name: String,
+    alias: Option<String>,
+    schema: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct RegisterMySqlRequest {
+    connection_string: String,
+    table_name: String,
+    alias: Option<String>,
+    schema: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -265,7 +284,11 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
                 Ok(r) => r,
                 Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
             };
-            match state.engine.register_file(&file_req.table_name, &file_req.path, &file_req.format).await {
+            match state
+                .engine
+                .register_file(&file_req.table_name, &file_req.path, &file_req.format)
+                .await
+            {
                 Ok(res) => make_success(serde_json::Value::String(res)),
                 Err(e) => make_error(-32001, e),
             }
@@ -279,7 +302,10 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
                 Ok(r) => r,
                 Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
             };
-            let alias = sqlite_req.alias.as_deref().unwrap_or(&sqlite_req.table_name);
+            let alias = sqlite_req
+                .alias
+                .as_deref()
+                .unwrap_or(&sqlite_req.table_name);
             match SqliteTableProvider::try_new(&sqlite_req.db_path, &sqlite_req.table_name) {
                 Ok(provider) => {
                     let provider_arc = Arc::new(provider);
@@ -302,6 +328,127 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
 
                     match state.engine.register_table(alias, provider_arc.clone()) {
                         Ok(msg) => make_success(serde_json::Value::String(msg)),
+                        Err(e) => make_error(-32001, e),
+                    }
+                }
+                Err(e) => make_error(-32001, e),
+            }
+        }
+        "register_postgres" => {
+            let params = match req.params {
+                Some(p) => p,
+                None => return make_error(-32602, "Missing params".to_string()),
+            };
+            let postgres_req: RegisterPostgresRequest = match serde_json::from_value(params) {
+                Ok(r) => r,
+                Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
+            };
+            if postgres_req.connection_string.trim().is_empty() {
+                return make_error(-32602, "connection_string is required".to_string());
+            }
+            if postgres_req.table_name.trim().is_empty() {
+                return make_error(-32602, "table_name is required".to_string());
+            }
+
+            let alias = postgres_req
+                .alias
+                .as_deref()
+                .unwrap_or(&postgres_req.table_name)
+                .to_string();
+            match PostgresTableProvider::try_new(
+                postgres_req.connection_string,
+                postgres_req.schema.clone(),
+                postgres_req.table_name.clone(),
+            )
+            .await
+            {
+                Ok(provider) => {
+                    let provider_arc = Arc::new(provider);
+                    let qsql_schema = arrow_schema_to_qsql_schema(&provider_arc.schema());
+                    let capabilities = provider_arc.connector().capabilities();
+                    match state.engine.register_table(&alias, provider_arc.clone()) {
+                        Ok(msg) => {
+                            state.engine.catalog_source(CatalogSource {
+                                name: alias,
+                                kind: SourceKind::Postgres,
+                                connection_details: serde_json::json!({
+                                    "schema": postgres_req.schema.unwrap_or_else(|| "public".to_string()),
+                                    "table_name": postgres_req.table_name,
+                                    "connection": "<redacted>",
+                                }),
+                                schema: Some(qsql_schema),
+                                capabilities: Some(capabilities),
+                                status: "ready".to_string(),
+                                error: None,
+                            });
+                            make_success(serde_json::Value::String(msg))
+                        }
+                        Err(e) => make_error(-32001, e),
+                    }
+                }
+                Err(e) => make_error(-32001, e),
+            }
+        }
+        "register_mysql" | "register_mariadb" => {
+            let params = match req.params {
+                Some(p) => p,
+                None => return make_error(-32602, "Missing params".to_string()),
+            };
+            let mysql_req: RegisterMySqlRequest = match serde_json::from_value(params) {
+                Ok(r) => r,
+                Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
+            };
+            if mysql_req.connection_string.trim().is_empty() {
+                return make_error(-32602, "connection_string is required".to_string());
+            }
+            if mysql_req.table_name.trim().is_empty() {
+                return make_error(-32602, "table_name is required".to_string());
+            }
+
+            let dialect = if method == "register_mariadb" {
+                SqlDialectKind::Mariadb
+            } else {
+                SqlDialectKind::Mysql
+            };
+            let source_kind = if method == "register_mariadb" {
+                SourceKind::Mariadb
+            } else {
+                SourceKind::Mysql
+            };
+            let alias = mysql_req
+                .alias
+                .as_deref()
+                .unwrap_or(&mysql_req.table_name)
+                .to_string();
+            match MySqlTableProvider::try_new(
+                mysql_req.connection_string,
+                dialect,
+                mysql_req.schema.clone(),
+                mysql_req.table_name.clone(),
+            )
+            .await
+            {
+                Ok(provider) => {
+                    let provider_arc = Arc::new(provider);
+                    let qsql_schema = arrow_schema_to_qsql_schema(&provider_arc.schema());
+                    let capabilities = provider_arc.connector().capabilities();
+                    match state.engine.register_table(&alias, provider_arc.clone()) {
+                        Ok(msg) => {
+                            state.engine.catalog_source(CatalogSource {
+                                name: alias,
+                                kind: source_kind,
+                                connection_details: serde_json::json!({
+                                    "schema": mysql_req.schema,
+                                    "table_name": mysql_req.table_name,
+                                    "connection": "<redacted>",
+                                }),
+                                schema: Some(qsql_schema),
+                                capabilities: Some(capabilities),
+                                status: "ready".to_string(),
+                                error: None,
+                            });
+                            make_success(serde_json::Value::String(msg))
+                        }
                         Err(e) => make_error(-32001, e),
                     }
                 }
@@ -354,13 +501,8 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
                 .await
             {
                 Ok(result) => {
-                    let page = build_query_page(
-                        query_id.clone(),
-                        &result,
-                        0,
-                        page_size,
-                        warning.clone(),
-                    );
+                    let page =
+                        build_query_page(query_id.clone(), &result, 0, page_size, warning.clone());
                     let mut sessions = state.sessions.lock().unwrap();
                     sessions.insert(
                         query_id,

@@ -1,24 +1,19 @@
 //! SQLite connector for QuiverSQL.
-//!
-//! Implements both the `RemoteConnector` trait (for direct query execution)
-//! and a DataFusion `TableProvider` (so SQLite tables can be referenced in
-//! federated SQL queries alongside local CSV/Parquet files).
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-};
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::Session;
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
-use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::prelude::Expr;
 use rusqlite::{types::ValueRef, Connection};
 use std::sync::Arc;
 
+use crate::sql::{
+    quote_identifier, sql_capabilities, sql_type_to_arrow, SqlDialectKind, SqlPushdownPlan,
+    SqlTableProvider, SqlTableRef,
+};
 use crate::RemoteConnector;
 
 /// A connector to a local SQLite database file.
@@ -46,23 +41,13 @@ impl RemoteConnector for SqliteConnector {
     }
 
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
-        qsql_core::models::ConnectorCapabilities {
-            projection: true,
-            filter: true,
-            limit: true,
-            aggregate: true,
-            joins: true,
-            dialect_name: "sqlite".to_string(),
-        }
+        sql_capabilities(SqlDialectKind::Sqlite)
     }
 
-    /// Execute any SQL query against the SQLite database and return results as
-    /// a JSON array of row objects (column_name -> value).
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
         let db_path = self.db_path.clone();
         let sql = sql.to_string();
 
-        // rusqlite is sync; run it on a blocking thread so we don't block tokio.
         tokio::task::spawn_blocking(move || {
             let conn = Connection::open(&db_path)
                 .map_err(|e| format!("Failed to open SQLite DB '{}': {}", db_path, e))?;
@@ -108,93 +93,47 @@ impl RemoteConnector for SqliteConnector {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DataFusion TableProvider — lets SQLite tables appear in federated queries
-// ---------------------------------------------------------------------------
-
 /// A DataFusion `TableProvider` backed by a single SQLite table.
-/// When DataFusion scans this provider it executes `SELECT * FROM <table>`
-/// against the SQLite file, converts the result to Arrow, and returns a
-/// `MemoryExec` plan. This is a straightforward "full-scan" proxy — predicate
-/// pushdown can be layered on top in a future iteration.
 #[derive(Debug)]
 pub struct SqliteTableProvider {
     connector: Arc<SqliteConnector>,
-    table_name: String,
-    schema: SchemaRef,
+    inner: SqlTableProvider,
 }
 
 impl SqliteTableProvider {
-    /// Open `db_path`, introspect `table_name`, and build the Arrow schema
-    /// by executing a `LIMIT 0` query and reading column type affinities.
     pub fn try_new(
         db_path: impl Into<String>,
         table_name: impl Into<String>,
     ) -> Result<Self, String> {
         let db_path = db_path.into();
         let table_name = table_name.into();
-
-        let conn = Connection::open(&db_path).map_err(|e| format!("SQLite open error: {}", e))?;
-
-        // Use PRAGMA table_info to get column names and declared types.
-        let mut stmt = conn
-            .prepare(&format!("PRAGMA table_info(\"{}\")", table_name))
-            .map_err(|e| format!("PRAGMA error: {}", e))?;
-
-        let mut fields: Vec<Field> = Vec::new();
-        let rows = stmt
-            .query_map([], |row| {
-                let name: String = row.get(1)?;
-                let col_type: String = row.get(2).unwrap_or_default();
-                Ok((name, col_type))
-            })
-            .map_err(|e| format!("PRAGMA query error: {}", e))?;
-
-        for r in rows {
-            let (name, col_type) = r.map_err(|e| format!("Row error: {}", e))?;
-            let arrow_type = sqlite_type_to_arrow(&col_type);
-            fields.push(Field::new(&name, arrow_type, true));
-        }
-
-        if fields.is_empty() {
-            return Err(format!(
-                "Table '{}' not found or has no columns in '{}'",
-                table_name, db_path
-            ));
-        }
-
-        let schema = Arc::new(Schema::new(fields));
+        let schema = introspect_sqlite_schema(&db_path, &table_name)?;
         let connector = Arc::new(SqliteConnector::new(db_path));
-
-        Ok(Self {
-            connector,
-            table_name,
+        let inner = SqlTableProvider::new(
+            connector.clone(),
+            SqlDialectKind::Sqlite,
+            SqlTableRef::bare(table_name),
             schema,
-        })
+        );
+
+        Ok(Self { connector, inner })
     }
 
     pub fn connector(&self) -> &Arc<SqliteConnector> {
         &self.connector
     }
-}
 
-/// Map SQLite type affinity strings to Arrow DataTypes.
-fn sqlite_type_to_arrow(sqlite_type: &str) -> DataType {
-    let upper = sqlite_type.to_uppercase();
-    if upper.contains("INT") {
-        DataType::Int64
-    } else if upper.contains("REAL")
-        || upper.contains("FLOA")
-        || upper.contains("DOUB")
-        || upper.contains("NUM")
-        || upper.contains("DEC")
-    {
-        DataType::Float64
-    } else if upper.contains("BOOL") {
-        DataType::Boolean
-    } else {
-        // TEXT, BLOB, and everything else → Utf8
-        DataType::Utf8
+    pub fn build_select_sql(
+        &self,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<SqlPushdownPlan, String> {
+        self.inner.build_select_sql(projection, filters, limit)
+    }
+
+    pub fn last_sql(&self) -> Option<String> {
+        self.inner.last_sql()
     }
 }
 
@@ -205,146 +144,83 @@ impl TableProvider for SqliteTableProvider {
     }
 
     fn schema(&self) -> SchemaRef {
-        self.schema.clone()
+        self.inner.schema()
     }
 
-    fn table_type(&self) -> datafusion::datasource::TableType {
-        datafusion::datasource::TableType::Base
+    fn table_type(&self) -> TableType {
+        self.inner.table_type()
     }
 
     async fn scan(
         &self,
-        _state: &dyn Session,
+        state: &dyn Session,
         projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-        _limit: Option<usize>,
+        filters: &[Expr],
+        limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let sql = format!("SELECT * FROM \"{}\"", self.table_name);
+        self.inner.scan(state, projection, filters, limit).await
+    }
 
-        // Execute via the connector (runs on a blocking thread internally).
-        let rows = self
-            .connector
-            .execute_query(&sql)
-            .await
-            .map_err(|e| DataFusionError::External(e.into()))?;
-
-        // Convert JSON rows → Arrow RecordBatch using the provider's schema.
-        let schema = self.schema.clone();
-        let batch = json_rows_to_record_batch(&rows, schema.clone())
-            .map_err(|e| DataFusionError::External(e.into()))?;
-
-        // Apply column projection if DataFusion requests a subset of columns.
-        let projected_batch = match projection {
-            Some(indices) => batch
-                .project(indices)
-                .map_err(|e| DataFusionError::ArrowError(e, None))?,
-            None => batch,
-        };
-
-        let projected_schema = projected_batch.schema();
-        let partitions = vec![vec![projected_batch]];
-        Ok(Arc::new(MemoryExec::try_new(
-            &partitions,
-            projected_schema,
-            None,
-        )?))
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> datafusion::common::Result<Vec<TableProviderFilterPushDown>> {
+        self.inner.supports_filters_pushdown(filters)
     }
 }
 
-/// Convert a Vec of JSON row objects into an Arrow RecordBatch using the
-/// provided schema. Each column is built independently using typed Arrow builders.
-fn json_rows_to_record_batch(
-    rows: &[serde_json::Value],
-    schema: SchemaRef,
-) -> Result<RecordBatch, String> {
-    if rows.is_empty() {
-        return Ok(RecordBatch::new_empty(schema));
+fn introspect_sqlite_schema(db_path: &str, table_name: &str) -> Result<SchemaRef, String> {
+    let conn = Connection::open(db_path).map_err(|e| format!("SQLite open error: {}", e))?;
+    let pragma_sql = format!(
+        "PRAGMA table_info({})",
+        quote_identifier(table_name, SqlDialectKind::Sqlite)
+    );
+    let mut stmt = conn
+        .prepare(&pragma_sql)
+        .map_err(|e| format!("PRAGMA error: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let name: String = row.get(1)?;
+            let col_type: String = row.get(2).unwrap_or_default();
+            let not_null: i64 = row.get(3).unwrap_or(0);
+            Ok((name, col_type, not_null == 0))
+        })
+        .map_err(|e| format!("PRAGMA query error: {}", e))?;
+
+    let mut fields = Vec::new();
+    for row in rows {
+        let (name, col_type, nullable) = row.map_err(|e| format!("Row error: {}", e))?;
+        fields.push(Field::new(name, sql_type_to_arrow(&col_type), nullable));
     }
 
-    let mut columns: Vec<ArrayRef> = Vec::new();
-
-    for field in schema.fields() {
-        match field.data_type() {
-            DataType::Int64 => {
-                let mut builder = Int64Builder::new();
-                for row in rows {
-                    match row.get(field.name()) {
-                        Some(serde_json::Value::Number(n)) => {
-                            builder.append_value(n.as_i64().unwrap_or(0));
-                        }
-                        Some(serde_json::Value::Null) | None => builder.append_null(),
-                        Some(v) => {
-                            // Try parsing a string representation
-                            builder.append_value(
-                                v.as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0),
-                            );
-                        }
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            DataType::Float64 => {
-                let mut builder = Float64Builder::new();
-                for row in rows {
-                    match row.get(field.name()) {
-                        Some(serde_json::Value::Number(n)) => {
-                            builder.append_value(n.as_f64().unwrap_or(0.0));
-                        }
-                        Some(serde_json::Value::Null) | None => builder.append_null(),
-                        Some(v) => {
-                            builder.append_value(
-                                v.as_str()
-                                    .and_then(|s| s.parse::<f64>().ok())
-                                    .unwrap_or(0.0),
-                            );
-                        }
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            DataType::Boolean => {
-                let mut builder = BooleanBuilder::new();
-                for row in rows {
-                    match row.get(field.name()) {
-                        Some(serde_json::Value::Bool(b)) => builder.append_value(*b),
-                        Some(serde_json::Value::Null) | None => builder.append_null(),
-                        Some(v) => {
-                            builder.append_value(v.as_i64().map(|n| n != 0).unwrap_or(false));
-                        }
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-            _ => {
-                // Default: treat as Utf8 string
-                let mut builder = StringBuilder::new();
-                for row in rows {
-                    match row.get(field.name()) {
-                        Some(serde_json::Value::Null) | None => builder.append_null(),
-                        Some(v) => {
-                            let s = match v {
-                                serde_json::Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            builder.append_value(&s);
-                        }
-                    }
-                }
-                columns.push(Arc::new(builder.finish()));
-            }
-        }
+    if fields.is_empty() {
+        return Err(format!(
+            "Table '{}' not found or has no columns in '{}'",
+            table_name, db_path
+        ));
     }
 
-    RecordBatch::try_new(schema, columns).map_err(|e| e.to_string())
+    Ok(Arc::new(Schema::new(fields)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::prelude::{col, lit};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn create_temp_sqlite(suffix: &str) -> String {
-        let path = std::env::temp_dir().join(format!("test_qsql_sqlite_{}.db", suffix));
-        // Remove old db if exists
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "test_qsql_sqlite_{}_{}_{}.db",
+            suffix,
+            std::process::id(),
+            nanos
+        ));
         let _ = std::fs::remove_file(&path);
 
         let conn = Connection::open(&path).unwrap();
@@ -378,6 +254,8 @@ mod tests {
         assert_eq!(res.len(), 2);
         assert_eq!(res[0]["name"], "Apple");
         assert_eq!(res[0]["price"], 1.20);
+        assert_eq!(connector.capabilities().aggregate, false);
+        assert_eq!(connector.capabilities().joins, false);
 
         let _ = std::fs::remove_file(path);
     }
@@ -390,13 +268,42 @@ mod tests {
 
         assert_eq!(schema.fields().len(), 4);
         assert_eq!(schema.field(0).name(), "id");
-        assert_eq!(*schema.field(0).data_type(), DataType::Int64);
+        assert_eq!(
+            *schema.field(0).data_type(),
+            datafusion::arrow::datatypes::DataType::Int64
+        );
         assert_eq!(schema.field(1).name(), "name");
-        assert_eq!(*schema.field(1).data_type(), DataType::Utf8);
+        assert_eq!(
+            *schema.field(1).data_type(),
+            datafusion::arrow::datatypes::DataType::Utf8
+        );
         assert_eq!(schema.field(2).name(), "price");
-        assert_eq!(*schema.field(2).data_type(), DataType::Float64);
+        assert_eq!(
+            *schema.field(2).data_type(),
+            datafusion::arrow::datatypes::DataType::Float64
+        );
         assert_eq!(schema.field(3).name(), "active");
-        assert_eq!(*schema.field(3).data_type(), DataType::Boolean);
+        assert_eq!(
+            *schema.field(3).data_type(),
+            datafusion::arrow::datatypes::DataType::Boolean
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_sqlite_pushdown_emits_projection_filter_limit() {
+        let path = create_temp_sqlite("pushdown_sql");
+        let provider = SqliteTableProvider::try_new(&path, "products").unwrap();
+        let plan = provider
+            .build_select_sql(Some(&vec![1, 2]), &[col("price").gt(lit(1.0))], Some(1))
+            .unwrap();
+
+        assert_eq!(
+            plan.sql,
+            "SELECT `name`, `price` FROM `products` WHERE (`price` > 1.0) LIMIT 1"
+        );
+        assert!(!plan.sql.contains("SELECT *"));
 
         let _ = std::fs::remove_file(path);
     }

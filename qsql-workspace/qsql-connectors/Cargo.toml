@@ -1,6 +1,6 @@
 [package]
 name = "qsql-connectors"
-version = "0.1.4-alpha.0"
+version = "0.2.0-alpha.0"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,13 @@ datafusion = "44.0.0"
 tokio = { version = "1.36", features = ["full"] }
 async-trait = "0.1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+tokio-postgres = "0.7"
+mysql_async = "0.34"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 parquet = "53.4.1"
+
+[features]
+default = []
+postgres = []
+mysql = []

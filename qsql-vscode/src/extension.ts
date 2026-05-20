@@ -497,7 +497,10 @@ export async function activate(context: vscode.ExtensionContext) {
             { label: '$(file) CSV File', description: 'Attach a local Comma-Separated Values file', type: 'csv' },
             { label: '$(file-binary) Parquet File', description: 'Attach a local binary Parquet file', type: 'parquet' },
             { label: '$(json) JSON File', description: 'Attach a local JSON or NDJSON file', type: 'json' },
-            { label: '$(database) SQLite Database', description: 'Attach a table from a SQLite database file', type: 'sqlite' }
+            { label: '$(database) SQLite Database', description: 'Attach a table from a SQLite database file', type: 'sqlite' },
+            { label: '$(database) Postgres', description: 'Attach a Postgres table using a connection string', type: 'postgres' },
+            { label: '$(database) MySQL', description: 'Attach a MySQL table using a connection string', type: 'mysql' },
+            { label: '$(database) MariaDB', description: 'Attach a MariaDB table using a connection string', type: 'mariadb' }
         ];
 
         const selection = await vscode.window.showQuickPick(sourceTypes, {
@@ -554,6 +557,63 @@ export async function activate(context: vscode.ExtensionContext) {
                 vscode.window.showErrorMessage(`Failed to attach SQLite table: ${e.message || JSON.stringify(e)}`);
             }
 
+        } else if (type === 'postgres' || type === 'mysql' || type === 'mariadb') {
+            const engineLabel = type === 'postgres' ? 'Postgres' : type === 'mysql' ? 'MySQL' : 'MariaDB';
+            const connectionString = await vscode.window.showInputBox({
+                prompt: `${engineLabel} connection string`,
+                placeHolder: type === 'postgres'
+                    ? 'postgres://user:password@localhost:5432/database'
+                    : 'mysql://user:password@localhost:3306/database',
+                password: true,
+                validateInput: (value) => value.trim().length === 0 ? 'Connection string is required' : null
+            });
+            if (!connectionString) return;
+
+            const schema = await vscode.window.showInputBox({
+                prompt: type === 'postgres'
+                    ? 'Schema name (blank uses public)'
+                    : 'Database/schema name (blank uses the connection default)',
+                placeHolder: type === 'postgres' ? 'public' : 'my_database'
+            });
+
+            const tableName = await vscode.window.showInputBox({
+                prompt: `${engineLabel} table name to expose`,
+                placeHolder: 'users',
+                validateInput: (value) => value.trim().length === 0 ? 'Table name is required' : null
+            });
+            if (!tableName) return;
+
+            const alias = await vscode.window.showInputBox({
+                prompt: 'Enter Table Alias (how it will be referenced in your QuiverSQL queries)',
+                placeHolder: tableName,
+                value: tableName,
+                validateInput: (value) => value.trim().length === 0 ? 'Alias is required' : null
+            });
+            if (!alias) return;
+
+            const method = type === 'postgres'
+                ? 'register_postgres'
+                : type === 'mariadb'
+                    ? 'register_mariadb'
+                    : 'register_mysql';
+
+            try {
+                const result = await daemonClient.sendRequest(method, {
+                    connection_string: connectionString,
+                    table_name: tableName,
+                    schema: schema?.trim() || undefined,
+                    alias: alias
+                });
+                vscode.window.showInformationMessage(result);
+
+                await sourceManager.addSource(alias, type, {
+                    tableName: tableName,
+                    schema: schema?.trim() || undefined
+                }, connectionString);
+                dataSourcesProvider.refresh();
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Failed to attach ${engineLabel} table: ${e.message || JSON.stringify(e)}`);
+            }
         } else {
             // File Connection Steps
             // Step 2a: Select File

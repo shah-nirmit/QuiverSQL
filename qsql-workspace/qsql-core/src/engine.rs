@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::{
-    build_query_page, normalize_page_size, PerformanceMetrics, QueryError, QueryExecutionResult,
-    QueryPage, Schema as QsqlSchema, SchemaField, CatalogSource,
+    build_query_page, normalize_page_size, CatalogSource, PerformanceMetrics, QueryError,
+    QueryExecutionResult, QueryPage, Schema as QsqlSchema, SchemaField,
 };
 
 pub struct QsqlEngine {
@@ -31,7 +31,9 @@ impl QsqlEngine {
     }
 
     pub fn remove_source(&self, name: &str) -> Result<bool, String> {
-        let deregistered = self.ctx.deregister_table(name)
+        let deregistered = self
+            .ctx
+            .deregister_table(name)
             .map_err(|e| e.to_string())?
             .is_some();
         let mut catalog = self.catalog.lock().unwrap();
@@ -119,6 +121,10 @@ impl QsqlEngine {
         cancellation_token: CancellationToken,
         timeout_ms: Option<u64>,
     ) -> Result<QueryExecutionResult, QueryError> {
+        if cancellation_token.is_cancelled() {
+            return Err(query_cancelled_error());
+        }
+
         if timeout_ms == Some(0) {
             return Err(query_timeout_error(0));
         }
@@ -212,7 +218,11 @@ impl QsqlEngine {
             _ => unreachable!(),
         }
 
-        let df = self.ctx.table(table_name).await.map_err(|e| e.to_string())?;
+        let df = self
+            .ctx
+            .table(table_name)
+            .await
+            .map_err(|e| e.to_string())?;
         let arrow_schema: &datafusion::arrow::datatypes::Schema = df.schema().as_ref();
         let qsql_schema = arrow_schema_to_qsql_schema(arrow_schema);
 
