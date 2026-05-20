@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { QueryError } from './models';
 
 let requestIdCounter = 0;
 
@@ -13,16 +14,23 @@ interface RpcRequest {
     id?: number;
 }
 
+interface RpcError {
+    code: number;
+    message: string;
+    data?: any;
+    details?: string;
+}
+
 interface RpcResponse {
     jsonrpc: '2.0';
     result?: any;
-    error?: any;
+    error?: RpcError;
     id?: number;
 }
 
 export class DaemonClient {
     private process?: cp.ChildProcess;
-    private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: any) => void }>();
+    private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: QueryError) => void }>();
     private buffer = '';
 
     constructor(private context: vscode.ExtensionContext) {}
@@ -117,7 +125,26 @@ export class DaemonClient {
                     this.pendingRequests.delete(response.id);
 
                     if (response.error) {
-                        reject(response.error);
+                        const rpcErr = response.error;
+                        let details: string | undefined = undefined;
+                        if (rpcErr.data !== undefined) {
+                            if (typeof rpcErr.data === 'string') {
+                                details = rpcErr.data;
+                            } else if (typeof rpcErr.data === 'object' && rpcErr.data !== null) {
+                                details = typeof rpcErr.data.details === 'string'
+                                    ? rpcErr.data.details
+                                    : JSON.stringify(rpcErr.data);
+                            }
+                        } else if (typeof rpcErr.details === 'string') {
+                            details = rpcErr.details;
+                        }
+
+                        const queryError: QueryError = {
+                            code: typeof rpcErr.code === 'number' ? rpcErr.code : -32603,
+                            message: typeof rpcErr.message === 'string' ? rpcErr.message : 'Unknown error',
+                            details
+                        };
+                        reject(queryError);
                     } else {
                         resolve(response.result);
                     }
@@ -128,7 +155,7 @@ export class DaemonClient {
         }
     }
 
-    public async sendRequest(method: string, params?: any): Promise<any> {
+    public async sendRequest<T = any>(method: string, params?: any): Promise<T> {
         if (!this.process || !this.process.stdin) {
             throw new Error('QuiverSQL Daemon is not running');
         }
@@ -143,12 +170,17 @@ export class DaemonClient {
 
         const reqStr = JSON.stringify(request) + '\n';
         
-        return new Promise((resolve, reject) => {
+        return new Promise<T>((resolve, reject) => {
             this.pendingRequests.set(id, { resolve, reject });
             this.process!.stdin!.write(reqStr, (err) => {
                 if (err) {
                     this.pendingRequests.delete(id);
-                    reject(err);
+                    const queryError: QueryError = {
+                        code: -32603,
+                        message: err.message,
+                        details: err.stack
+                    };
+                    reject(queryError);
                 }
             });
         });

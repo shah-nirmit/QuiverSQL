@@ -54,7 +54,7 @@ export class LineageProvider implements vscode.TreeDataProvider<LineageItem> {
         this.activeSql = trimmed;
 
         try {
-            const lineage = await this.daemonClient.sendRequest('get_lineage', trimmed) as QueryLineage;
+            const lineage = await this.daemonClient.sendRequest<QueryLineage>('get_lineage', { sql: trimmed });
             this.buildTree(lineage);
         } catch (e: any) {
             const errMsg = e.message || JSON.stringify(e);

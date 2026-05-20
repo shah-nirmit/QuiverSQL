@@ -1,5 +1,5 @@
 pub mod engine;
-mod models; // Reserved for future data source and table reference models.
+pub mod models;
 
 pub use engine::QsqlEngine;
 

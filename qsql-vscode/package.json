@@ -2,7 +2,7 @@
   "name": "qsql-vscode",
   "displayName": "QuiverSQL Developer Tools",
   "description": "Developer-first, Arrow-native query virtualization layer for VS Code",
-  "version": "0.1.1-alpha.0",
+  "version": "0.1.2-alpha.0",
   "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
@@ -120,7 +120,9 @@
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
-    "test:scanner": "npm run compile && node out/test/detectQueries.test.js"
+    "test:scanner": "npm run compile && node out/test/detectQueries.test.js",
+    "test:client": "npm run compile && node out/test/client.test.js",
+    "test": "npm run compile && node out/test/detectQueries.test.js && node out/test/client.test.js"
   },
   "devDependencies": {
     "@types/vscode": "1.120.0",

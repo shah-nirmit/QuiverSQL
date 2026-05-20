@@ -2,7 +2,7 @@
 
 QuiverSQL uses SemVer for public releases.
 
-The current project version is `0.1.1-alpha.0`. Keep these files in sync when changing it:
+The current project version is `0.1.2-alpha.0`. Keep these files in sync when changing it:
 
 - `VERSION`
 - `qsql-workspace/qsql-core/Cargo.toml`

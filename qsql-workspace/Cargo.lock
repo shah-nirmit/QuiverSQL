@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "qsql-connectors"
-version = "0.1.1-alpha.0"
+version = "0.1.2-alpha.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -2221,7 +2221,7 @@ dependencies = [
 
 [[package]]
 name = "qsql-core"
-version = "0.1.1-alpha.0"
+version = "0.1.2-alpha.0"
 dependencies = [
  "datafusion",
  "serde",
@@ -2231,7 +2231,7 @@ dependencies = [
 
 [[package]]
 name = "qsql-daemon"
-version = "0.1.1-alpha.0"
+version = "0.1.2-alpha.0"
 dependencies = [
  "criterion",
  "qsql-connectors",

@@ -203,7 +203,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
         try {
             const explainSql = `EXPLAIN ${sql.trim().replace(/;$/, '')}`;
-            const result = await daemonClient.sendRequest('execute_json', explainSql) as any[];
+            const result = await daemonClient.sendRequest<any[]>('execute_json', { sql: explainSql });
 
             if (!result || result.length === 0) {
                 vscode.window.showErrorMessage('Failed to generate query execution plan.');
@@ -336,7 +336,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
         const start = Date.now();
         try {
-            const result = await daemonClient.sendRequest('execute_json', sql);
+            const result = await daemonClient.sendRequest<any[]>('execute_json', { sql: sql });
             const duration = Date.now() - start;
             
             // Show result in the rich Webview Data Grid

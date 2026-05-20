@@ -92,16 +92,40 @@ fn unknown_method_returns_json_rpc_error() {
 fn invalid_params_returns_json_rpc_error() {
     let mut rpc = RpcHarness::spawn();
 
-    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"sql":"SELECT 1"},"id":4}"#);
+    // Passing wrong param field "query" instead of "sql"
+    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"query":"SELECT 1"},"id":4}"#);
 
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 4);
     assert!(response.get("result").is_none() || response["result"].is_null());
-    assert_eq!(response["error"]["code"], -32601);
-    assert_eq!(
-        response["error"]["message"],
-        "Invalid params: expected SQL string"
-    );
+    assert_eq!(response["error"]["code"], -32602);
+    assert!(response["error"]["message"].as_str().unwrap().contains("Invalid params"));
+}
+
+#[test]
+fn execute_query_succeeds_with_structured_params() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute","params":{"sql":"SELECT 1"},"id":5}"#);
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 5);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert!(response["result"].as_str().unwrap().contains("1"));
+}
+
+#[test]
+fn execute_json_succeeds_with_structured_params() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"execute_json","params":{"sql":"SELECT 1"},"id":6}"#);
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 6);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert!(response["result"].is_array());
+    let arr = response["result"].as_array().unwrap();
+    assert_eq!(arr.len(), 1);
 }
 
 #[test]

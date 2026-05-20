@@ -16,4 +16,7 @@ pub trait RemoteConnector: Send + Sync {
     /// Connectors may choose to push down full SQL or fall back to
     /// `SELECT *` and let DataFusion handle higher-level planning.
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String>;
+
+    /// Returns the capabilities of this connector.
+    fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities;
 }

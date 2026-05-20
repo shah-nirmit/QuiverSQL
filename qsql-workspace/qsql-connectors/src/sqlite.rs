@@ -45,6 +45,17 @@ impl RemoteConnector for SqliteConnector {
         "sqlite"
     }
 
+    fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
+        qsql_core::models::ConnectorCapabilities {
+            projection: true,
+            filter: true,
+            limit: true,
+            aggregate: true,
+            joins: true,
+            dialect_name: "sqlite".to_string(),
+        }
+    }
+
     /// Execute any SQL query against the SQLite database and return results as
     /// a JSON array of row objects (column_name -> value).
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
