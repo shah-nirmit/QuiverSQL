@@ -404,10 +404,90 @@ function makeQueryPage(queryId: string, pageIndex: number): QueryPage {
 // -------------------------------------------------------------
 // 4. Run Suite
 // -------------------------------------------------------------
+async function testSourceCatalogMethods() {
+    console.log("Running: testSourceCatalogMethods");
+    const client = await createClient();
+    const methods: string[] = [];
+
+    mockProcessInstance.onRequestWritten = (data: string) => {
+        const req = JSON.parse(data.trim());
+        methods.push(req.method);
+
+        if (req.method === 'list_sources') {
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: [
+                    {
+                        name: "my_csv",
+                        kind: "csv",
+                        connection_details: { path: "/path/to/file.csv", format: "csv" },
+                        status: "ok"
+                    }
+                ],
+                id: req.id
+            }) + "\n");
+            return;
+        }
+
+        if (req.method === 'remove_source') {
+            assert.strictEqual(req.params.name, "my_csv");
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: {
+                    name: "my_csv",
+                    removed: true
+                },
+                id: req.id
+            }) + "\n");
+            return;
+        }
+
+        if (req.method === 'get_source_metadata') {
+            assert.strictEqual(req.params.name, "my_csv");
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: {
+                    name: "my_csv",
+                    kind: "csv",
+                    connection_details: { path: "/path/to/file.csv", format: "csv" },
+                    status: "ok",
+                    capabilities: {
+                        projection: true,
+                        filter: true,
+                        limit: true,
+                        aggregate: false,
+                        joins: false,
+                        dialect_name: "generic"
+                    }
+                },
+                id: req.id
+            }) + "\n");
+        }
+    };
+
+    const sources = await client.listSources();
+    assert.strictEqual(sources.length, 1);
+    assert.strictEqual(sources[0].name, "my_csv");
+    assert.strictEqual(sources[0].kind, "csv");
+
+    const removeResult = await client.removeSource("my_csv");
+    assert.strictEqual(removeResult.name, "my_csv");
+    assert.strictEqual(removeResult.removed, true);
+
+    const metadata = await client.getSourceMetadata("my_csv");
+    assert.strictEqual(metadata.name, "my_csv");
+    assert.strictEqual(metadata.capabilities?.projection, true);
+    assert.deepStrictEqual(methods, ['list_sources', 'remove_source', 'get_source_metadata']);
+
+    client.stop();
+    console.log("OK: testSourceCatalogMethods passed!");
+}
+
 async function runAll() {
     console.log("Starting QuiverSQL VS Code Client Unit Tests...\n");
     try {
         await testSuccessfulQuery();
+        await testSourceCatalogMethods();
         await testPagedQueryHelpersSendExpectedRpc();
         await testStandardErrorBubble();
         await testErrorWithDetails();

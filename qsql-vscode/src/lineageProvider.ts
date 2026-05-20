@@ -1,3 +1,4 @@
+import { CatalogSource } from './models';
 import * as vscode from 'vscode';
 import { DaemonClient } from './daemonClient';
 import { DataSourcesProvider } from './dataSourcesProvider';
@@ -107,23 +108,21 @@ export class LineageProvider implements vscode.TreeDataProvider<LineageItem> {
         const registered = this.dataSourcesProvider.getSources();
 
         this.rootNodes = lineage.relations.map(rel => {
-            const matchedSource = registered.find(s => s.tableName.toLowerCase() === rel.table_name.toLowerCase());
+            const matchedSource = registered.find((s: CatalogSource) => s.name.toLowerCase() === rel.table_name.toLowerCase());
             let iconName = 'table'; // Default fallback
             if (matchedSource) {
-                switch (matchedSource.sourceType) {
-                    case 'csv':
-                        iconName = 'table';
-                        break;
-                    case 'sqlite':
-                        iconName = 'database';
-                        break;
-                    case 'parquet':
-                        iconName = 'file-binary';
-                        break;
-                    case 'json':
-                        iconName = 'json';
-                        break;
-                }
+                const iconMap: Record<string, string> = {
+                    csv:         'table',
+                    parquet:     'file-binary',
+                    json:        'json',
+                    ndjson:      'json',
+                    sqlite:      'database',
+                    fixed_width: 'file-text',
+                    postgres:    'database',
+                    mysql:       'database',
+                    mariadb:     'database',
+                };
+                iconName = iconMap[matchedSource.kind] || 'database';
             }
 
             const colItems = rel.columns.map(col => new LineageItem(

@@ -94,3 +94,27 @@ export interface QueryCancelResult {
     cancelled: boolean;
     message: string;
 }
+
+
+export interface CatalogSource {
+    name: string;
+    kind: SourceKind;
+    connection_details: Record<string, any>;
+    schema?: Schema;
+    capabilities?: ConnectorCapabilities;
+    status: string;
+    error?: string;
+}
+
+export interface RemoveSourceRequest {
+    name: string;
+}
+
+export interface RemoveSourceResult {
+    name: string;
+    removed: boolean;
+}
+
+export interface GetSourceMetadataRequest {
+    name: string;
+}

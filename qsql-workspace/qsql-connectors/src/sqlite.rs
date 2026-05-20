@@ -172,6 +172,10 @@ impl SqliteTableProvider {
             schema,
         })
     }
+
+    pub fn connector(&self) -> &Arc<SqliteConnector> {
+        &self.connector
+    }
 }
 
 /// Map SQLite type affinity strings to Arrow DataTypes.

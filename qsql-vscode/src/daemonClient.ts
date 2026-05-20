@@ -8,7 +8,11 @@ import {
     QueryError,
     QueryPage,
     QueryPageRequest,
-    QueryStartRequest
+    QueryStartRequest,
+    CatalogSource,
+    RemoveSourceResult,
+    RemoveSourceRequest,
+    GetSourceMetadataRequest
 } from './models';
 
 let requestIdCounter = 0;
@@ -231,5 +235,19 @@ export class DaemonClient {
             reject(error);
         }
         this.pendingRequests.clear();
+    }
+
+    public listSources(): Promise<CatalogSource[]> {
+        return this.sendRequest<CatalogSource[]>('list_sources');
+    }
+
+    public removeSource(name: string): Promise<RemoveSourceResult> {
+        const request: RemoveSourceRequest = { name };
+        return this.sendRequest<RemoveSourceResult>('remove_source', request);
+    }
+
+    public getSourceMetadata(name: string): Promise<CatalogSource> {
+        const request: GetSourceMetadataRequest = { name };
+        return this.sendRequest<CatalogSource>('get_source_metadata', request);
     }
 }

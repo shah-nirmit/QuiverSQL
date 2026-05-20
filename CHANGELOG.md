@@ -2,7 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.1.3-alpha.0 - Unreleased
+## 0.1.4-alpha.0 - Unreleased
+
+- Introduced a thread-safe, persistent data source catalog inside the Rust daemon supporting CSV, Parquet, and SQLite.
+- Added `list_sources`, `remove_source`, and `get_source_metadata` JSON-RPC endpoints to the daemon control plane.
+- Implemented a VS Code `SourceManager` with secure operating system keychain storage integration via `SecretStorage` for database credentials.
+- Enabled automatic, concurrent workspace source activation and replay during extension load with graceful, isolated error handling.
+- Refactored the tree data explorer to pull directly from the daemon's active catalog state, adding custom file/database icons and rich markdown warning tooltips.
+
+## 0.1.3-alpha.0 - 2026-05-20
 
 - Added `query_start`, `query_page`, and `query_cancel` JSON-RPC endpoints to the daemon to enable paged JSON query delivery and caching.
 - Implemented robust, cooperative asynchronous query cancellation using Tokio `CancellationToken` in the execution context.

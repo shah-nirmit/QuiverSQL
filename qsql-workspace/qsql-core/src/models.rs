@@ -177,3 +177,31 @@ pub fn build_query_page(
         warning,
     }
 }
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CatalogSource {
+    pub name: String,
+    pub kind: SourceKind,
+    pub connection_details: serde_json::Value,
+    pub schema: Option<Schema>,
+    pub capabilities: Option<ConnectorCapabilities>,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveSourceRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoveSourceResult {
+    pub name: String,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GetSourceMetadataRequest {
+    pub name: String,
+}

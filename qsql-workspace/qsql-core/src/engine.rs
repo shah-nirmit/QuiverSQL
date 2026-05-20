@@ -6,17 +6,43 @@ use tokio_util::sync::CancellationToken;
 
 use crate::models::{
     build_query_page, normalize_page_size, PerformanceMetrics, QueryError, QueryExecutionResult,
-    QueryPage, Schema as QsqlSchema, SchemaField,
+    QueryPage, Schema as QsqlSchema, SchemaField, CatalogSource,
 };
 
 pub struct QsqlEngine {
     ctx: SessionContext,
+    pub catalog: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, CatalogSource>>>,
 }
 
 impl QsqlEngine {
+    pub fn get_catalog(&self) -> Vec<CatalogSource> {
+        let catalog = self.catalog.lock().unwrap();
+        catalog.values().cloned().collect()
+    }
+
+    pub fn get_source_metadata(&self, name: &str) -> Option<CatalogSource> {
+        let catalog = self.catalog.lock().unwrap();
+        catalog.get(name).cloned()
+    }
+
+    pub fn catalog_source(&self, source: CatalogSource) {
+        let mut catalog = self.catalog.lock().unwrap();
+        catalog.insert(source.name.clone(), source);
+    }
+
+    pub fn remove_source(&self, name: &str) -> Result<bool, String> {
+        let deregistered = self.ctx.deregister_table(name)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        let mut catalog = self.catalog.lock().unwrap();
+        let removed_from_catalog = catalog.remove(name).is_some();
+        Ok(deregistered || removed_from_catalog)
+    }
+
     pub fn new() -> Self {
         Self {
             ctx: SessionContext::new(),
+            catalog: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -151,20 +177,28 @@ impl QsqlEngine {
         file_path: &str,
         format: &str,
     ) -> Result<String, String> {
-        match format.to_lowercase().as_str() {
-            "csv" => {
+        let kind = match format.to_lowercase().as_str() {
+            "csv" => crate::models::SourceKind::Csv,
+            "parquet" => crate::models::SourceKind::Parquet,
+            "json" => crate::models::SourceKind::Json,
+            "ndjson" => crate::models::SourceKind::Ndjson,
+            _ => return Err(format!("Unsupported format: {}", format)),
+        };
+
+        match kind {
+            crate::models::SourceKind::Csv => {
                 self.ctx
                     .register_csv(table_name, file_path, CsvReadOptions::new())
                     .await
                     .map_err(|e| format!("Failed to register CSV: {}", e))?;
             }
-            "parquet" => {
+            crate::models::SourceKind::Parquet => {
                 self.ctx
                     .register_parquet(table_name, file_path, ParquetReadOptions::default())
                     .await
                     .map_err(|e| format!("Failed to register Parquet: {}", e))?;
             }
-            "json" | "ndjson" => {
+            crate::models::SourceKind::Json | crate::models::SourceKind::Ndjson => {
                 let file_extension = file_extension_filter(file_path, ".json");
                 self.ctx
                     .register_json(
@@ -175,8 +209,27 @@ impl QsqlEngine {
                     .await
                     .map_err(|e| format!("Failed to register JSON: {}", e))?;
             }
-            _ => return Err(format!("Unsupported format: {}", format)),
+            _ => unreachable!(),
         }
+
+        let df = self.ctx.table(table_name).await.map_err(|e| e.to_string())?;
+        let arrow_schema: &datafusion::arrow::datatypes::Schema = df.schema().as_ref();
+        let qsql_schema = arrow_schema_to_qsql_schema(arrow_schema);
+
+        let source = CatalogSource {
+            name: table_name.to_string(),
+            kind,
+            connection_details: serde_json::json!({
+                "path": file_path,
+                "format": format,
+            }),
+            schema: Some(qsql_schema),
+            capabilities: None,
+            status: "ready".to_string(),
+            error: None,
+        };
+        self.catalog_source(source);
+
         Ok(format!(
             "Successfully registered '{}' as a virtual table.",
             table_name
@@ -510,5 +563,19 @@ mod tests {
 
         assert_eq!(err.code, -32002);
         assert_eq!(err.message, "Query cancelled");
+    }
+}
+
+pub fn arrow_schema_to_qsql_schema(schema: &datafusion::arrow::datatypes::Schema) -> QsqlSchema {
+    QsqlSchema {
+        fields: schema
+            .fields()
+            .iter()
+            .map(|field| SchemaField {
+                name: field.name().to_string(),
+                data_type: field.data_type().to_string(),
+                nullable: field.is_nullable(),
+            })
+            .collect(),
     }
 }

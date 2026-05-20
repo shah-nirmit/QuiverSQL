@@ -266,3 +266,106 @@ fn invalid_json_returns_parse_error_with_null_id() {
     assert_eq!(response["error"]["code"], -32700);
     assert_eq!(response["error"]["message"], "Parse error");
 }
+
+
+#[test]
+fn list_sources_initially_empty() {
+    let mut rpc = RpcHarness::spawn();
+    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":100}"#);
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 100);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert_eq!(response["result"].as_array().unwrap().len(), 0);
+}
+
+fn create_temp_csv() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::io::Write;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "test_jsonrpc_emp_{}_{}.csv",
+        std::process::id(),
+        nanos
+    ));
+    let mut file = std::fs::File::create(&path).unwrap();
+    writeln!(file, "id,name\n1,Alice\n2,Bob").unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+fn create_temp_sqlite() -> String {
+    use rusqlite::Connection;
+    let path = std::env::temp_dir().join(format!("test_jsonrpc_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
+    conn.execute("INSERT INTO items (name) VALUES ('Widget')", []).unwrap();
+    path.to_str().unwrap().to_string()
+}
+
+#[test]
+fn catalog_lifecycle_test() {
+    let mut rpc = RpcHarness::spawn();
+    
+    // 1. Initial list_sources is empty
+    let list_res = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":100}"#);
+    assert_eq!(list_res["result"].as_array().unwrap().len(), 0);
+
+    // 2. Register file
+    let csv_path = create_temp_csv();
+    let reg_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"register_file","params":{{"table_name":"employees","path":{:?},"format":"csv"}},"id":101}}"#,
+        csv_path
+    );
+    let reg_res = rpc.request(&reg_req);
+    assert!(reg_res.get("error").is_none() || reg_res["error"].is_null());
+
+    // 3. Register SQLite
+    let db_path = create_temp_sqlite();
+    let reg_sql_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"register_sqlite","params":{{"db_path":{:?},"table_name":"items"}},"id":102}}"#,
+        db_path
+    );
+    let reg_sql_res = rpc.request(&reg_sql_req);
+    assert!(reg_sql_res.get("error").is_none() || reg_sql_res["error"].is_null());
+
+    // 4. list_sources now has 2 records
+    let list_res2 = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":103}"#);
+    let sources = list_res2["result"].as_array().unwrap();
+    assert_eq!(sources.len(), 2);
+
+    // Verify properties of catalog items
+    let emp_source = sources.iter().find(|s| s["name"] == "employees").unwrap();
+    assert_eq!(emp_source["kind"], "csv");
+    assert_eq!(emp_source["status"], "ready");
+    assert!(emp_source["schema"].is_object());
+
+    let items_source = sources.iter().find(|s| s["name"] == "items").unwrap();
+    assert_eq!(items_source["kind"], "sqlite");
+    assert_eq!(items_source["status"], "ready");
+    assert!(items_source["capabilities"].is_object());
+
+    // 5. get_source_metadata retrieves it properly
+    let get_res = rpc.request(r#"{"jsonrpc":"2.0","method":"get_source_metadata","params":{"name":"employees"},"id":104}"#);
+    assert_eq!(get_res["result"]["name"], "employees");
+    assert_eq!(get_res["result"]["kind"], "csv");
+
+    // Test get_source_metadata not found error (-32004)
+    let get_res_err = rpc.request(r#"{"jsonrpc":"2.0","method":"get_source_metadata","params":{"name":"non_existent"},"id":105}"#);
+    assert_eq!(get_res_err["error"]["code"], -32004);
+
+    // 6. remove_source successfully deregisters
+    let remove_res = rpc.request(r#"{"jsonrpc":"2.0","method":"remove_source","params":{"name":"employees"},"id":106}"#);
+    assert_eq!(remove_res["result"]["name"], "employees");
+    assert_eq!(remove_res["result"]["removed"], true);
+
+    // list_sources now has only 1 record
+    let list_res3 = rpc.request(r#"{"jsonrpc":"2.0","method":"list_sources","id":107}"#);
+    assert_eq!(list_res3["result"].as_array().unwrap().len(), 1);
+
+    // Clean up
+    let _ = std::fs::remove_file(csv_path);
+    let _ = std::fs::remove_file(db_path);
+}

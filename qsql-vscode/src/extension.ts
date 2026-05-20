@@ -1,3 +1,4 @@
+import { SourceManager } from './sourceManager';
 import * as vscode from 'vscode';
 import { DaemonClient } from './daemonClient';
 import { DataSourcesProvider } from './dataSourcesProvider';
@@ -129,6 +130,8 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider('qsqlDataSources', dataSourcesProvider);
 
     daemonClient = new DaemonClient(context);
+    const sourceManager = new SourceManager(context, daemonClient);
+    dataSourcesProvider.setContext(daemonClient, sourceManager);
 
     const lineageProvider = new LineageProvider(daemonClient, dataSourcesProvider);
     vscode.window.registerTreeDataProvider('qsqlLineage', lineageProvider);
@@ -156,6 +159,11 @@ export async function activate(context: vscode.ExtensionContext) {
     try {
         await daemonClient.start();
         vscode.window.showInformationMessage('QuiverSQL Daemon started successfully.');
+        
+        // Replay persistent sources
+        await sourceManager.replaySources();
+        dataSourcesProvider.refresh();
+
         refreshLineage(vscode.window.activeTextEditor);
     } catch (e) {
         console.error('Failed to start QuiverSQL Daemon', e);
@@ -421,12 +429,12 @@ export async function activate(context: vscode.ExtensionContext) {
             });
             vscode.window.showInformationMessage(result);
             
-            // Register source in the tree view explorer
-            dataSourcesProvider.register({
-                tableName: tableName,
-                sourceType: format as any,
-                location: filePath
+            // Persist the source and refresh
+            await sourceManager.addSource(tableName, 'file', {
+                path: filePath,
+                format: format
             });
+            dataSourcesProvider.refresh();
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to attach file: ${e.message || JSON.stringify(e)}`);
         }
@@ -467,12 +475,12 @@ export async function activate(context: vscode.ExtensionContext) {
             });
             vscode.window.showInformationMessage(result);
 
-            // Register SQLite source in the tree view explorer
-            dataSourcesProvider.register({
-                tableName: alias || tableName,
-                sourceType: 'sqlite',
-                location: `${dbPath} :: ${tableName}`
+            // Persist the source and refresh
+            await sourceManager.addSource(alias || tableName, 'sqlite', {
+                dbPath: dbPath,
+                tableName: tableName
             });
+            dataSourcesProvider.refresh();
         } catch (e: any) {
             vscode.window.showErrorMessage(`Failed to attach SQLite table: ${e.message || JSON.stringify(e)}`);
         }
@@ -536,12 +544,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 });
                 vscode.window.showInformationMessage(result);
 
-                // Register source in the tree view explorer
-                dataSourcesProvider.register({
-                    tableName: alias,
-                    sourceType: 'sqlite',
-                    location: `${dbPath} :: ${tableName}`
+                // Persist the source and refresh
+                await sourceManager.addSource(alias, 'sqlite', {
+                    dbPath: dbPath,
+                    tableName: tableName
                 });
+                dataSourcesProvider.refresh();
             } catch (e: any) {
                 vscode.window.showErrorMessage(`Failed to attach SQLite table: ${e.message || JSON.stringify(e)}`);
             }
@@ -584,12 +592,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 });
                 vscode.window.showInformationMessage(result);
                 
-                // Register source in the tree view explorer
-                dataSourcesProvider.register({
-                    tableName: alias,
-                    sourceType: type as any,
-                    location: filePath
+                // Persist the source and refresh
+                await sourceManager.addSource(alias, 'file', {
+                    path: filePath,
+                    format: type
                 });
+                dataSourcesProvider.refresh();
             } catch (e: any) {
                 vscode.window.showErrorMessage(`Failed to attach file: ${e.message || JSON.stringify(e)}`);
             }
@@ -619,6 +627,48 @@ export async function activate(context: vscode.ExtensionContext) {
             return lenses;
         }
     });
+
+
+    const removeSourceCommand = vscode.commands.registerCommand('qsql.removeSource', async (item: any) => {
+        if (!daemonClient) {
+            vscode.window.showErrorMessage('Daemon is not running.');
+            return;
+        }
+
+        let name = '';
+        if (item && item.source && item.source.name) {
+            name = item.source.name;
+        } else {
+            const profiles = sourceManager.getProfiles();
+            if (profiles.length === 0) {
+                vscode.window.showInformationMessage('No active data sources to remove.');
+                return;
+            }
+            const selection = await vscode.window.showQuickPick(
+                profiles.map(p => p.name),
+                { placeHolder: 'Select a data source to remove' }
+            );
+            if (!selection) return;
+            name = selection;
+        }
+
+        try {
+            const result = await daemonClient.removeSource(name);
+            if (result.removed) {
+                vscode.window.showInformationMessage(`Data source '${name}' removed successfully.`);
+            } else {
+                vscode.window.showWarningMessage(`Data source '${name}' was not found on daemon but will be cleaned up locally.`);
+            }
+            await sourceManager.removeSource(name);
+            dataSourcesProvider.refresh();
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to remove data source: ${e.message || JSON.stringify(e)}`);
+            await sourceManager.removeSource(name);
+            dataSourcesProvider.refresh();
+        }
+    });
+
+    context.subscriptions.push(removeSourceCommand);
 
     context.subscriptions.push(pingCommand);
     context.subscriptions.push(showVersionCommand);

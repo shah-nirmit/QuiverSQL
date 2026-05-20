@@ -1,8 +1,12 @@
 use qsql_connectors::sqlite::SqliteTableProvider;
+use qsql_connectors::RemoteConnector;
+use datafusion::datasource::TableProvider;
 use qsql_core::models::{
     build_query_page, normalize_page_size, QueryCancelRequest, QueryCancelResult, QueryError,
-    QueryExecutionResult, QueryPageRequest, QueryStartRequest,
+    QueryExecutionResult, QueryPageRequest, QueryStartRequest, CatalogSource, RemoveSourceRequest,
+    RemoveSourceResult, GetSourceMetadataRequest, SourceKind,
 };
+use qsql_core::engine::arrow_schema_to_qsql_schema;
 use qsql_core::{init_core, QsqlEngine, QSQL_CORE_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -177,6 +181,44 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
     };
 
     match method {
+        "list_sources" => {
+            let catalog = state.engine.get_catalog();
+            make_success(serde_json::to_value(catalog).unwrap())
+        }
+        "remove_source" => {
+            let params = match req.params {
+                Some(p) => p,
+                None => return make_error(-32602, "Missing params".to_string()),
+            };
+            let remove_req: RemoveSourceRequest = match serde_json::from_value(params) {
+                Ok(r) => r,
+                Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
+            };
+            match state.engine.remove_source(&remove_req.name) {
+                Ok(removed) => {
+                    let result = RemoveSourceResult {
+                        name: remove_req.name,
+                        removed,
+                    };
+                    make_success(serde_json::to_value(result).unwrap())
+                }
+                Err(e) => make_error(-32001, e),
+            }
+        }
+        "get_source_metadata" => {
+            let params = match req.params {
+                Some(p) => p,
+                None => return make_error(-32602, "Missing params".to_string()),
+            };
+            let get_req: GetSourceMetadataRequest = match serde_json::from_value(params) {
+                Ok(r) => r,
+                Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
+            };
+            match state.engine.get_source_metadata(&get_req.name) {
+                Some(source) => make_success(serde_json::to_value(source).unwrap()),
+                None => make_error(-32004, format!("Source '{}' not found", get_req.name)),
+            }
+        }
         "ping" => make_success(serde_json::json!("pong")),
         "version" => make_success(serde_json::json!({
             "product": "QuiverSQL",
@@ -239,10 +281,30 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
             };
             let alias = sqlite_req.alias.as_deref().unwrap_or(&sqlite_req.table_name);
             match SqliteTableProvider::try_new(&sqlite_req.db_path, &sqlite_req.table_name) {
-                Ok(provider) => match state.engine.register_table(alias, Arc::new(provider)) {
-                    Ok(msg) => make_success(serde_json::Value::String(msg)),
-                    Err(e) => make_error(-32001, e),
-                },
+                Ok(provider) => {
+                    let provider_arc = Arc::new(provider);
+                    let qsql_schema = arrow_schema_to_qsql_schema(&provider_arc.schema());
+                    let capabilities = provider_arc.connector().capabilities();
+                    let connection_details = serde_json::json!({
+                        "db_path": sqlite_req.db_path,
+                        "table_name": sqlite_req.table_name,
+                    });
+                    let catalog_source = CatalogSource {
+                        name: alias.to_string(),
+                        kind: SourceKind::Sqlite,
+                        connection_details,
+                        schema: Some(qsql_schema),
+                        capabilities: Some(capabilities),
+                        status: "ready".to_string(),
+                        error: None,
+                    };
+                    state.engine.catalog_source(catalog_source);
+
+                    match state.engine.register_table(alias, provider_arc.clone()) {
+                        Ok(msg) => make_success(serde_json::Value::String(msg)),
+                        Err(e) => make_error(-32001, e),
+                    }
+                }
                 Err(e) => make_error(-32001, e),
             }
         }
