@@ -233,6 +233,7 @@ pub struct CatalogSource {
     pub capabilities: Option<ConnectorCapabilities>,
     pub status: String,
     pub error: Option<String>,
+    pub tables: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

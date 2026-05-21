@@ -25,4 +25,6 @@ pub trait RemoteConnector: Send + Sync {
 
     /// Execute a native EXPLAIN query and return the result as a raw string or JSON representation.
     async fn explain_query(&self, sql: &str) -> Result<String, String>;
+
+    async fn list_tables(&self, schema: Option<&str>, limit: usize) -> Result<Vec<String>, String>;
 }

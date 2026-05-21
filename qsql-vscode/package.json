@@ -2,7 +2,7 @@
   "name": "qsql-vscode",
   "displayName": "QuiverSQL Developer Tools",
   "description": "Developer-first, Arrow-native query virtualization layer for VS Code",
-  "version": "0.2.0-alpha.0",
+  "version": "0.2.1-alpha.0",
   "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
@@ -31,7 +31,7 @@
       },
       {
         "command": "qsql.attachSQLite",
-        "title": "QuiverSQL: Attach SQLite Table"
+        "title": "QuiverSQL: Attach SQLite Database"
       },
       {
         "command": "qsql.connectWizard",
@@ -141,7 +141,7 @@
     "@types/node": "18.19.130",
     "@types/vscode": "1.120.0",
     "eslint": "^10.4.0",
-    "typescript": "5.9.3",
+    "typescript": "^5.9.3",
     "typescript-eslint": "^8.59.4"
   }
 }

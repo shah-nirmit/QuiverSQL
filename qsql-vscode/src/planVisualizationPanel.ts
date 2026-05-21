@@ -1,5 +1,655 @@
 import * as vscode from 'vscode';
-import { ExplainQueryResult } from './models';
+import { ExplainQueryResult, PlanMetrics, PlanNode } from './models';
+
+export function escapePlanHtml(unsafe: unknown): string {
+    if (unsafe === null || unsafe === undefined) {
+        return '';
+    }
+    return String(unsafe)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+export function formatPlanMetrics(metrics?: PlanMetrics | null): string {
+    if (!metrics) {
+        return '';
+    }
+
+    const parts: string[] = [];
+    if (typeof metrics.estimated_rows === 'number' && Number.isFinite(metrics.estimated_rows)) {
+        parts.push(`Rows: ${metrics.estimated_rows}`);
+    }
+    if (
+        typeof metrics.startup_cost === 'number' &&
+        Number.isFinite(metrics.startup_cost) &&
+        typeof metrics.total_cost === 'number' &&
+        Number.isFinite(metrics.total_cost)
+    ) {
+        parts.push(`Cost: ${metrics.startup_cost}..${metrics.total_cost}`);
+    } else if (typeof metrics.total_cost === 'number' && Number.isFinite(metrics.total_cost)) {
+        parts.push(`Cost: ${metrics.total_cost}`);
+    }
+    return parts.join(' | ');
+}
+
+export function formatPlanForDisplay(plan: unknown): string {
+    if (typeof plan === 'string') {
+        return plan;
+    }
+    return JSON.stringify(plan, null, 2);
+}
+
+export function nodeDisplayTitle(node: PlanNode): string {
+    return node.attributes?.table ||
+        node.attributes?.join_condition ||
+        node.attributes?.predicate ||
+        node.attributes?.sort ||
+        node.attributes?.expressions ||
+        node.label ||
+        node.node_type;
+}
+
+export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: string): string {
+    const graphJson = JSON.stringify(result.federated_plan).replace(/</g, '\\u003c');
+    const sourcePlans = result.source_plans || {};
+    const sourcePlansJson = JSON.stringify(sourcePlans).replace(/</g, '\\u003c');
+    const rawPlan = result.raw || '';
+    let rawText = rawPlan;
+    if (rawText.length > 50000) {
+        rawText = rawText.substring(0, 50000) + "\n\n... [TRUNCATED - PLAN TOO LARGE] ...";
+    }
+
+    const copyPayloads: Record<string, string> = {
+        logical: rawText
+    };
+
+    const nativePlanEntries = Object.entries(sourcePlans).sort(([left], [right]) => left.localeCompare(right));
+    const nativePlansHtml = nativePlanEntries.map(([sourceRef, sourcePlan]) => {
+        const copyKey = `native:${sourceRef}`;
+        const display = formatPlanForDisplay(sourcePlan);
+        copyPayloads[copyKey] = display;
+        return `
+            <section class="plan-source-section">
+                <div class="section-heading">
+                    <span>${escapePlanHtml(sourceRef)}</span>
+                    <button class="icon-button copy-button" data-copy-key="${escapePlanHtml(copyKey)}" title="Copy native source plan" aria-label="Copy native source plan">&#x2398;</button>
+                </div>
+                <pre>${escapePlanHtml(display)}</pre>
+            </section>
+        `;
+    }).join('');
+
+    const copyPayloadsJson = JSON.stringify(copyPayloads).replace(/</g, '\\u003c');
+    const warningsHtml = result.warnings && result.warnings.length > 0
+        ? `<div class="warning-banner"><strong>Warnings:</strong><ul>${result.warnings.map(w => `<li>${escapePlanHtml(w)}</li>`).join('')}</ul></div>`
+        : '';
+    const truncatedHtml = result.federated_plan.truncated
+        ? `<div class="warning-banner"><strong>Warning:</strong> The plan graph was truncated because it is too large.</div>`
+        : '';
+
+    return `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Query Plan</title>
+    <style>
+        body {
+            font-family: var(--vscode-font-family);
+            background-color: var(--vscode-editor-background);
+            color: var(--vscode-editor-foreground);
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+        .warning-banner {
+            background-color: var(--vscode-inputValidation-warningBackground);
+            border: 1px solid var(--vscode-inputValidation-warningBorder);
+            color: var(--vscode-editor-foreground);
+            padding: 8px 12px;
+            margin: 0;
+            font-size: 13px;
+        }
+        .warning-banner ul { margin: 4px 0 0 0; padding-left: 20px; }
+        .tabs {
+            display: flex;
+            background-color: var(--vscode-editorGroupHeader-tabsBackground);
+            border-bottom: 1px solid var(--vscode-editorGroupHeader-tabsBorder);
+        }
+        .tab {
+            padding: 8px 16px;
+            cursor: pointer;
+            color: var(--vscode-tab-inactiveForeground);
+            background-color: var(--vscode-tab-inactiveBackground);
+            border-right: 1px solid var(--vscode-tab-border);
+            user-select: none;
+        }
+        .tab.active {
+            color: var(--vscode-tab-activeForeground);
+            background-color: var(--vscode-tab-activeBackground);
+            border-bottom: 1px solid var(--vscode-tab-activeBorder);
+        }
+        .tab-content {
+            display: none;
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            position: relative;
+        }
+        .tab-content.active {
+            display: flex;
+            flex-direction: column;
+        }
+        .tree-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 8px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            background: var(--vscode-editorGroupHeader-noTabsBackground);
+        }
+        .toolbar-label {
+            color: var(--vscode-descriptionForeground);
+            font-size: 12px;
+            margin-left: 4px;
+        }
+        .icon-button {
+            min-width: 28px;
+            height: 26px;
+            padding: 0 8px;
+            border: 1px solid var(--vscode-button-border, transparent);
+            border-radius: 4px;
+            color: var(--vscode-button-foreground);
+            background: var(--vscode-button-background);
+            cursor: pointer;
+            font: inherit;
+            line-height: 24px;
+        }
+        .icon-button:hover {
+            background: var(--vscode-button-hoverBackground);
+        }
+        #tree-container {
+            flex: 1;
+            min-height: 0;
+            overflow: hidden;
+            position: relative;
+            background: var(--vscode-editor-background);
+            cursor: grab;
+        }
+        #tree-container.dragging {
+            cursor: grabbing;
+        }
+        #plan-svg {
+            display: block;
+            width: 100%;
+            height: 100%;
+            user-select: none;
+        }
+        .node-rect {
+            fill: var(--vscode-editorWidget-background);
+            stroke: var(--vscode-editorWidget-border);
+            stroke-width: 1.5;
+            rx: 6;
+            ry: 6;
+        }
+        .plan-node.table-scan .node-rect {
+            stroke: var(--vscode-focusBorder);
+        }
+        .node-text {
+            fill: var(--vscode-editor-foreground);
+            font-family: var(--vscode-font-family);
+            font-size: 12px;
+            pointer-events: none;
+        }
+        .node-type {
+            font-weight: 700;
+            fill: var(--vscode-symbolIcon-classForeground);
+        }
+        .node-muted {
+            fill: var(--vscode-descriptionForeground);
+            font-size: 11px;
+        }
+        .node-native {
+            fill: var(--vscode-textLink-foreground);
+            font-size: 11px;
+        }
+        .edge {
+            fill: none;
+            stroke: var(--vscode-editorIndentGuide-background);
+            stroke-width: 2;
+        }
+        #table-container,
+        #source-container {
+            flex: 1;
+            min-height: 0;
+            overflow: auto;
+            padding: 10px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 6px 10px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            vertical-align: top;
+        }
+        th {
+            background-color: var(--vscode-editorGroupHeader-noTabsBackground);
+            position: sticky;
+            top: 0;
+        }
+        .indent {
+            display: inline-block;
+            width: 20px;
+        }
+        pre {
+            margin: 0 0 14px 0;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            font-family: var(--vscode-editor-font-family, monospace);
+        }
+        .section-heading {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-weight: 700;
+            margin-top: 15px;
+            margin-bottom: 5px;
+            border-bottom: 1px solid var(--vscode-panel-border);
+            padding-bottom: 4px;
+        }
+        .section-heading:first-child {
+            margin-top: 0;
+        }
+    </style>
+</head>
+<body>
+    ${warningsHtml}
+    ${truncatedHtml}
+
+    <div class="tabs">
+        <div class="tab active" data-target="tree-tab">Tree</div>
+        <div class="tab" data-target="table-tab">Table</div>
+        <div class="tab" data-target="source-tab">Source</div>
+    </div>
+
+    <div id="tree-tab" class="tab-content active">
+        <div class="tree-toolbar">
+            <button class="icon-button" id="tree-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+            <button class="icon-button" id="tree-zoom-out" title="Zoom out" aria-label="Zoom out">-</button>
+            <button class="icon-button" id="tree-fit" title="Fit plan" aria-label="Fit plan">Fit</button>
+            <button class="icon-button" id="tree-reset" title="Reset pan and zoom" aria-label="Reset pan and zoom">Reset</button>
+            <span class="toolbar-label">Drag the canvas to pan</span>
+        </div>
+        <div id="tree-container">
+            <svg id="plan-svg" role="img" aria-label="Federated query plan tree">
+                <g id="plan-viewport"></g>
+            </svg>
+        </div>
+    </div>
+
+    <div id="table-tab" class="tab-content">
+        <div id="table-container">
+            <input type="text" id="table-search" placeholder="Search..." style="margin-bottom: 10px; padding: 4px; width: 300px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border);">
+            <table id="plan-table">
+                <thead>
+                    <tr>
+                        <th>Operator</th>
+                        <th>Details</th>
+                        <th>Est. Rows</th>
+                    </tr>
+                </thead>
+                <tbody id="plan-table-body"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div id="source-tab" class="tab-content">
+        <div id="source-container">
+            <div class="section-heading">
+                <span>Federated Logical Plan</span>
+                <button class="icon-button copy-button" data-copy-key="logical" title="Copy logical plan" aria-label="Copy logical plan">&#x2398;</button>
+            </div>
+            <pre>${escapePlanHtml(rawText)}</pre>
+            ${nativePlanEntries.length > 0 ? `<div class="section-heading"><span>Native Source Plans</span></div>${nativePlansHtml}` : ''}
+        </div>
+    </div>
+
+    <script nonce="${nonce}">
+        const vscodeApi = typeof acquireVsCodeApi === 'function' ? acquireVsCodeApi() : null;
+        const graph = ${graphJson};
+        const sourcePlans = ${sourcePlansJson};
+        const copyPayloads = ${copyPayloadsJson};
+        const treeState = { rendered: false, scale: 1, x: 24, y: 24, width: 1, height: 1 };
+        let panState = null;
+
+        document.querySelectorAll('.tab').forEach(function(tab) {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+                document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+                tab.classList.add('active');
+                document.getElementById(tab.dataset.target).classList.add('active');
+                if (tab.dataset.target === 'tree-tab') {
+                    renderTree();
+                    fitTree();
+                }
+            });
+        });
+
+        document.querySelectorAll('.copy-button').forEach(function(button) {
+            button.addEventListener('click', function() {
+                const key = button.getAttribute('data-copy-key');
+                if (vscodeApi && key && Object.prototype.hasOwnProperty.call(copyPayloads, key)) {
+                    vscodeApi.postMessage({ command: 'copyPlan', text: copyPayloads[key] });
+                }
+            });
+        });
+
+        function hasNumber(value) {
+            return typeof value === 'number' && Number.isFinite(value);
+        }
+
+        function formatMetrics(metrics) {
+            if (!metrics) return '';
+            const parts = [];
+            if (hasNumber(metrics.estimated_rows)) parts.push('Rows: ' + metrics.estimated_rows);
+            if (hasNumber(metrics.startup_cost) && hasNumber(metrics.total_cost)) {
+                parts.push('Cost: ' + metrics.startup_cost + '..' + metrics.total_cost);
+            } else if (hasNumber(metrics.total_cost)) {
+                parts.push('Cost: ' + metrics.total_cost);
+            }
+            return parts.join(' | ');
+        }
+
+        function displayTitle(node) {
+            const attrs = node.attributes || {};
+            return attrs.table || attrs.join_condition || attrs.predicate || attrs.sort || attrs.expressions || node.label || node.node_type;
+        }
+
+        function displayDetails(node) {
+            const attrs = node.attributes || {};
+            if (attrs.output_columns) return 'Cols: ' + attrs.output_columns;
+            return '';
+        }
+
+        function shortText(value, max) {
+            const text = String(value || '').replace(/\\s+/g, ' ').trim();
+            if (text.length <= max) return text;
+            return text.slice(0, Math.max(0, max - 3)) + '...';
+        }
+
+        function wrapText(value, maxChars, maxLines) {
+            const words = String(value || '').replace(/\\s+/g, ' ').trim().split(' ').filter(Boolean);
+            const lines = [];
+            let current = '';
+            words.forEach(function(word) {
+                if (!current) {
+                    current = word;
+                } else if ((current + ' ' + word).length <= maxChars) {
+                    current += ' ' + word;
+                } else {
+                    lines.push(current);
+                    current = word;
+                }
+            });
+            if (current) lines.push(current);
+            if (lines.length > maxLines) {
+                const kept = lines.slice(0, maxLines);
+                kept[maxLines - 1] = shortText(kept[maxLines - 1], maxChars);
+                return kept;
+            }
+            return lines.length ? lines : [''];
+        }
+
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function nodeLines(node) {
+            const lines = [{ text: node.node_type, cls: 'node-type' }];
+            wrapText(displayTitle(node), 42, 2).forEach(function(line) {
+                if (line) lines.push({ text: line, cls: 'node-text' });
+            });
+            const details = displayDetails(node);
+            if (details) lines.push({ text: shortText(details, 46), cls: 'node-muted' });
+            const metrics = formatMetrics(node.metrics);
+            if (metrics) lines.push({ text: metrics, cls: 'node-muted' });
+            if (node.native_plan_ref && sourcePlans[node.native_plan_ref]) {
+                lines.push({ text: 'Native plan available', cls: 'node-native' });
+            }
+            return lines.slice(0, 5);
+        }
+
+        function renderTree() {
+            if (treeState.rendered || !graph.root_ids || graph.root_ids.length === 0) return;
+            treeState.rendered = true;
+
+            const viewport = document.getElementById('plan-viewport');
+            const nodeWidth = 280;
+            const nodeHeight = 112;
+            const levelHeight = 152;
+            const siblingSpacing = 36;
+            const layouts = {};
+            let maxLevel = 0;
+
+            function measure(nodeId, level) {
+                const node = graph.nodes[nodeId];
+                if (!node) return 0;
+                maxLevel = Math.max(maxLevel, level);
+                let width = nodeWidth;
+                if (node.children && node.children.length > 0) {
+                    let childWidth = 0;
+                    node.children.forEach(function(childId, index) {
+                        childWidth += measure(childId, level + 1);
+                        if (index < node.children.length - 1) childWidth += siblingSpacing;
+                    });
+                    width = Math.max(nodeWidth, childWidth);
+                }
+                layouts[nodeId] = { id: nodeId, node: node, level: level, width: width, x: 0, y: level * levelHeight + 24 };
+                return width;
+            }
+
+            function position(nodeId, left) {
+                const layout = layouts[nodeId];
+                if (!layout) return;
+                layout.x = left + (layout.width - nodeWidth) / 2;
+                const node = layout.node;
+                if (node.children && node.children.length > 0) {
+                    let childLeft = left;
+                    node.children.forEach(function(childId, index) {
+                        position(childId, childLeft);
+                        childLeft += layouts[childId].width;
+                        if (index < node.children.length - 1) childLeft += siblingSpacing;
+                    });
+                }
+            }
+
+            let cursor = 32;
+            graph.root_ids.forEach(function(rootId) {
+                const width = measure(rootId, 0);
+                position(rootId, cursor);
+                cursor += width + siblingSpacing;
+            });
+
+            treeState.width = Math.max(1, cursor + 32);
+            treeState.height = Math.max(1, (maxLevel + 1) * levelHeight + nodeHeight + 48);
+
+            let svgContent = '';
+            Object.keys(layouts).forEach(function(id) {
+                const parent = layouts[id];
+                const node = parent.node;
+                if (!node.children) return;
+                node.children.forEach(function(childId) {
+                    const child = layouts[childId];
+                    if (!child) return;
+                    const startX = parent.x + nodeWidth / 2;
+                    const startY = parent.y + nodeHeight;
+                    const endX = child.x + nodeWidth / 2;
+                    const endY = child.y;
+                    svgContent += '<path class="edge" d="M' + startX + ',' + startY + ' C' + startX + ',' + (startY + 32) + ' ' + endX + ',' + (endY - 32) + ' ' + endX + ',' + endY + '" />';
+                });
+            });
+
+            Object.keys(layouts).forEach(function(id) {
+                const layout = layouts[id];
+                const node = layout.node;
+                const className = node.node_type === 'TableScan' ? 'plan-node table-scan' : 'plan-node';
+                svgContent += '<g class="' + className + '" transform="translate(' + layout.x + ', ' + layout.y + ')">';
+                svgContent += '<rect class="node-rect" width="' + nodeWidth + '" height="' + nodeHeight + '" />';
+                nodeLines(node).forEach(function(line, index) {
+                    const y = 22 + index * 18;
+                    svgContent += '<text class="node-text ' + line.cls + '" x="12" y="' + y + '">' + escapeHtml(shortText(line.text, 48)) + '</text>';
+                });
+                svgContent += '</g>';
+            });
+
+            viewport.innerHTML = svgContent;
+            fitTree();
+        }
+
+        function applyTreeTransform() {
+            document.getElementById('plan-viewport').setAttribute(
+                'transform',
+                'translate(' + treeState.x + ',' + treeState.y + ') scale(' + treeState.scale + ')'
+            );
+        }
+
+        function clampZoom(value) {
+            return Math.max(0.25, Math.min(2.5, value));
+        }
+
+        function zoomTree(factor) {
+            const container = document.getElementById('tree-container');
+            const rect = container.getBoundingClientRect();
+            const centerX = rect.width / 2;
+            const centerY = rect.height / 2;
+            const oldScale = treeState.scale;
+            const nextScale = clampZoom(oldScale * factor);
+            if (nextScale === oldScale) return;
+            const ratio = nextScale / oldScale;
+            treeState.x = centerX - (centerX - treeState.x) * ratio;
+            treeState.y = centerY - (centerY - treeState.y) * ratio;
+            treeState.scale = nextScale;
+            applyTreeTransform();
+        }
+
+        function fitTree() {
+            renderTree();
+            const container = document.getElementById('tree-container');
+            const width = Math.max(1, container.clientWidth);
+            const height = Math.max(1, container.clientHeight);
+            const scale = clampZoom(Math.min((width - 48) / treeState.width, (height - 48) / treeState.height));
+            treeState.scale = scale;
+            treeState.x = Math.max(16, (width - treeState.width * scale) / 2);
+            treeState.y = 24;
+            applyTreeTransform();
+        }
+
+        function resetTree() {
+            treeState.scale = 1;
+            treeState.x = 24;
+            treeState.y = 24;
+            applyTreeTransform();
+        }
+
+        document.getElementById('tree-zoom-in').addEventListener('click', function() { zoomTree(1.2); });
+        document.getElementById('tree-zoom-out').addEventListener('click', function() { zoomTree(1 / 1.2); });
+        document.getElementById('tree-fit').addEventListener('click', fitTree);
+        document.getElementById('tree-reset').addEventListener('click', resetTree);
+
+        const treeContainer = document.getElementById('tree-container');
+        treeContainer.addEventListener('mousedown', function(event) {
+            if (event.button !== 0) return;
+            panState = { x: event.clientX, y: event.clientY, startX: treeState.x, startY: treeState.y };
+            treeContainer.classList.add('dragging');
+            event.preventDefault();
+        });
+        window.addEventListener('mousemove', function(event) {
+            if (!panState) return;
+            treeState.x = panState.startX + event.clientX - panState.x;
+            treeState.y = panState.startY + event.clientY - panState.y;
+            applyTreeTransform();
+        });
+        window.addEventListener('mouseup', function() {
+            panState = null;
+            treeContainer.classList.remove('dragging');
+        });
+        treeContainer.addEventListener('wheel', function(event) {
+            event.preventDefault();
+            zoomTree(event.deltaY < 0 ? 1.08 : 1 / 1.08);
+        }, { passive: false });
+
+        function renderTable() {
+            const flatNodes = [];
+            function traverse(nodeId, depth) {
+                const node = graph.nodes[nodeId];
+                if (!node) return;
+                flatNodes.push({ node: node, depth: depth });
+                if (node.children) node.children.forEach(function(child) { traverse(child, depth + 1); });
+            }
+            if (graph.root_ids) {
+                graph.root_ids.forEach(function(id) { traverse(id, 0); });
+            } else {
+                Object.keys(graph.nodes).forEach(function(id) {
+                    flatNodes.push({ node: graph.nodes[id], depth: 0 });
+                });
+            }
+            window.flatPlanNodes = flatNodes;
+            updateTableRows(flatNodes);
+        }
+
+        function metricOrDash(metrics) {
+            return metrics && hasNumber(metrics.estimated_rows) ? String(metrics.estimated_rows) : '-';
+        }
+
+        function updateTableRows(nodesList) {
+            const tbody = document.getElementById('plan-table-body');
+            tbody.innerHTML = nodesList.map(function(item) {
+                const node = item.node;
+                const indent = '<span class="indent"></span>'.repeat(item.depth);
+                return '<tr>' +
+                    '<td>' + indent + '<strong>' + escapeHtml(node.node_type) + '</strong></td>' +
+                    '<td>' + escapeHtml(displayTitle(node)) + '</td>' +
+                    '<td>' + escapeHtml(metricOrDash(node.metrics)) + '</td>' +
+                    '</tr>';
+            }).join('');
+        }
+
+        document.getElementById('table-search').addEventListener('input', function(event) {
+            const q = event.target.value.toLowerCase();
+            if (!q) {
+                updateTableRows(window.flatPlanNodes);
+                return;
+            }
+            const filtered = window.flatPlanNodes.filter(function(item) {
+                return item.node.node_type.toLowerCase().includes(q) ||
+                    displayTitle(item.node).toLowerCase().includes(q);
+            });
+            updateTableRows(filtered);
+        });
+
+        renderTable();
+        renderTree();
+    </script>
+</body>
+</html>`;
+}
 
 export class PlanVisualizationPanel {
     public static currentPanel: PlanVisualizationPanel | undefined;
@@ -10,6 +660,12 @@ export class PlanVisualizationPanel {
     private constructor(panel: vscode.WebviewPanel, extensionUri: vscode.Uri) {
         this._panel = panel;
         this._extensionUri = extensionUri;
+
+        this._panel.webview.onDidReceiveMessage(async (message) => {
+            if (message?.command === 'copyPlan' && typeof message.text === 'string') {
+                await vscode.env.clipboard.writeText(message.text);
+            }
+        }, null, this._disposables);
 
         this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     }
@@ -54,7 +710,7 @@ export class PlanVisualizationPanel {
             </head>
             <body>
                 <h2>Failed to Generate Query Plan</h2>
-                <pre>${this._escapeHtml(error)}</pre>
+                <pre>${escapePlanHtml(error)}</pre>
             </body>
             </html>
         `;
@@ -69,541 +725,8 @@ export class PlanVisualizationPanel {
         }
     }
 
-    private _escapeHtml(unsafe: string): string {
-        if (!unsafe) return '';
-        return unsafe
-            .replace(/&/g, "&amp;")
-            .replace(/</g, "&lt;")
-            .replace(/>/g, "&gt;")
-            .replace(/"/g, "&quot;")
-            .replace(/'/g, "&#039;");
-    }
-
     private _getHtmlForWebview(result: ExplainQueryResult): string {
-        const nonce = this._getNonce();
-        
-        // Serialize graph for the client side script
-        const graphJson = JSON.stringify(result.federated_plan).replace(/</g, '\\u003c');
-        const sourcePlansJson = JSON.stringify(result.source_plans || {}).replace(/</g, '\\u003c');
-        let rawText = result.raw;
-        if (rawText && rawText.length > 50000) {
-            rawText = rawText.substring(0, 50000) + "\n\n... [TRUNCATED - PLAN TOO LARGE] ...";
-        }
-        rawText = this._escapeHtml(rawText);
-        const warningsHtml = result.warnings && result.warnings.length > 0 
-            ? `<div class="warning-banner"><strong>Warnings:</strong><ul>${result.warnings.map(w => `<li>${this._escapeHtml(w)}</li>`).join('')}</ul></div>`
-            : '';
-        const truncatedHtml = result.federated_plan.truncated
-            ? `<div class="warning-banner"><strong>Warning:</strong> The plan graph was truncated because it is too large.</div>`
-            : '';
-
-        return `<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline' var(--vscode-editor-background); script-src 'nonce-${nonce}';">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Query Plan</title>
-    <style>
-        body {
-            font-family: var(--vscode-font-family);
-            background-color: var(--vscode-editor-background);
-            color: var(--vscode-editor-foreground);
-            padding: 0;
-            margin: 0;
-            display: flex;
-            flex-direction: column;
-            height: 100vh;
-            overflow: hidden;
-        }
-        .warning-banner {
-            background-color: var(--vscode-inputValidation-warningBackground);
-            border: 1px solid var(--vscode-inputValidation-warningBorder);
-            color: var(--vscode-editor-foreground);
-            padding: 8px 12px;
-            margin: 0;
-            font-size: 13px;
-        }
-        .warning-banner ul { margin: 4px 0 0 0; padding-left: 20px; }
-        
-        .tabs {
-            display: flex;
-            background-color: var(--vscode-editorGroupHeader-tabsBackground);
-            border-bottom: 1px solid var(--vscode-editorGroupHeader-tabsBorder);
-        }
-        .tab {
-            padding: 8px 16px;
-            cursor: pointer;
-            color: var(--vscode-tab-inactiveForeground);
-            background-color: var(--vscode-tab-inactiveBackground);
-            border-right: 1px solid var(--vscode-tab-border);
-            user-select: none;
-        }
-        .tab.active {
-            color: var(--vscode-tab-activeForeground);
-            background-color: var(--vscode-tab-activeBackground);
-            border-bottom: 1px solid var(--vscode-tab-activeBorder);
-        }
-        
-        .tab-content {
-            display: none;
-            flex: 1;
-            overflow: auto;
-            position: relative;
-        }
-        .tab-content.active {
-            display: flex;
-            flex-direction: column;
-        }
-
-        /* SVG Tree Styles */
-        #tree-container {
-            flex: 1;
-            overflow: auto;
-            position: relative;
-            background: var(--vscode-editor-background);
-        }
-        .node-rect {
-            fill: var(--vscode-editorWidget-background);
-            stroke: var(--vscode-editorWidget-border);
-            stroke-width: 1.5;
-            rx: 4;
-            ry: 4;
-            cursor: pointer;
-        }
-        .node-rect:hover {
-            stroke: var(--vscode-focusBorder);
-        }
-        .node-text {
-            fill: var(--vscode-editor-foreground);
-            font-family: var(--vscode-font-family);
-            font-size: 12px;
-            pointer-events: none;
-        }
-        .node-type {
-            font-weight: bold;
-            fill: var(--vscode-symbolIcon-classForeground);
-        }
-        .node-metrics {
-            fill: var(--vscode-descriptionForeground);
-            font-size: 10px;
-        }
-        .edge {
-            fill: none;
-            stroke: var(--vscode-editorIndentGuide-background);
-            stroke-width: 2;
-        }
-        
-        /* Table Styles */
-        #table-container {
-            flex: 1;
-            overflow: auto;
-            padding: 10px;
-        }
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-        th, td {
-            text-align: left;
-            padding: 6px 10px;
-            border-bottom: 1px solid var(--vscode-panel-border);
-        }
-        th {
-            background-color: var(--vscode-editorGroupHeader-noTabsBackground);
-            position: sticky;
-            top: 0;
-        }
-        .indent {
-            display: inline-block;
-            width: 20px;
-        }
-
-        /* Source Styles */
-        #source-container {
-            flex: 1;
-            overflow: auto;
-            padding: 10px;
-        }
-        pre {
-            margin: 0;
-            white-space: pre-wrap;
-            font-family: var(--vscode-editor-font-family, monospace);
-        }
-        .section-title {
-            font-weight: bold;
-            margin-top: 15px;
-            margin-bottom: 5px;
-            border-bottom: 1px solid var(--vscode-panel-border);
-            padding-bottom: 4px;
-        }
-        
-        /* Details Panel */
-        #details-panel {
-            position: absolute;
-            right: 0;
-            top: 0;
-            bottom: 0;
-            width: 300px;
-            background-color: var(--vscode-sideBar-background);
-            border-left: 1px solid var(--vscode-sideBar-border);
-            padding: 15px;
-            overflow-y: auto;
-            transform: translateX(100%);
-            transition: transform 0.2s ease;
-            box-shadow: -2px 0 5px rgba(0,0,0,0.1);
-        }
-        #details-panel.open {
-            transform: translateX(0);
-        }
-        .close-btn {
-            float: right;
-            cursor: pointer;
-            font-weight: bold;
-        }
-    </style>
-</head>
-<body>
-    ${warningsHtml}
-    ${truncatedHtml}
-    
-    <div class="tabs">
-        <div class="tab active" data-target="tree-tab">Tree</div>
-        <div class="tab" data-target="table-tab">Table</div>
-        <div class="tab" data-target="source-tab">Source</div>
-    </div>
-    
-    <div id="tree-tab" class="tab-content active">
-        <div id="tree-container">
-            <svg id="plan-svg" width="100%" height="100%"></svg>
-        </div>
-        <div id="details-panel">
-            <div class="close-btn" id="close-details">x</div>
-            <h3 id="details-title">Node Details</h3>
-            <div id="details-content"></div>
-        </div>
-    </div>
-    
-    <div id="table-tab" class="tab-content">
-        <div id="table-container">
-            <input type="text" id="table-search" placeholder="Search..." style="margin-bottom: 10px; padding: 4px; width: 300px; background: var(--vscode-input-background); color: var(--vscode-input-foreground); border: 1px solid var(--vscode-input-border);">
-            <table id="plan-table">
-                <thead>
-                    <tr>
-                        <th>Operator</th>
-                        <th>Details</th>
-                        <th>Est. Rows</th>
-                    </tr>
-                </thead>
-                <tbody id="plan-table-body"></tbody>
-            </table>
-        </div>
-    </div>
-    
-    <div id="source-tab" class="tab-content">
-        <div id="source-container">
-            <div class="section-title">Federated Logical Plan</div>
-            <pre>${rawText}</pre>
-            <div id="native-plans-container"></div>
-        </div>
-    </div>
-
-    <script nonce="${nonce}">
-        const graph = ${graphJson};
-        const sourcePlans = ${sourcePlansJson};
-        
-        // Tab switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                
-                tab.classList.add('active');
-                document.getElementById(tab.dataset.target).classList.add('active');
-                
-                if (tab.dataset.target === 'tree-tab') {
-                    renderTree();
-                }
-            });
-        });
-        
-        // Helper: format metrics
-        function formatMetrics(metrics) {
-            if (!metrics) return '';
-            let s = [];
-            if (metrics.estimated_rows !== undefined) s.push(\`Rows: \${metrics.estimated_rows}\`);
-            if (metrics.startup_cost !== undefined) s.push(\`Cost: \${metrics.startup_cost}..\${metrics.total_cost}\`);
-            return s.join(' | ');
-        }
-        
-        // Tree Rendering (Vanilla JS SVG)
-        let treeRendered = false;
-        function renderTree() {
-            if (treeRendered || !graph.root_ids || graph.root_ids.length === 0) return;
-            treeRendered = true;
-            
-            const svg = document.getElementById('plan-svg');
-            const NODE_WIDTH = 200;
-            const NODE_HEIGHT = 60;
-            const LEVEL_HEIGHT = 100;
-            const SIBLING_SPACING = 20;
-            
-            let nodesArray = [];
-            let levels = {};
-            let maxLevel = 0;
-            
-            // Layout calculations
-            function computeLayout(nodeId, level, xOffset) {
-                const node = graph.nodes[nodeId];
-                if (!node) return 0;
-                
-                if (!levels[level]) levels[level] = [];
-                const nodeLayout = { id: nodeId, node, level, x: 0, y: level * LEVEL_HEIGHT + 20, width: 0 };
-                
-                if (!node.children || node.children.length === 0) {
-                    nodeLayout.width = NODE_WIDTH;
-                } else {
-                    let childrenWidth = 0;
-                    for (let i = 0; i < node.children.length; i++) {
-                        childrenWidth += computeLayout(node.children[i], level + 1, xOffset + childrenWidth);
-                        if (i < node.children.length - 1) childrenWidth += SIBLING_SPACING;
-                    }
-                    nodeLayout.width = Math.max(NODE_WIDTH, childrenWidth);
-                }
-                
-                levels[level].push(nodeLayout);
-                maxLevel = Math.max(maxLevel, level);
-                return nodeLayout.width;
-            }
-            
-            let totalWidth = 0;
-            for (let rootId of graph.root_ids) {
-                totalWidth += computeLayout(rootId, 0, totalWidth);
-                totalWidth += SIBLING_SPACING;
-            }
-            
-            // Second pass: position nodes
-            let placed = {};
-            function positionNodes(nodeId, xCenter) {
-                if (placed[nodeId]) return placed[nodeId];
-                
-                const node = graph.nodes[nodeId];
-                if (!node) return null;
-                
-                // find node layout
-                let layout = null;
-                for (let lvl in levels) {
-                    let l = levels[lvl].find(n => n.id === nodeId);
-                    if (l) { layout = l; break; }
-                }
-                
-                layout.x = xCenter - (NODE_WIDTH / 2);
-                placed[nodeId] = layout;
-                
-                if (node.children && node.children.length > 0) {
-                    let childrenTotalWidth = 0;
-                    let childrenLayouts = [];
-                    for (let cid of node.children) {
-                        for (let lvl in levels) {
-                            let cl = levels[lvl].find(n => n.id === cid);
-                            if (cl) {
-                                childrenLayouts.push(cl);
-                                childrenTotalWidth += cl.width;
-                                break;
-                            }
-                        }
-                    }
-                    
-                    let startX = xCenter - (childrenTotalWidth + (childrenLayouts.length-1)*SIBLING_SPACING) / 2;
-                    for (let i = 0; i < node.children.length; i++) {
-                        let cwidth = childrenLayouts[i].width;
-                        positionNodes(node.children[i], startX + cwidth / 2);
-                        startX += cwidth + SIBLING_SPACING;
-                    }
-                }
-                
-                return layout;
-            }
-            
-            let rootStartX = totalWidth / 2;
-            for (let rootId of graph.root_ids) {
-                positionNodes(rootId, rootStartX);
-                // just simplified, assuming single root mostly
-            }
-            
-            // Draw
-            let svgContent = '';
-            
-            // Draw edges
-            for (let id in placed) {
-                let p = placed[id];
-                let node = p.node;
-                if (node.children) {
-                    for (let cid of node.children) {
-                        let cp = placed[cid];
-                        if (cp) {
-                            const startX = p.x + NODE_WIDTH / 2;
-                            const startY = p.y + NODE_HEIGHT;
-                            const endX = cp.x + NODE_WIDTH / 2;
-                            const endY = cp.y;
-                            svgContent += \`<path class="edge" d="M\${startX},\${startY} C\${startX},\${startY+20} \${endX},\${endY-20} \${endX},\${endY}" />\`;
-                        }
-                    }
-                }
-            }
-            
-            // Draw nodes
-            for (let id in placed) {
-                let p = placed[id];
-                let node = p.node;
-                
-                let metricsText = formatMetrics(node.metrics);
-                
-                svgContent += \`
-                    <g transform="translate(\${p.x}, \${p.y})" onclick="showDetails('\${id}')">
-                        <rect class="node-rect" width="\${NODE_WIDTH}" height="\${NODE_HEIGHT}" />
-                        <text class="node-text node-type" x="10" y="20">\${escapeHtml(node.node_type)}</text>
-                        <text class="node-text" x="10" y="38" textLength="180" lengthAdjust="spacingAndGlyphs">\${escapeHtml(node.label)}</text>
-                        <text class="node-text node-metrics" x="10" y="52">\${escapeHtml(metricsText)}</text>
-                    </g>
-                \`;
-            }
-            
-            svg.innerHTML = svgContent;
-            
-            // Resize SVG
-            svg.setAttribute('width', Math.max(800, totalWidth + 100));
-            svg.setAttribute('height', (maxLevel + 2) * LEVEL_HEIGHT);
-        }
-        
-        // Table Rendering
-        function renderTable() {
-            const tbody = document.getElementById('plan-table-body');
-            let rows = '';
-            
-            // Flatten tree for table
-            let flatNodes = [];
-            function traverse(nodeId, depth) {
-                const node = graph.nodes[nodeId];
-                if (!node) return;
-                flatNodes.push({ node, depth });
-                if (node.children) {
-                    node.children.forEach(c => traverse(c, depth + 1));
-                }
-            }
-            
-            if (graph.root_ids) {
-                graph.root_ids.forEach(id => traverse(id, 0));
-            } else {
-                // fallback to unordered if roots missing
-                for (let id in graph.nodes) {
-                    flatNodes.push({ node: graph.nodes[id], depth: 0 });
-                }
-            }
-            
-            window.flatPlanNodes = flatNodes; // for search
-            
-            updateTableRows(flatNodes);
-        }
-        
-        function updateTableRows(nodesList) {
-            const tbody = document.getElementById('plan-table-body');
-            tbody.innerHTML = nodesList.map(item => {
-                const node = item.node;
-                const indent = '<span class="indent"></span>'.repeat(item.depth);
-                return \`
-                    <tr>
-                        <td>\${indent}<strong>\${escapeHtml(node.node_type)}</strong></td>
-                        <td>\${escapeHtml(node.label)}</td>
-                        <td>\${node.metrics && node.metrics.estimated_rows ? node.metrics.estimated_rows : '-'}</td>
-                    </tr>
-                \`;
-            }).join('');
-        }
-        
-        document.getElementById('table-search').addEventListener('input', (e) => {
-            const q = e.target.value.toLowerCase();
-            if (!q) {
-                updateTableRows(window.flatPlanNodes);
-                return;
-            }
-            const filtered = window.flatPlanNodes.filter(item => 
-                item.node.node_type.toLowerCase().includes(q) || 
-                item.node.label.toLowerCase().includes(q)
-            );
-            updateTableRows(filtered);
-        });
-        
-        // Source native plans render
-        function renderSourcePlans() {
-            const container = document.getElementById('native-plans-container');
-            if (!sourcePlans || Object.keys(sourcePlans).length === 0) return;
-            
-            let html = '<div class="section-title">Native Source Plans</div>';
-            for (let sourceRef in sourcePlans) {
-                html += \`<strong>\${escapeHtml(sourceRef)}</strong>\`;
-                html += \`<pre>\${escapeHtml(JSON.stringify(sourcePlans[sourceRef], null, 2))}</pre>\`;
-            }
-            container.innerHTML = html;
-        }
-        
-        // Details panel
-        window.showDetails = function(nodeId) {
-            const node = graph.nodes[nodeId];
-            if (!node) return;
-            
-            document.getElementById('details-title').innerText = node.node_type;
-            
-            let content = \`<p><strong>Label:</strong> \${escapeHtml(node.label)}</p>\`;
-            
-            if (node.metrics) {
-                content += '<h4>Metrics</h4><ul>';
-                for (let k in node.metrics) {
-                    content += \`<li><strong>\${k}:</strong> \${node.metrics[k]}</li>\`;
-                }
-                content += '</ul>';
-            }
-            
-            if (node.attributes && Object.keys(node.attributes).length > 0) {
-                content += '<h4>Attributes</h4><ul>';
-                for (let k in node.attributes) {
-                    content += \`<li><strong>\${k}:</strong> \${escapeHtml(node.attributes[k])}</li>\`;
-                }
-                content += '</ul>';
-            }
-            
-            if (node.native_plan_ref && sourcePlans[node.native_plan_ref]) {
-                content += '<h4>Native Plan</h4>';
-                content += \`<pre style="font-size: 10px;">\${escapeHtml(JSON.stringify(sourcePlans[node.native_plan_ref], null, 2))}</pre>\`;
-            }
-            
-            document.getElementById('details-content').innerHTML = content;
-            document.getElementById('details-panel').classList.add('open');
-        };
-        
-        document.getElementById('close-details').addEventListener('click', () => {
-            document.getElementById('details-panel').classList.remove('open');
-        });
-        
-        function escapeHtml(str) {
-            if (typeof str !== 'string') return '';
-            return str
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        }
-        
-        // Initial render
-        renderTable();
-        renderSourcePlans();
-        if (document.querySelector('.tab[data-target="tree-tab"]').classList.contains('active')) {
-            renderTree();
-        }
-    </script>
-</body>
-</html>`;
+        return renderPlanVisualizationHtml(result, this._getNonce());
     }
 
     private _getNonce() {

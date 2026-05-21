@@ -2,13 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
-## 0.2.0-alpha.0 - Unreleased
+## 0.2.1-alpha.0 - Unreleased
 
 - Added a shared SQL pushdown layer for projection, basic filters, and limits using DataFusion SQL unparsing.
 - Reworked SQLite scans to generate pushed-down SQL instead of always scanning `SELECT *`.
 - Added Postgres and MySQL/MariaDB connectors with schema introspection, table registration, and env-gated live tests.
 - Added daemon registration methods for Postgres, MySQL, and MariaDB with credential redaction in catalog responses.
 - Extended the VS Code connect wizard and source replay to support SQL database profiles backed by SecretStorage.
+- Added database-level SQL registration so SQLite/Postgres/MySQL/MariaDB sources register as one alias and query tables as `<alias>.<table_name>`.
+- Added bounded table discovery plus lazy JIT table-provider registration before execute, explain, and lineage planning.
+- Updated the VS Code source explorer to render database aliases as expandable nodes with table children.
+- Added JSON-RPC coverage for multi-table database discovery and querying joined tables through the alias-qualified path.
 
 ## 0.1.4-alpha.0 - 2026-05-20
 

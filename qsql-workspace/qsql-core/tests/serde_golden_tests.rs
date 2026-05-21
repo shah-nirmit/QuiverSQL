@@ -337,8 +337,8 @@ fn test_query_requests_and_cancel_result_golden() {
 
 #[test]
 fn test_explain_query_models_golden() {
-    use std::collections::HashMap;
     use qsql_core::models::*;
+    use std::collections::HashMap;
     let request = ExplainQueryRequest {
         sql: "SELECT 1".to_string(),
         include_native: Some(true),
@@ -348,7 +348,7 @@ fn test_explain_query_models_golden() {
         "include_native": true
     });
     assert_eq!(serde_json::to_value(&request).unwrap(), req_expected);
-    
+
     let metrics = PlanMetrics {
         estimated_rows: Some(10.0),
         estimated_bytes: None,

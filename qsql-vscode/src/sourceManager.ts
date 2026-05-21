@@ -8,7 +8,6 @@ export interface PersistentSourceProfile {
         path?: string;      // for file
         format?: string;    // for file
         dbPath?: string;    // for sqlite
-        tableName?: string; // for sqlite table name
         schema?: string;    // for SQL database schema/database
     };
     secretKey?: string;
@@ -104,13 +103,11 @@ export class SourceManager {
                 } else if (profile.kind === 'sqlite') {
                     await this.daemonClient.sendRequest('register_sqlite', {
                         db_path: profile.details.dbPath,
-                        table_name: profile.details.tableName,
                         alias: profile.name
                     });
                 } else if (profile.kind === 'postgres') {
                     await this.daemonClient.sendRequest('register_postgres', {
                         connection_string: _password,
-                        table_name: profile.details.tableName,
                         schema: profile.details.schema,
                         alias: profile.name
                     });
@@ -119,7 +116,6 @@ export class SourceManager {
                         profile.kind === 'mariadb' ? 'register_mariadb' : 'register_mysql',
                         {
                             connection_string: _password,
-                            table_name: profile.details.tableName,
                             schema: profile.details.schema,
                             alias: profile.name
                         }

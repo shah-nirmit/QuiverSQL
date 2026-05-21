@@ -438,34 +438,26 @@ export async function activate(context: vscode.ExtensionContext) {
         if (!fileUri || fileUri.length === 0) return;
         const dbPath = fileUri[0].fsPath;
 
-        const tableName = await vscode.window.showInputBox({
-            prompt: 'SQLite table name to expose (must exist in the DB)',
-            placeHolder: 'users'
-        });
-        if (!tableName) return;
-
         const alias = await vscode.window.showInputBox({
-            prompt: 'Alias for this table in QuiverSQL queries (leave blank to use table name)',
-            placeHolder: tableName,
-            value: tableName
+            prompt: 'Database Alias (how it will be referenced in your QuiverSQL queries, e.g. sqlite_local)',
+            placeHolder: 'sqlite_local'
         });
+        if (!alias) return;
 
         try {
             const result = await daemonClient.sendRequest('register_sqlite', {
                 db_path: dbPath,
-                table_name: tableName,
-                alias: alias || tableName
+                alias: alias
             });
             vscode.window.showInformationMessage(result);
 
             // Persist the source and refresh
-            await sourceManager.addSource(alias || tableName, 'sqlite', {
-                dbPath: dbPath,
-                tableName: tableName
+            await sourceManager.addSource(alias, 'sqlite', {
+                dbPath: dbPath
             });
             dataSourcesProvider.refresh();
         } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to attach SQLite table: ${e.message || JSON.stringify(e)}`);
+            vscode.window.showErrorMessage(`Failed to attach SQLite database: ${e.message || JSON.stringify(e)}`);
         }
     });
 
@@ -480,10 +472,10 @@ export async function activate(context: vscode.ExtensionContext) {
             { label: '$(file) CSV File', description: 'Attach a local Comma-Separated Values file', type: 'csv' },
             { label: '$(file-binary) Parquet File', description: 'Attach a local binary Parquet file', type: 'parquet' },
             { label: '$(json) JSON File', description: 'Attach a local JSON or NDJSON file', type: 'json' },
-            { label: '$(database) SQLite Database', description: 'Attach a table from a SQLite database file', type: 'sqlite' },
-            { label: '$(database) Postgres', description: 'Attach a Postgres table using a connection string', type: 'postgres' },
-            { label: '$(database) MySQL', description: 'Attach a MySQL table using a connection string', type: 'mysql' },
-            { label: '$(database) MariaDB', description: 'Attach a MariaDB table using a connection string', type: 'mariadb' }
+            { label: '$(database) SQLite Database', description: 'Attach a SQLite database file', type: 'sqlite' },
+            { label: '$(database) Postgres', description: 'Attach a Postgres database or schema using a connection string', type: 'postgres' },
+            { label: '$(database) MySQL', description: 'Attach a MySQL database using a connection string', type: 'mysql' },
+            { label: '$(database) MariaDB', description: 'Attach a MariaDB database using a connection string', type: 'mariadb' }
         ];
 
         const selection = await vscode.window.showQuickPick(sourceTypes, {
@@ -505,19 +497,10 @@ export async function activate(context: vscode.ExtensionContext) {
             if (!fileUri || fileUri.length === 0) return;
             const dbPath = fileUri[0].fsPath;
 
-            // Step 2b: Enter Table Name to Expose
-            const tableName = await vscode.window.showInputBox({
-                prompt: 'SQLite table name to expose (must exist in the database)',
-                placeHolder: 'users',
-                validateInput: (value) => value.trim().length === 0 ? 'Table name is required' : null
-            });
-            if (!tableName) return;
-
-            // Step 3: Enter Table Alias
+            // Step 3: Enter Database Alias
             const alias = await vscode.window.showInputBox({
-                prompt: 'Enter Table Alias (how it will be referenced in your QuiverSQL queries)',
-                placeHolder: tableName,
-                value: tableName,
+                prompt: 'Enter Database Alias (how it will be referenced in your QuiverSQL queries, e.g. sqlite_local)',
+                placeHolder: 'sqlite_local',
                 validateInput: (value) => value.trim().length === 0 ? 'Alias is required' : null
             });
             if (!alias) return;
@@ -525,19 +508,17 @@ export async function activate(context: vscode.ExtensionContext) {
             try {
                 const result = await daemonClient.sendRequest('register_sqlite', {
                     db_path: dbPath,
-                    table_name: tableName,
                     alias: alias
                 });
                 vscode.window.showInformationMessage(result);
 
                 // Persist the source and refresh
                 await sourceManager.addSource(alias, 'sqlite', {
-                    dbPath: dbPath,
-                    tableName: tableName
+                    dbPath: dbPath
                 });
                 dataSourcesProvider.refresh();
             } catch (e: any) {
-                vscode.window.showErrorMessage(`Failed to attach SQLite table: ${e.message || JSON.stringify(e)}`);
+                vscode.window.showErrorMessage(`Failed to attach SQLite database: ${e.message || JSON.stringify(e)}`);
             }
 
         } else if (type === 'postgres' || type === 'mysql' || type === 'mariadb') {
@@ -559,17 +540,9 @@ export async function activate(context: vscode.ExtensionContext) {
                 placeHolder: type === 'postgres' ? 'public' : 'my_database'
             });
 
-            const tableName = await vscode.window.showInputBox({
-                prompt: `${engineLabel} table name to expose`,
-                placeHolder: 'users',
-                validateInput: (value) => value.trim().length === 0 ? 'Table name is required' : null
-            });
-            if (!tableName) return;
-
             const alias = await vscode.window.showInputBox({
-                prompt: 'Enter Table Alias (how it will be referenced in your QuiverSQL queries)',
-                placeHolder: tableName,
-                value: tableName,
+                prompt: 'Enter Database Alias (how it will be referenced in your QuiverSQL queries, e.g. pg_local)',
+                placeHolder: type === 'postgres' ? 'pg_local' : type === 'mysql' ? 'mysql_local' : 'mariadb_local',
                 validateInput: (value) => value.trim().length === 0 ? 'Alias is required' : null
             });
             if (!alias) return;
@@ -583,19 +556,17 @@ export async function activate(context: vscode.ExtensionContext) {
             try {
                 const result = await daemonClient.sendRequest(method, {
                     connection_string: connectionString,
-                    table_name: tableName,
                     schema: schema?.trim() || undefined,
                     alias: alias
                 });
                 vscode.window.showInformationMessage(result);
 
                 await sourceManager.addSource(alias, type, {
-                    tableName: tableName,
                     schema: schema?.trim() || undefined
                 }, connectionString);
                 dataSourcesProvider.refresh();
             } catch (e: any) {
-                vscode.window.showErrorMessage(`Failed to attach ${engineLabel} table: ${e.message || JSON.stringify(e)}`);
+                vscode.window.showErrorMessage(`Failed to attach ${engineLabel} database: ${e.message || JSON.stringify(e)}`);
             }
         } else {
             // File Connection Steps

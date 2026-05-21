@@ -41,7 +41,11 @@ import {
     getQueryPageColumns,
     renderQueryPageHtml
 } from '../webviewPanel';
-import { QueryPage } from '../models';
+import {
+    formatPlanMetrics,
+    renderPlanVisualizationHtml
+} from '../planVisualizationPanel';
+import { ExplainQueryResult, QueryPage } from '../models';
 
 // -------------------------------------------------------------
 // 2. Mock vscode.TextDocument implementation
@@ -235,6 +239,79 @@ function testPagedGridRendering() {
     console.log("OK testPagedGridRendering passed!");
 }
 
+function testPlanMetricFormatting() {
+    assert.strictEqual(formatPlanMetrics(null), '');
+    assert.strictEqual(formatPlanMetrics({}), '');
+    assert.strictEqual(
+        formatPlanMetrics({
+            estimated_rows: undefined,
+            estimated_bytes: undefined,
+            startup_cost: undefined,
+            total_cost: undefined
+        }),
+        ''
+    );
+    assert.strictEqual(formatPlanMetrics({ estimated_rows: 0 }), 'Rows: 0');
+    assert.strictEqual(
+        formatPlanMetrics({ estimated_rows: 42, startup_cost: 1, total_cost: 9 }),
+        'Rows: 42 | Cost: 1..9'
+    );
+    console.log("OK testPlanMetricFormatting passed!");
+}
+
+function testPlanVisualizationHtmlRendering() {
+    const result: ExplainQueryResult = {
+        sql: 'SELECT name FROM pg_local.customers',
+        federated_plan: {
+            root_ids: ['df_0'],
+            node_count: 1,
+            truncated: false,
+            nodes: {
+                df_0: {
+                    id: 'df_0',
+                    origin: 'DataFusion',
+                    node_type: 'TableScan',
+                    label: 'TableScan: pg_local.customers projection=[name]',
+                    children: [],
+                    attributes: {
+                        table: 'pg_local.customers',
+                        output_columns: 'name, region'
+                    },
+                    metrics: {
+                        estimated_rows: undefined,
+                        estimated_bytes: undefined,
+                        startup_cost: undefined,
+                        total_cost: undefined
+                    },
+                    source_ref: 'pg_local.customers',
+                    native_plan_ref: 'pg_local.customers'
+                }
+            }
+        },
+        source_plans: {
+            'pg_local.customers': { Plan: { 'Node Type': 'Seq Scan', 'Relation Name': 'customers' } }
+        },
+        raw: 'TableScan: pg_local.customers projection=[name]',
+        warnings: []
+    };
+
+    const html = renderPlanVisualizationHtml(result, 'test-nonce');
+    assert.ok(html.includes('id="tree-zoom-in"'));
+    assert.ok(html.includes('id="tree-zoom-out"'));
+    assert.ok(html.includes('id="tree-fit"'));
+    assert.ok(html.includes('id="tree-reset"'));
+    assert.ok(html.includes('mousedown'));
+    assert.ok(html.includes('mousemove'));
+    assert.ok(html.includes('data-copy-key="logical"'));
+    assert.ok(html.includes('data-copy-key="native:pg_local.customers"'));
+    assert.ok(html.includes('pg_local.customers'));
+    assert.ok(html.includes('Native plan available'));
+    assert.ok(!html.includes('Node Details'));
+    assert.ok(!html.includes('Rows: null'));
+    assert.ok(!html.includes('Cost: null'));
+    console.log("OK testPlanVisualizationHtmlRendering passed!");
+}
+
 function testPagedGridEmptyState() {
     const page: QueryPage = {
         query_id: 'q_empty',
@@ -278,6 +355,8 @@ function runAll() {
         testFormatCellValue();
         testFormatErrorMessage();
         testPagedGridRendering();
+        testPlanMetricFormatting();
+        testPlanVisualizationHtmlRendering();
         testPagedGridEmptyState();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {

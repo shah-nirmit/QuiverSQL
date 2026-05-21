@@ -4,19 +4,25 @@ import { CatalogSource } from './models';
 import { SourceManager } from './sourceManager';
 
 export class DataSourceItem extends vscode.TreeItem {
-    constructor(public readonly source: CatalogSource) {
-        super(source.name, vscode.TreeItemCollapsibleState.None);
+    constructor(
+        public readonly source: CatalogSource,
+        public readonly tableName?: string
+    ) {
+        super(
+            tableName ? tableName : source.name,
+            tableName ? vscode.TreeItemCollapsibleState.None : (source.tables && source.tables.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None)
+        );
 
         const typeLabel: Record<string, string> = {
             csv:         'CSV File',
             parquet:     'Parquet File',
             json:        'JSON File',
             ndjson:      'NDJSON File',
-            sqlite:      'SQLite Table',
+            sqlite:      'SQLite DB',
             fixed_width: 'Fixed Width File',
-            postgres:    'Postgres Table',
-            mysql:       'MySQL Table',
-            mariadb:     'MariaDB Table',
+            postgres:    'Postgres DB',
+            mysql:       'MySQL DB',
+            mariadb:     'MariaDB DB',
         };
 
         const icon: Record<string, string> = {
@@ -34,40 +40,47 @@ export class DataSourceItem extends vscode.TreeItem {
         const isError = source.status === 'error';
         const typeStr = typeLabel[source.kind] || source.kind;
 
-        if (isError) {
-            this.description = `-> ${typeStr} (Error)`;
-            this.tooltip = new vscode.MarkdownString(
-                `**${source.name}**\n\n` +
-                `Type: ${typeStr}\n\n` +
-                `Status: ⚠️ **Error**\n\n` +
-                `Details: \`${source.error || 'Unknown error during registration'}\``
-            );
-            this.iconPath = new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+        if (this.tableName) {
+            this.description = 'Table';
+            this.tooltip = `Table: ${source.name}.${tableName}`;
+            this.iconPath = new vscode.ThemeIcon('table');
+            this.contextValue = 'qsqlDataSourceTable';
         } else {
-            this.description = `-> ${typeStr}`;
-            
-            let location = '';
-            if (source.connection_details) {
-                if (source.connection_details.path) {
-                    location = source.connection_details.path;
-                } else if (source.connection_details.db_path) {
-                    location = `${source.connection_details.db_path} :: ${source.connection_details.table_name}`;
-                } else if (source.connection_details.dbPath) {
-                    location = `${source.connection_details.dbPath} :: ${source.connection_details.tableName}`;
-                } else {
-                    location = JSON.stringify(source.connection_details);
+            if (isError) {
+                this.description = `-> ${typeStr} (Error)`;
+                this.tooltip = new vscode.MarkdownString(
+                    `**${source.name}**\n\n` +
+                    `Type: ${typeStr}\n\n` +
+                    `Status: **Error**\n\n` +
+                    `Details: \`${source.error || 'Unknown error during registration'}\``
+                );
+                this.iconPath = new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+            } else {
+                this.description = `-> ${typeStr}`;
+
+                let location = '';
+                if (source.connection_details) {
+                    if (source.connection_details.path) {
+                        location = source.connection_details.path;
+                    } else if (source.connection_details.db_path) {
+                        location = source.connection_details.db_path;
+                    } else if (source.connection_details.dbPath) {
+                        location = source.connection_details.dbPath;
+                    } else {
+                        location = JSON.stringify(source.connection_details);
+                    }
                 }
+
+                this.tooltip = new vscode.MarkdownString(
+                    `**${source.name}**\n\n` +
+                    `Type: ${typeStr}\n\n` +
+                    `Location: \`${location}\``
+                );
+                this.iconPath = new vscode.ThemeIcon(icon[source.kind] || 'database');
             }
 
-            this.tooltip = new vscode.MarkdownString(
-                `**${source.name}**\n\n` +
-                `Type: ${typeStr}\n\n` +
-                `Location: \`${location}\``
-            );
-            this.iconPath = new vscode.ThemeIcon(icon[source.kind] || 'database');
+            this.contextValue = 'qsqlDataSource';
         }
-
-        this.contextValue = 'qsqlDataSource';
     }
 }
 
@@ -99,7 +112,14 @@ export class DataSourcesProvider
         return element;
     }
 
-    async getChildren(): Promise<DataSourceItem[]> {
+    async getChildren(element?: DataSourceItem): Promise<DataSourceItem[]> {
+        if (element) {
+            if (element.source.tables && element.source.tables.length > 0) {
+                return element.source.tables.map(table => new DataSourceItem(element.source, table));
+            }
+            return [];
+        }
+
         if (!this.daemonClient || !this.sourceManager) {
             const empty = new vscode.TreeItem(
                 'DataSourcesProvider context not set.',

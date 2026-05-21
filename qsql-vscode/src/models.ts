@@ -100,6 +100,7 @@ export interface CatalogSource {
     name: string;
     kind: SourceKind;
     connection_details: Record<string, any>;
+    tables?: string[];
     schema?: Schema;
     capabilities?: ConnectorCapabilities;
     status: string;
