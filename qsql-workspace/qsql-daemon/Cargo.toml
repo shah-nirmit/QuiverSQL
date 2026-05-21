@@ -20,7 +20,7 @@ mysql = ["qsql-connectors/mysql", "qsql-core/mysql"]
 
 [dev-dependencies]
 criterion = "0.5"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 
 [[bench]]
 name = "phase0_benchmarks"
