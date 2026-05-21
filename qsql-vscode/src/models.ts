@@ -118,3 +118,42 @@ export interface RemoveSourceResult {
 export interface GetSourceMetadataRequest {
     name: string;
 }
+
+export interface ExplainQueryRequest {
+    sql: string;
+    include_native?: boolean;
+}
+
+export interface ExplainQueryResult {
+    sql: string;
+    federated_plan: PlanGraph;
+    source_plans: Record<string, any>;
+    raw: string;
+    warnings: string[];
+}
+
+export interface PlanGraph {
+    root_ids: string[];
+    nodes: Record<string, PlanNode>;
+    node_count: number;
+    truncated: boolean;
+}
+
+export interface PlanNode {
+    id: string;
+    origin: string;
+    node_type: string;
+    label: string;
+    children: string[];
+    attributes: Record<string, string>;
+    metrics: PlanMetrics;
+    source_ref?: string;
+    native_plan_ref?: string;
+}
+
+export interface PlanMetrics {
+    estimated_rows?: number;
+    estimated_bytes?: number;
+    startup_cost?: number;
+    total_cost?: number;
+}

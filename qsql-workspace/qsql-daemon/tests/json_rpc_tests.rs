@@ -489,3 +489,48 @@ async fn optional_mysql_registration_redacts_credentials() {
     assert_eq!(source["connection_details"]["connection"], "<redacted>");
     assert!(!source.to_string().contains(&url));
 }
+
+#[test]
+fn test_explain_query_rpc() {
+    let mut harness = RpcHarness::spawn();
+
+    let csv_path = create_temp_csv();
+    let req1 = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "register_file",
+        "params": {
+            "table_name": "test_explain_tbl",
+            "path": csv_path,
+            "format": "csv"
+        }
+    });
+    
+    let resp1 = harness.request(&req1.to_string());
+    assert!(resp1["error"].is_null(), "Register file failed: {:?}", resp1["error"]);
+    assert_eq!(resp1["id"], 1);
+
+    // Some sleep just in case
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let req2 = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "explain_query",
+        "params": {
+            "sql": "SELECT id, name FROM test_explain_tbl WHERE id = 1",
+            "include_native": true
+        }
+    });
+    
+    let resp = harness.request(&req2.to_string());
+    assert!(resp["error"].is_null(), "Explain query failed: {:?}", resp["error"]);
+    
+    assert_eq!(resp["id"], 2);
+    let result = &resp["result"];
+    assert!(!result["federated_plan"].is_null(), "federated_plan is null in {:?}", result);
+    assert!(!result["source_plans"].is_null());
+    assert!(result["raw"].as_str().unwrap().contains("TableScan: test_explain_tbl"));
+
+    std::fs::remove_file(csv_path).unwrap();
+}

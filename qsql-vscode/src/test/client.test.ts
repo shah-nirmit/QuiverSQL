@@ -541,9 +541,55 @@ async function testSourceManagerSqlSecretReplay() {
     console.log("OK: testSourceManagerSqlSecretReplay passed!");
 }
 
+
+async function testExplainQuery() {
+    console.log("Running testExplainQuery...");
+    const client = new DaemonClient({ extensionPath: "/fake/path" } as any);
+
+    const startPromise = client.start();
+    setTimeout(() => {
+        if (mockProcessInstance && mockProcessInstance.emitSpawn) {
+            mockProcessInstance.emitSpawn();
+        }
+    }, 10);
+    await startPromise;
+
+    mockProcessInstance.onRequestWritten = (data: string) => {
+        const req = JSON.parse(data.trim());
+        if (req.method === 'explain_query') {
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: '2.0',
+                id: req.id,
+                result: {
+                    sql: req.params.sql,
+                    federated_plan: {
+                        root_ids: ['1'],
+                        nodes: { '1': { id: '1', origin: 'datafusion', node_type: 'Projection', label: 'SELECT *', children: [], attributes: {}, metrics: {} } },
+                        node_count: 1,
+                        truncated: false
+                    },
+                    source_plans: {},
+                    raw: 'raw plan text',
+                    warnings: []
+                }
+            }) + '\n');
+        }
+    };
+
+    const result = await client.explainQuery("SELECT 1", false);
+    assert.strictEqual(result.sql, "SELECT 1");
+    assert.strictEqual(result.federated_plan.node_count, 1);
+    assert.strictEqual(result.federated_plan.nodes['1'].node_type, "Projection");
+    assert.strictEqual(result.raw, "raw plan text");
+
+    client.stop();
+    console.log("OK: testExplainQuery passed!");
+}
+
 async function runAll() {
     console.log("Starting QuiverSQL VS Code Client Unit Tests...\n");
     try {
+        await testExplainQuery();
         await testSuccessfulQuery();
         await testSourceCatalogMethods();
         await testSourceManagerSqlSecretReplay();

@@ -22,4 +22,7 @@ pub trait RemoteConnector: Send + Sync {
 
     /// Returns the capabilities of this connector.
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities;
+
+    /// Execute a native EXPLAIN query and return the result as a raw string or JSON representation.
+    async fn explain_query(&self, sql: &str) -> Result<String, String>;
 }

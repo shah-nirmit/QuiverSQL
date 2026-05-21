@@ -268,6 +268,16 @@ impl QsqlEngine {
     }
 
     /// Extracts column-level query lineage from a SQL statement.
+    pub async fn get_logical_plan(&self, sql: &str) -> Result<datafusion::logical_expr::LogicalPlan, String> {
+        let plan = self
+            .ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.ctx.state().optimize(&plan).map_err(|e| e.to_string())
+    }
+
     pub async fn get_query_lineage(&self, sql: &str) -> Result<QueryLineage, String> {
         let plan = self
             .ctx

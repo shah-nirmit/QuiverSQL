@@ -84,6 +84,50 @@ pub struct ExplainResult {
     pub physical_plan: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainQueryRequest {
+    pub sql: String,
+    pub include_native: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExplainQueryResult {
+    pub sql: String,
+    pub federated_plan: PlanGraph,
+    pub source_plans: serde_json::Value,
+    pub raw: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanGraph {
+    pub root_ids: Vec<String>,
+    pub nodes: std::collections::HashMap<String, PlanNode>,
+    pub node_count: usize,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanNode {
+    pub id: String,
+    pub origin: String,
+    pub node_type: String,
+    pub label: String,
+    pub children: Vec<String>,
+    pub attributes: std::collections::HashMap<String, String>,
+    pub metrics: PlanMetrics,
+    pub source_ref: Option<String>,
+    pub native_plan_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanMetrics {
+    pub estimated_rows: Option<f64>,
+    pub estimated_bytes: Option<f64>,
+    pub startup_cost: Option<f64>,
+    pub total_cost: Option<f64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
     pub planning_time_ms: u64,

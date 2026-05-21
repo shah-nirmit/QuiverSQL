@@ -45,6 +45,21 @@ impl RemoteConnector for PostgresConnector {
         "postgres"
     }
 
+    async fn explain_query(&self, sql: &str) -> Result<String, String> {
+        let explain_sql = format!("EXPLAIN (FORMAT JSON, COSTS TRUE) {}", sql);
+        let client = self.client().await?;
+        let rows = client
+            .query(&explain_sql, &[])
+            .await
+            .map_err(|e| format!("Explain failed: {}", e))?;
+        
+        if let Some(row) = rows.first() {
+            let val: serde_json::Value = row.get(0);
+            return Ok(serde_json::to_string(&val).unwrap_or_default());
+        }
+        Ok("[]".to_string())
+    }
+
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
         sql_capabilities(SqlDialectKind::Postgres)
     }

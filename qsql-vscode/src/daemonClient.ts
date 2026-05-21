@@ -12,7 +12,9 @@ import {
     CatalogSource,
     RemoveSourceResult,
     RemoveSourceRequest,
-    GetSourceMetadataRequest
+    GetSourceMetadataRequest,
+    ExplainQueryRequest,
+    ExplainQueryResult
 } from './models';
 
 let requestIdCounter = 0;
@@ -244,6 +246,15 @@ export class DaemonClient {
     public removeSource(name: string): Promise<RemoveSourceResult> {
         const request: RemoveSourceRequest = { name };
         return this.sendRequest<RemoveSourceResult>('remove_source', request);
+    }
+
+    
+    public explainQuery(sql: string, includeNative: boolean = true): Promise<ExplainQueryResult> {
+        const request: ExplainQueryRequest = {
+            sql,
+            include_native: includeNative
+        };
+        return this.sendRequest<ExplainQueryResult>('explain_query', request);
     }
 
     public getSourceMetadata(name: string): Promise<CatalogSource> {

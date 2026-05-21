@@ -1,3 +1,4 @@
+pub mod explain;
 use datafusion::datasource::TableProvider;
 use qsql_connectors::mysql::MySqlTableProvider;
 use qsql_connectors::postgres::PostgresTableProvider;
@@ -5,7 +6,7 @@ use qsql_connectors::sql::SqlDialectKind;
 use qsql_connectors::sqlite::SqliteTableProvider;
 use qsql_connectors::RemoteConnector;
 use qsql_core::engine::arrow_schema_to_qsql_schema;
-use qsql_core::models::{
+use qsql_core::models::{ExplainQueryRequest, ExplainQueryResult, 
     build_query_page, normalize_page_size, CatalogSource, GetSourceMetadataRequest,
     QueryCancelRequest, QueryCancelResult, QueryError, QueryExecutionResult, QueryPageRequest,
     QueryStartRequest, RemoveSourceRequest, RemoveSourceResult, SourceKind,
@@ -455,8 +456,49 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
                 Err(e) => make_error(-32001, e),
             }
         }
-        "get_lineage" => {
+        "explain_query" => {
             let params = match req.params {
+                Some(p) => p,
+                None => return make_error(-32602, "Missing params".to_string()),
+            };
+            let req: ExplainQueryRequest = match serde_json::from_value(params.clone()) {
+                Ok(r) => r,
+                Err(e) => return make_error(-32602, format!("Invalid params: {}", e)),
+            };
+            
+            let upper_sql = req.sql.trim().to_uppercase();
+            if !upper_sql.starts_with("SELECT") && !upper_sql.starts_with("WITH") {
+                return make_error(-32602, "Only SELECT and WITH queries are supported for EXPLAIN".to_string());
+            }
+            
+            let logical_plan = match state.engine.get_logical_plan(&req.sql).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let re = regex::Regex::new(r"(?i)(password|pwd|secret)=[^\s;]+").unwrap();
+                    let redacted = re.replace_all(&e, "${1}=***").to_string();
+                    return make_error(-32603, format!("Failed to parse query: {}", redacted));
+                }
+            };
+            
+            let federated_plan = explain::build_plan_graph(&logical_plan);
+            let source_plans = explain::extract_source_plans(&logical_plan).await;
+            
+            let mut source_plans_json = serde_json::Map::new();
+            for (k, v) in source_plans {
+                source_plans_json.insert(k, v);
+            }
+            
+            let res = ExplainQueryResult {
+                sql: req.sql.clone(),
+                federated_plan,
+                source_plans: serde_json::Value::Object(source_plans_json),
+                raw: format!("{}", logical_plan.display_indent()),
+                warnings: vec![],
+            };
+            
+            make_success(serde_json::to_value(res).unwrap())
+        }
+        "get_lineage" => {            let params = match req.params {
                 Some(p) => p,
                 None => return make_error(-32602, "Missing params".to_string()),
             };
@@ -605,3 +647,4 @@ async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse {
         _ => make_error(-32601, "Method not found".to_string()),
     }
 }
+

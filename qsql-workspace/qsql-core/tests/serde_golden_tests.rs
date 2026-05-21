@@ -334,3 +334,90 @@ fn test_query_requests_and_cancel_result_golden() {
         serde_json::from_value(cancel_result_expected).unwrap();
     assert_eq!(cancel_result_de, cancel_result);
 }
+
+#[test]
+fn test_explain_query_models_golden() {
+    use std::collections::HashMap;
+    use qsql_core::models::*;
+    let request = ExplainQueryRequest {
+        sql: "SELECT 1".to_string(),
+        include_native: Some(true),
+    };
+    let req_expected = json!({
+        "sql": "SELECT 1",
+        "include_native": true
+    });
+    assert_eq!(serde_json::to_value(&request).unwrap(), req_expected);
+    
+    let metrics = PlanMetrics {
+        estimated_rows: Some(10.0),
+        estimated_bytes: None,
+        startup_cost: Some(0.0),
+        total_cost: Some(5.5),
+    };
+    let metrics_expected = json!({
+        "estimated_rows": 10.0,
+        "estimated_bytes": null,
+        "startup_cost": 0.0,
+        "total_cost": 5.5
+    });
+    assert_eq!(serde_json::to_value(&metrics).unwrap(), metrics_expected);
+
+    let node = PlanNode {
+        id: "n1".to_string(),
+        origin: "DataFusion".to_string(),
+        node_type: "Projection".to_string(),
+        label: "Project: 1".to_string(),
+        children: vec![],
+        attributes: HashMap::new(),
+        metrics: metrics.clone(),
+        source_ref: None,
+        native_plan_ref: None,
+    };
+    let node_expected = json!({
+        "id": "n1",
+        "origin": "DataFusion",
+        "node_type": "Projection",
+        "label": "Project: 1",
+        "children": [],
+        "attributes": {},
+        "metrics": metrics_expected,
+        "source_ref": null,
+        "native_plan_ref": null
+    });
+    assert_eq!(serde_json::to_value(&node).unwrap(), node_expected);
+
+    let mut nodes = HashMap::new();
+    nodes.insert("n1".to_string(), node.clone());
+    let graph = PlanGraph {
+        root_ids: vec!["n1".to_string()],
+        nodes,
+        node_count: 1,
+        truncated: false,
+    };
+    let graph_expected = json!({
+        "root_ids": ["n1"],
+        "nodes": {
+            "n1": node_expected
+        },
+        "node_count": 1,
+        "truncated": false
+    });
+    assert_eq!(serde_json::to_value(&graph).unwrap(), graph_expected);
+
+    let result = ExplainQueryResult {
+        sql: "SELECT 1".to_string(),
+        federated_plan: graph.clone(),
+        source_plans: json!({}),
+        raw: "raw_plan".to_string(),
+        warnings: vec!["warn1".to_string()],
+    };
+    let result_expected = json!({
+        "sql": "SELECT 1",
+        "federated_plan": graph_expected,
+        "source_plans": {},
+        "raw": "raw_plan",
+        "warnings": ["warn1"]
+    });
+    assert_eq!(serde_json::to_value(&result).unwrap(), result_expected);
+}

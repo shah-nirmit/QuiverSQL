@@ -210,36 +210,19 @@ export async function activate(context: vscode.ExtensionContext) {
         }
 
         try {
-            const explainSql = `EXPLAIN ${sql.trim().replace(/;$/, '')}`;
-            const result = await daemonClient.sendRequest<any[]>('execute_json', { sql: explainSql });
-
-            if (!result || result.length === 0) {
-                vscode.window.showErrorMessage('Failed to generate query execution plan.');
-                return;
+            const { PlanVisualizationPanel } = await import('./planVisualizationPanel');
+            PlanVisualizationPanel.createOrShow(context.extensionUri);
+            
+            const result = await daemonClient.explainQuery(sql);
+            if (PlanVisualizationPanel.currentPanel) {
+                PlanVisualizationPanel.currentPanel.updatePlan(result);
             }
-
-            let planText = `QuiverSQL QUERY PLAN VISUALIZATION\n`;
-            planText += `=============================\n\n`;
-            planText += `QUERY:\n------\n${sql.trim()}\n\n`;
-
-            for (const row of result) {
-                const planType = row.plan_type || 'PLAN';
-                const planDetail = row.plan || '';
-                planText += `${planType.toUpperCase()}:\n`;
-                planText += `${'-'.repeat(planType.length + 1)}\n`;
-                planText += `${planDetail}\n\n`;
-            }
-
-            const planUri = vscode.Uri.parse(`qsql-plan://plan/query-${Date.now()}.txt`);
-            planProvider.setPlan(planUri, planText);
-
-            const doc = await vscode.workspace.openTextDocument(planUri);
-            await vscode.window.showTextDocument(doc, {
-                viewColumn: vscode.ViewColumn.Beside,
-                preserveFocus: false
-            });
         } catch (e: any) {
-            vscode.window.showErrorMessage(`Failed to compile execution plan: ${e.message || JSON.stringify(e)}`);
+            const { PlanVisualizationPanel } = await import('./planVisualizationPanel');
+            PlanVisualizationPanel.createOrShow(context.extensionUri);
+            if (PlanVisualizationPanel.currentPanel) {
+                PlanVisualizationPanel.currentPanel.updateError(e.message || JSON.stringify(e));
+            }
         }
     });
 

@@ -58,6 +58,28 @@ impl RemoteConnector for MySqlConnector {
         }
     }
 
+    async fn explain_query(&self, sql: &str) -> Result<String, String> {
+        use mysql_async::prelude::Queryable;
+        let explain_sql = format!("EXPLAIN FORMAT=JSON {}", sql);
+        let mut conn = self
+            .pool()?
+            .get_conn()
+            .await
+            .map_err(|e| format!("Failed to get MySQL connection: {}", e))?;
+
+        let rows: Vec<mysql_async::Row> = conn
+            .query(&explain_sql)
+            .await
+            .map_err(|e| format!("Explain failed: {}", e))?;
+
+        if let Some(row) = rows.first() {
+            if let Some(val) = row.get::<String, _>(0) {
+                return Ok(val);
+            }
+        }
+        Ok("{}".to_string())
+    }
+
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
         sql_capabilities(self.dialect)
     }

@@ -40,6 +40,30 @@ impl RemoteConnector for SqliteConnector {
         "sqlite"
     }
 
+    async fn explain_query(&self, sql: &str) -> Result<String, String> {
+        let conn = rusqlite::Connection::open(&self.db_path)
+            .map_err(|e| format!("Failed to get SQLite connection: {}", e))?;
+
+        let explain_sql = format!("EXPLAIN QUERY PLAN {}", sql);
+        let mut stmt = conn
+            .prepare(&explain_sql)
+            .map_err(|e| format!("Failed to prepare explain query: {}", e))?;
+
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| format!("Failed to execute explain query: {}", e))?;
+
+        let mut result = String::new();
+        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+            let id: i32 = row.get(0).unwrap_or(0);
+            let parent: i32 = row.get(1).unwrap_or(0);
+            let detail: String = row.get(3).unwrap_or_default();
+            result.push_str(&format!("id: {}, parent: {}, detail: {}\n", id, parent, detail));
+        }
+
+        Ok(result)
+    }
+
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
         sql_capabilities(SqlDialectKind::Sqlite)
     }

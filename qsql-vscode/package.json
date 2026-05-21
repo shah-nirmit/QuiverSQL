@@ -131,17 +131,17 @@
     "typecheck": "tsc -p ./ --noEmit",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
-    "lint": "eslint src --ext ts",
+    "lint": "eslint src/",
     "test:scanner": "npm run compile && node out/test/detectQueries.test.js",
     "test:client": "npm run compile && node out/test/client.test.js",
     "test": "npm run compile && node out/test/detectQueries.test.js && node out/test/client.test.js"
   },
   "devDependencies": {
-    "@types/vscode": "1.120.0",
+    "@eslint/js": "^10.0.1",
     "@types/node": "18.19.130",
+    "@types/vscode": "1.120.0",
+    "eslint": "^10.4.0",
     "typescript": "5.9.3",
-    "@typescript-eslint/eslint-plugin": "7.18.0",
-    "@typescript-eslint/parser": "7.18.0",
-    "eslint": "8.57.1"
+    "typescript-eslint": "^8.59.4"
   }
 }
