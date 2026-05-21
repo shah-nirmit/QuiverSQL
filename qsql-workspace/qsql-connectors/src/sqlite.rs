@@ -58,7 +58,10 @@ impl RemoteConnector for SqliteConnector {
             let id: i32 = row.get(0).unwrap_or(0);
             let parent: i32 = row.get(1).unwrap_or(0);
             let detail: String = row.get(3).unwrap_or_default();
-            result.push_str(&format!("id: {}, parent: {}, detail: {}\n", id, parent, detail));
+            result.push_str(&format!(
+                "id: {}, parent: {}, detail: {}\n",
+                id, parent, detail
+            ));
         }
 
         Ok(result)
@@ -66,6 +69,25 @@ impl RemoteConnector for SqliteConnector {
 
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
         sql_capabilities(SqlDialectKind::Sqlite)
+    }
+
+    async fn list_tables(
+        &self,
+        _schema: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, String> {
+        let sql = format!(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT {}",
+            limit.max(1)
+        );
+        let rows = self.execute_query(&sql).await?;
+        let mut tables = Vec::new();
+        for row in rows {
+            if let Some(name) = row.get("name").and_then(|v| v.as_str()) {
+                tables.push(name.to_string());
+            }
+        }
+        Ok(tables)
     }
 
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {

@@ -1071,7 +1071,7 @@ dependencies = [
  "parquet",
  "rand 0.8.6",
  "regex",
- "sqlparser",
+ "sqlparser 0.53.0",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -1116,7 +1116,7 @@ dependencies = [
  "parquet",
  "paste",
  "recursive",
- "sqlparser",
+ "sqlparser 0.53.0",
  "tokio",
  "web-time",
 ]
@@ -1174,7 +1174,7 @@ dependencies = [
  "paste",
  "recursive",
  "serde_json",
- "sqlparser",
+ "sqlparser 0.53.0",
 ]
 
 [[package]]
@@ -1451,7 +1451,7 @@ dependencies = [
  "log",
  "recursive",
  "regex",
- "sqlparser",
+ "sqlparser 0.53.0",
 ]
 
 [[package]]
@@ -3000,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "qsql-connectors"
-version = "0.2.0-alpha.0"
+version = "0.2.1-alpha.0"
 dependencies = [
  "async-trait",
  "datafusion",
@@ -3016,18 +3016,19 @@ dependencies = [
 
 [[package]]
 name = "qsql-core"
-version = "0.2.0-alpha.0"
+version = "0.2.1-alpha.0"
 dependencies = [
  "datafusion",
  "serde",
  "serde_json",
+ "sqlparser 0.62.0",
  "tokio",
  "tokio-util",
 ]
 
 [[package]]
 name = "qsql-daemon"
-version = "0.2.0-alpha.0"
+version = "0.2.1-alpha.0"
 dependencies = [
  "criterion",
  "datafusion",
@@ -3549,7 +3550,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
 dependencies = [
  "log",
- "sqlparser_derive",
+ "sqlparser_derive 0.3.0",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.62.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c6d1b651dc4edf07eead2a0c6c78016ce971bc2c10da5266861b13f25e7cec"
+dependencies = [
+ "log",
+ "recursive",
+ "sqlparser_derive 0.5.0",
 ]
 
 [[package]]
@@ -3557,6 +3569,17 @@ name = "sqlparser_derive"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da5fc6819faabb412da764b99d3b713bb55083c11e7e0c00144d386cd6a1939c"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "sqlparser_derive"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6dd45d8fc1c79299bfbb7190e42ccbbdf6a5f52e4a6ad98d92357ea965bd289"
 dependencies = [
  "proc-macro2",
  "quote",

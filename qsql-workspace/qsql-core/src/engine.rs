@@ -1,6 +1,10 @@
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::catalog::TableProvider;
+use datafusion::catalog_common::MemorySchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::execution::options::{CsvReadOptions, NdJsonReadOptions, ParquetReadOptions};
 use datafusion::prelude::*;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -39,11 +43,18 @@ impl QsqlEngine {
     }
 
     pub fn remove_source(&self, name: &str) -> Result<bool, String> {
-        let deregistered = self
-            .ctx
-            .deregister_table(name)
-            .map_err(|e| e.to_string())?
-            .is_some();
+        let source = {
+            let catalog = self.catalog.lock().unwrap();
+            catalog.get(name).cloned()
+        };
+        let deregistered = if source.as_ref().is_some_and(is_database_source) {
+            self.deregister_schema(name)?
+        } else {
+            self.ctx
+                .deregister_table(name)
+                .map_err(|e| e.to_string())?
+                .is_some()
+        };
         let mut catalog = self.catalog.lock().unwrap();
         let removed_from_catalog = catalog.remove(name).is_some();
         Ok(deregistered || removed_from_catalog)
@@ -241,6 +252,7 @@ impl QsqlEngine {
             capabilities: None,
             status: "ready".to_string(),
             error: None,
+            tables: None,
         };
         self.catalog_source(source);
 
@@ -256,7 +268,7 @@ impl QsqlEngine {
     pub fn register_table(
         &self,
         table_name: &str,
-        provider: std::sync::Arc<dyn datafusion::datasource::TableProvider>,
+        provider: Arc<dyn TableProvider>,
     ) -> Result<String, String> {
         self.ctx
             .register_table(table_name, provider)
@@ -267,8 +279,91 @@ impl QsqlEngine {
         ))
     }
 
+    pub fn register_schema_table(
+        &self,
+        schema_name: &str,
+        table_name: &str,
+        provider: Arc<dyn TableProvider>,
+    ) -> Result<String, String> {
+        if self.table_registered_in_schema(schema_name, table_name) {
+            return Ok(format!(
+                "Table '{}.{}' is already registered.",
+                schema_name, table_name
+            ));
+        }
+        self.ensure_schema(schema_name)?;
+        let table_ref = TableReference::partial(schema_name.to_string(), table_name.to_string());
+        self.ctx.register_table(table_ref, provider).map_err(|e| {
+            format!(
+                "Failed to register table '{}.{}': {}",
+                schema_name, table_name, e
+            )
+        })?;
+        Ok(format!(
+            "Successfully registered '{}.{}' as a federated table.",
+            schema_name, table_name
+        ))
+    }
+
+    pub fn table_registered_in_schema(&self, schema_name: &str, table_name: &str) -> bool {
+        self.ctx
+            .table_exist(TableReference::partial(
+                schema_name.to_string(),
+                table_name.to_string(),
+            ))
+            .unwrap_or(false)
+    }
+
+    fn ensure_schema(&self, schema_name: &str) -> Result<(), String> {
+        let catalog_name = self
+            .ctx
+            .state()
+            .config()
+            .options()
+            .catalog
+            .default_catalog
+            .clone();
+        let catalog = self
+            .ctx
+            .catalog(&catalog_name)
+            .ok_or_else(|| format!("Default catalog '{catalog_name}' not found"))?;
+
+        if catalog.schema(schema_name).is_none() {
+            catalog
+                .register_schema(schema_name, Arc::new(MemorySchemaProvider::new()))
+                .map_err(|e| format!("Failed to register schema '{}': {}", schema_name, e))?;
+        }
+
+        Ok(())
+    }
+
+    fn deregister_schema(&self, schema_name: &str) -> Result<bool, String> {
+        let catalog_name = self
+            .ctx
+            .state()
+            .config()
+            .options()
+            .catalog
+            .default_catalog
+            .clone();
+        let catalog = self
+            .ctx
+            .catalog(&catalog_name)
+            .ok_or_else(|| format!("Default catalog '{catalog_name}' not found"))?;
+        if catalog.schema(schema_name).is_none() {
+            return Ok(false);
+        }
+        catalog
+            .deregister_schema(schema_name, true)
+            .map(|schema| schema.is_some())
+            .map_err(|e| format!("Failed to deregister schema '{}': {}", schema_name, e))
+    }
+
     /// Extracts column-level query lineage from a SQL statement.
-    pub async fn get_logical_plan(&self, sql: &str) -> Result<datafusion::logical_expr::LogicalPlan, String> {
+    pub async fn get_logical_plan(
+        &self,
+        sql: &str,
+    ) -> Result<datafusion::logical_expr::LogicalPlan, String> {
         let plan = self
             .ctx
             .state()
@@ -344,6 +439,16 @@ impl QsqlEngine {
 
 fn elapsed_ms(start: Instant) -> u64 {
     start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn is_database_source(source: &CatalogSource) -> bool {
+    matches!(
+        source.kind,
+        crate::models::SourceKind::Sqlite
+            | crate::models::SourceKind::Postgres
+            | crate::models::SourceKind::Mysql
+            | crate::models::SourceKind::Mariadb
+    ) && source.tables.is_some()
 }
 
 fn query_execution_error(error: impl ToString) -> QueryError {

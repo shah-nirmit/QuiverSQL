@@ -84,6 +84,40 @@ impl RemoteConnector for MySqlConnector {
         sql_capabilities(self.dialect)
     }
 
+    async fn list_tables(&self, schema: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+        let schema_predicate = match schema {
+            Some(schema) if !schema.trim().is_empty() => {
+                format!("table_schema = {}", sql_literal(schema))
+            }
+            _ => "table_schema = DATABASE()".to_string(),
+        };
+        let sql = format!(
+            "SELECT table_name FROM information_schema.tables WHERE {schema_predicate} AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT {}",
+            limit.max(1)
+        );
+        let pool = self.pool()?;
+        let mut conn = pool
+            .get_conn()
+            .await
+            .map_err(|e| format!("Failed to get MySQL connection: {}", e))?;
+        let rows: Vec<mysql_async::Row> = conn
+            .query(sql)
+            .await
+            .map_err(|e| format!("Failed to list tables: {}", e))?;
+
+        let mut tables = Vec::new();
+        for row in rows {
+            if let Some(name) = row.get::<String, _>(0) {
+                tables.push(name);
+            }
+        }
+        drop(conn);
+        pool.disconnect()
+            .await
+            .map_err(|e| format!("Failed to close MySQL/MariaDB connection pool: {e}"))?;
+        Ok(tables)
+    }
+
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
         let pool = self.pool()?;
         let mut conn = pool
@@ -327,14 +361,22 @@ mod tests {
             .await
             .unwrap();
 
-        let provider =
-            MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_phase4_mysql_pushdowns")
-                .await
-                .unwrap();
+        let provider = MySqlTableProvider::try_new(
+            url,
+            SqlDialectKind::Mysql,
+            None,
+            "qsql_phase4_mysql_pushdowns",
+        )
+        .await
+        .unwrap();
 
         // Test Between and Arithmetic
         let sql1 = provider
-            .build_select_sql(None, &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))], None)
+            .build_select_sql(
+                None,
+                &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))],
+                None,
+            )
             .unwrap()
             .sql;
         let rows1 = connector.execute_query(&sql1).await.unwrap();
@@ -343,7 +385,13 @@ mod tests {
 
         // Test Not and IsNull
         let sql2 = provider
-            .build_select_sql(None, &[datafusion::logical_expr::expr::Expr::Not(Box::new(col("name").is_null()))], None)
+            .build_select_sql(
+                None,
+                &[datafusion::logical_expr::expr::Expr::Not(Box::new(
+                    col("name").is_null(),
+                ))],
+                None,
+            )
             .unwrap()
             .sql;
         let rows2 = connector.execute_query(&sql2).await.unwrap();
@@ -373,10 +421,14 @@ mod tests {
             .await
             .unwrap();
 
-        let provider =
-            MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_phase4_mysql_complex")
-                .await
-                .unwrap();
+        let provider = MySqlTableProvider::try_new(
+            url,
+            SqlDialectKind::Mysql,
+            None,
+            "qsql_phase4_mysql_complex",
+        )
+        .await
+        .unwrap();
 
         // category LIKE 'A%' AND id IN (1, 3, 4) AND (score > 9.0 OR score < 5.0)
         let sql = provider
@@ -391,7 +443,7 @@ mod tests {
             )
             .unwrap()
             .sql;
-        
+
         let rows = connector.execute_query(&sql).await.unwrap();
         assert_eq!(rows.len(), 2); // id 1 (Alpha, 9.5) and id 4 (Alpha, 3.0)
     }

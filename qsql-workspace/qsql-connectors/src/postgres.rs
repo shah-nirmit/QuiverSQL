@@ -52,7 +52,7 @@ impl RemoteConnector for PostgresConnector {
             .query(&explain_sql, &[])
             .await
             .map_err(|e| format!("Explain failed: {}", e))?;
-        
+
         if let Some(row) = rows.first() {
             let val: serde_json::Value = row.get(0);
             return Ok(serde_json::to_string(&val).unwrap_or_default());
@@ -62,6 +62,24 @@ impl RemoteConnector for PostgresConnector {
 
     fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
         sql_capabilities(SqlDialectKind::Postgres)
+    }
+
+    async fn list_tables(&self, schema: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+        let schema_name = schema.unwrap_or("public");
+        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+        let sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT $2";
+        let client = self.client().await?;
+        let rows = client
+            .query(sql, &[&schema_name, &limit])
+            .await
+            .map_err(|e| format!("Failed to list tables: {}", e))?;
+
+        let mut tables = Vec::new();
+        for row in rows {
+            let name: String = row.get(0);
+            tables.push(name);
+        }
+        Ok(tables)
     }
 
     async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
@@ -324,7 +342,11 @@ mod tests {
 
         // Test Between and Arithmetic
         let sql1 = provider
-            .build_select_sql(None, &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))], None)
+            .build_select_sql(
+                None,
+                &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))],
+                None,
+            )
             .unwrap()
             .sql;
         let rows1 = connector.execute_query(&sql1).await.unwrap();
@@ -333,7 +355,13 @@ mod tests {
 
         // Test Not and IsNull
         let sql2 = provider
-            .build_select_sql(None, &[datafusion::logical_expr::expr::Expr::Not(Box::new(col("name").is_null()))], None)
+            .build_select_sql(
+                None,
+                &[datafusion::logical_expr::expr::Expr::Not(Box::new(
+                    col("name").is_null(),
+                ))],
+                None,
+            )
             .unwrap()
             .sql;
         let rows2 = connector.execute_query(&sql2).await.unwrap();
@@ -381,7 +409,7 @@ mod tests {
             )
             .unwrap()
             .sql;
-        
+
         let rows = connector.execute_query(&sql).await.unwrap();
         assert_eq!(rows.len(), 2); // id 1 (Alpha, 9.5) and id 4 (Alpha, 3.0)
     }

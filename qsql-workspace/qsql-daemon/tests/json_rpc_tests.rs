@@ -309,7 +309,14 @@ fn create_temp_sqlite() -> String {
     let conn = Connection::open(&path).unwrap();
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", [])
         .unwrap();
+    conn.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, item_id INTEGER, quantity INTEGER)",
+        [],
+    )
+    .unwrap();
     conn.execute("INSERT INTO items (name) VALUES ('Widget')", [])
+        .unwrap();
+    conn.execute("INSERT INTO orders (item_id, quantity) VALUES (1, 3)", [])
         .unwrap();
     path.to_str().unwrap().to_string()
 }
@@ -334,7 +341,7 @@ fn catalog_lifecycle_test() {
     // 3. Register SQLite
     let db_path = create_temp_sqlite();
     let reg_sql_req = format!(
-        r#"{{"jsonrpc":"2.0","method":"register_sqlite","params":{{"db_path":{:?},"table_name":"items"}},"id":102}}"#,
+        r#"{{"jsonrpc":"2.0","method":"register_sqlite","params":{{"db_path":{:?},"alias":"my_sqlite"}},"id":102}}"#,
         db_path
     );
     let reg_sql_res = rpc.request(&reg_sql_req);
@@ -351,10 +358,28 @@ fn catalog_lifecycle_test() {
     assert_eq!(emp_source["status"], "ready");
     assert!(emp_source["schema"].is_object());
 
-    let items_source = sources.iter().find(|s| s["name"] == "items").unwrap();
+    let items_source = sources.iter().find(|s| s["name"] == "my_sqlite").unwrap();
     assert_eq!(items_source["kind"], "sqlite");
     assert_eq!(items_source["status"], "ready");
     assert!(items_source["capabilities"].is_object());
+    assert_eq!(
+        items_source["tables"],
+        serde_json::json!(["items", "orders"])
+    );
+    assert_eq!(
+        items_source["connection_details"]["tables"],
+        serde_json::json!(["items", "orders"])
+    );
+
+    let query_res = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"query_start","params":{"sql":"SELECT i.name, o.quantity FROM my_sqlite.items i JOIN my_sqlite.orders o ON i.id = o.item_id"},"id":1030}"#,
+    );
+    assert!(
+        query_res.get("error").is_none() || query_res["error"].is_null(),
+        "query_start failed: {query_res}"
+    );
+    assert_eq!(query_res["result"]["data"][0]["name"], "Widget");
+    assert_eq!(query_res["result"]["data"][0]["quantity"], 3);
 
     // 5. get_source_metadata retrieves it properly
     let get_res = rpc.request(r#"{"jsonrpc":"2.0","method":"get_source_metadata","params":{"name":"employees"},"id":104}"#);
@@ -386,18 +411,18 @@ fn sql_connector_registration_rejects_invalid_params() {
     let mut rpc = RpcHarness::spawn();
 
     let missing_connection = rpc.request(
-        r#"{"jsonrpc":"2.0","method":"register_postgres","params":{"table_name":"users","alias":"users"},"id":200}"#,
+        r#"{"jsonrpc":"2.0","method":"register_postgres","params":{"alias":"users"},"id":200}"#,
     );
     assert_eq!(missing_connection["jsonrpc"], "2.0");
     assert_eq!(missing_connection["id"], 200);
     assert_eq!(missing_connection["error"]["code"], -32602);
 
-    let missing_table = rpc.request(
+    let missing_alias = rpc.request(
         r#"{"jsonrpc":"2.0","method":"register_mysql","params":{"connection_string":"mysql://user:secret@localhost/db"},"id":201}"#,
     );
-    assert_eq!(missing_table["jsonrpc"], "2.0");
-    assert_eq!(missing_table["id"], 201);
-    assert_eq!(missing_table["error"]["code"], -32602);
+    assert_eq!(missing_alias["jsonrpc"], "2.0");
+    assert_eq!(missing_alias["id"], 201);
+    assert_eq!(missing_alias["error"]["code"], -32602);
 }
 
 #[tokio::test]
@@ -425,7 +450,7 @@ async fn optional_postgres_registration_redacts_credentials() {
     let mut rpc = RpcHarness::spawn();
 
     let setup_req = format!(
-        r#"{{"jsonrpc":"2.0","method":"register_postgres","params":{{"connection_string":{:?},"schema":"public","table_name":"qsql_phase4_rpc_pg","alias":"rpc_pg"}},"id":210}}"#,
+        r#"{{"jsonrpc":"2.0","method":"register_postgres","params":{{"connection_string":{:?},"schema":"public","alias":"rpc_pg"}},"id":210}}"#,
         url
     );
     let register = rpc.request(&setup_req);
@@ -470,7 +495,7 @@ async fn optional_mysql_registration_redacts_credentials() {
     let mut rpc = RpcHarness::spawn();
 
     let setup_req = format!(
-        r#"{{"jsonrpc":"2.0","method":"register_mysql","params":{{"connection_string":{:?},"table_name":"qsql_phase4_rpc_mysql","alias":"rpc_mysql"}},"id":220}}"#,
+        r#"{{"jsonrpc":"2.0","method":"register_mysql","params":{{"connection_string":{:?},"alias":"rpc_mysql"}},"id":220}}"#,
         url
     );
     let register = rpc.request(&setup_req);
@@ -505,9 +530,13 @@ fn test_explain_query_rpc() {
             "format": "csv"
         }
     });
-    
+
     let resp1 = harness.request(&req1.to_string());
-    assert!(resp1["error"].is_null(), "Register file failed: {:?}", resp1["error"]);
+    assert!(
+        resp1["error"].is_null(),
+        "Register file failed: {:?}",
+        resp1["error"]
+    );
     assert_eq!(resp1["id"], 1);
 
     // Some sleep just in case
@@ -522,15 +551,26 @@ fn test_explain_query_rpc() {
             "include_native": true
         }
     });
-    
+
     let resp = harness.request(&req2.to_string());
-    assert!(resp["error"].is_null(), "Explain query failed: {:?}", resp["error"]);
-    
+    assert!(
+        resp["error"].is_null(),
+        "Explain query failed: {:?}",
+        resp["error"]
+    );
+
     assert_eq!(resp["id"], 2);
     let result = &resp["result"];
-    assert!(!result["federated_plan"].is_null(), "federated_plan is null in {:?}", result);
+    assert!(
+        !result["federated_plan"].is_null(),
+        "federated_plan is null in {:?}",
+        result
+    );
     assert!(!result["source_plans"].is_null());
-    assert!(result["raw"].as_str().unwrap().contains("TableScan: test_explain_tbl"));
+    assert!(result["raw"]
+        .as_str()
+        .unwrap()
+        .contains("TableScan: test_explain_tbl"));
 
     std::fs::remove_file(csv_path).unwrap();
 }

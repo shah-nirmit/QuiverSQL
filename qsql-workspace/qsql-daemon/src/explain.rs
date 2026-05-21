@@ -1,16 +1,16 @@
-﻿use datafusion::logical_expr::{LogicalPlan, TableScan};
 use datafusion::datasource::DefaultTableSource;
-use qsql_connectors::sqlite::SqliteTableProvider;
-use qsql_connectors::postgres::PostgresTableProvider;
+use datafusion::logical_expr::{LogicalPlan, TableScan};
 use qsql_connectors::mysql::MySqlTableProvider;
+use qsql_connectors::postgres::PostgresTableProvider;
+use qsql_connectors::sqlite::SqliteTableProvider;
 use qsql_connectors::RemoteConnector;
-use qsql_core::models::{PlanGraph, PlanNode, PlanMetrics};
+use qsql_core::models::{PlanGraph, PlanMetrics, PlanNode};
 use std::collections::HashMap;
 
 pub fn build_plan_graph(plan: &LogicalPlan) -> PlanGraph {
     let mut nodes = HashMap::new();
     let root_id = traverse_plan(plan, &mut nodes, &mut 0);
-    
+
     PlanGraph {
         root_ids: vec![root_id],
         node_count: nodes.len(),
@@ -19,18 +19,22 @@ pub fn build_plan_graph(plan: &LogicalPlan) -> PlanGraph {
     }
 }
 
-fn traverse_plan(plan: &LogicalPlan, nodes: &mut HashMap<String, PlanNode>, id_counter: &mut usize) -> String {
+fn traverse_plan(
+    plan: &LogicalPlan,
+    nodes: &mut HashMap<String, PlanNode>,
+    id_counter: &mut usize,
+) -> String {
     let current_id = format!("df_{}", id_counter);
     *id_counter += 1;
-    
+
     let mut children = Vec::new();
     for child in plan.inputs() {
         let child_id = traverse_plan(child, nodes, id_counter);
         children.push(child_id);
     }
-    
+
     let label = format!("{}", plan.display());
-    
+
     let node_type = match plan {
         LogicalPlan::Projection(_) => "Projection",
         LogicalPlan::Filter(_) => "Filter",
@@ -46,7 +50,8 @@ fn traverse_plan(plan: &LogicalPlan, nodes: &mut HashMap<String, PlanNode>, id_c
         LogicalPlan::Extension(_) => "Extension",
         LogicalPlan::Window(_) => "Window",
         _ => "Other",
-    }.to_string();
+    }
+    .to_string();
 
     let mut source_ref = None;
     let mut native_plan_ref = None;
@@ -56,23 +61,26 @@ fn traverse_plan(plan: &LogicalPlan, nodes: &mut HashMap<String, PlanNode>, id_c
         native_plan_ref = Some(tname);
     }
 
-    nodes.insert(current_id.clone(), PlanNode {
-        id: current_id.clone(),
-        origin: "DataFusion".to_string(),
-        node_type,
-        label,
-        children,
-        attributes: HashMap::new(),
-        metrics: PlanMetrics {
-            estimated_rows: None,
-            estimated_bytes: None,
-            startup_cost: None,
-            total_cost: None,
+    nodes.insert(
+        current_id.clone(),
+        PlanNode {
+            id: current_id.clone(),
+            origin: "DataFusion".to_string(),
+            node_type,
+            label,
+            children,
+            attributes: HashMap::new(),
+            metrics: PlanMetrics {
+                estimated_rows: None,
+                estimated_bytes: None,
+                startup_cost: None,
+                total_cost: None,
+            },
+            source_ref,
+            native_plan_ref,
         },
-        source_ref,
-        native_plan_ref,
-    });
-    
+    );
+
     current_id
 }
 
@@ -85,28 +93,39 @@ pub async fn extract_source_plans(plan: &LogicalPlan) -> HashMap<String, serde_j
         let table_name = scan.table_name.table().to_string();
         if let Some(source) = scan.source.as_any().downcast_ref::<DefaultTableSource>() {
             let provider = source.table_provider.as_any();
-            
+
             if let Some(sqlite) = provider.downcast_ref::<SqliteTableProvider>() {
-                let sql = sqlite.build_select_sql(scan.projection.as_ref(), &scan.filters, None).map(|r| r.sql).unwrap_or_else(|_| "SELECT *".to_string());
+                let sql = sqlite
+                    .build_select_sql(scan.projection.as_ref(), &scan.filters, None)
+                    .map(|r| r.sql)
+                    .unwrap_or_else(|_| "SELECT *".to_string());
                 if let Ok(explain) = sqlite.connector().explain_query(&sql).await {
                     source_plans.insert(table_name, serde_json::Value::String(explain));
                 }
             } else if let Some(pg) = provider.downcast_ref::<PostgresTableProvider>() {
-                let sql = pg.build_select_sql(scan.projection.as_ref(), &scan.filters, None).map(|r| r.sql).unwrap_or_else(|_| "SELECT *".to_string());
+                let sql = pg
+                    .build_select_sql(scan.projection.as_ref(), &scan.filters, None)
+                    .map(|r| r.sql)
+                    .unwrap_or_else(|_| "SELECT *".to_string());
                 if let Ok(explain) = pg.connector().explain_query(&sql).await {
-                    let parsed: serde_json::Value = serde_json::from_str(&explain).unwrap_or_else(|_| serde_json::Value::String(explain.clone()));
+                    let parsed: serde_json::Value = serde_json::from_str(&explain)
+                        .unwrap_or_else(|_| serde_json::Value::String(explain.clone()));
                     source_plans.insert(table_name, parsed);
                 }
             } else if let Some(my) = provider.downcast_ref::<MySqlTableProvider>() {
-                let sql = my.build_select_sql(scan.projection.as_ref(), &scan.filters, None).map(|r| r.sql).unwrap_or_else(|_| "SELECT *".to_string());
+                let sql = my
+                    .build_select_sql(scan.projection.as_ref(), &scan.filters, None)
+                    .map(|r| r.sql)
+                    .unwrap_or_else(|_| "SELECT *".to_string());
                 if let Ok(explain) = my.connector().explain_query(&sql).await {
-                    let parsed: serde_json::Value = serde_json::from_str(&explain).unwrap_or_else(|_| serde_json::Value::String(explain.clone()));
+                    let parsed: serde_json::Value = serde_json::from_str(&explain)
+                        .unwrap_or_else(|_| serde_json::Value::String(explain.clone()));
                     source_plans.insert(table_name, parsed);
                 }
             }
         }
     }
-    
+
     source_plans
 }
 

@@ -515,9 +515,9 @@ async function testSourceManagerSqlSecretReplay() {
 
     const manager = new SourceManager(context, daemon);
     await manager.addSource(
-        "pg_users",
+        "pg_local",
         "postgres",
-        { tableName: "users", schema: "public" },
+        { schema: "public" },
         "postgres://user:secret@localhost:5432/db"
     );
 
@@ -530,12 +530,11 @@ async function testSourceManagerSqlSecretReplay() {
     await manager.replaySources();
     assert.strictEqual(requests.length, 1);
     assert.strictEqual(requests[0].method, "register_postgres");
-    assert.strictEqual(requests[0].params.alias, "pg_users");
-    assert.strictEqual(requests[0].params.table_name, "users");
+    assert.strictEqual(requests[0].params.alias, "pg_local");
     assert.strictEqual(requests[0].params.schema, "public");
     assert.strictEqual(requests[0].params.connection_string, "postgres://user:secret@localhost:5432/db");
 
-    await manager.removeSource("pg_users");
+    await manager.removeSource("pg_local");
     assert.strictEqual(manager.getProfiles().length, 0);
     assert.strictEqual(secrets.size, 0);
     console.log("OK: testSourceManagerSqlSecretReplay passed!");

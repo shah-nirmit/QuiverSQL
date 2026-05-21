@@ -92,6 +92,10 @@ services:
       - sh
       - -c
       - |
+        until mysql -h mysql -u qsql_test -pqsql_test -e "SELECT 1" > /dev/null 2>&1; do
+          echo "Waiting for MySQL to be ready..."
+          sleep 2
+        done
         mysql -h mysql -u qsql_test -pqsql_test qsql_test <<'SQL'
         CREATE TABLE IF NOT EXISTS customers (
           id INT PRIMARY KEY,
