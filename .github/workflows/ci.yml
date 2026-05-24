@@ -14,7 +14,7 @@ jobs:
         working-directory: qsql-workspace
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -36,7 +36,7 @@ jobs:
         working-directory: qsql-vscode
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
