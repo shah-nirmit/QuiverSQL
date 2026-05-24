@@ -97,6 +97,8 @@ pub struct ExplainQueryResult {
     pub source_plans: serde_json::Value,
     pub raw: String,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broadcast_rewrites: Option<crate::broadcast::BroadcastRewriteInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -250,4 +252,23 @@ pub struct RemoveSourceResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetSourceMetadataRequest {
     pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSourceTablesRequest {
+    pub name: String,
+    #[serde(default)]
+    pub offset: Option<usize>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListSourceTablesResult {
+    pub name: String,
+    pub tables: Vec<String>,
+    pub offset: usize,
+    pub limit: usize,
+    pub total_known: Option<usize>,
+    pub truncated: bool,
 }

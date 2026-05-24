@@ -1,19 +1,24 @@
 [package]
 name = "qsql-connectors"
-version = "0.2.1-alpha.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
 qsql-core = { path = "../qsql-core" }
-datafusion = "44.0.0"
+datafusion = "53.1.0"
+datafusion-federation = { version = "0.5.3", features = ["sql"] }
+datafusion-table-providers = { version = "0.11.0", features = ["sqlite-federation", "sqlite-bundled", "postgres-federation", "mysql-federation"] }
+futures = "0.3"
 tokio = { version = "1.36", features = ["full"] }
 async-trait = "0.1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 mysql_async = "0.34"
+secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-parquet = "53.4.1"
+parquet = "58.0"
+url = "2"
 
 [features]
 default = []

@@ -1,6 +1,5 @@
-use qsql_connectors::RemoteConnector;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 
 struct RpcHarness {
@@ -32,10 +31,37 @@ impl RpcHarness {
         writeln!(self.stdin, "{line}").expect("write request");
         self.stdin.flush().expect("flush request");
 
-        let mut response = String::new();
-        self.stdout.read_line(&mut response).expect("read response");
+        self.read_response()
+    }
 
-        serde_json::from_str(response.trim()).expect("valid json response")
+    fn request_framed(&mut self, body: &str) -> Value {
+        write!(self.stdin, "Content-Length: {}\r\n\r\n{}", body.len(), body)
+            .expect("write framed request");
+        self.stdin.flush().expect("flush framed request");
+
+        self.read_response()
+    }
+
+    fn read_response(&mut self) -> Value {
+        let mut first = String::new();
+        self.stdout.read_line(&mut first).expect("read response");
+        let trimmed = first.trim_end_matches(['\r', '\n']);
+        if let Some(length) = trimmed
+            .strip_prefix("Content-Length:")
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            let mut blank = String::new();
+            self.stdout
+                .read_line(&mut blank)
+                .expect("read response header terminator");
+            let mut body = vec![0_u8; length];
+            self.stdout
+                .read_exact(&mut body)
+                .expect("read framed response body");
+            return serde_json::from_slice(&body).expect("valid json response");
+        }
+
+        serde_json::from_str(trimmed).expect("valid json response")
     }
 }
 
@@ -72,6 +98,22 @@ fn version_returns_component_versions() {
     assert!(response["result"]["connectors"].as_str().is_some());
     assert!(response["result"]["rpc"].as_str().is_some());
     assert!(response.get("error").is_none() || response["error"].is_null());
+}
+
+#[test]
+fn content_length_framing_accepts_pretty_json_request() {
+    let mut rpc = RpcHarness::spawn();
+    let response = rpc.request_framed(
+        r#"{
+  "jsonrpc": "2.0",
+  "method": "ping",
+  "id": 20
+}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 20);
+    assert_eq!(response["result"], "pong");
 }
 
 #[test]
@@ -304,7 +346,13 @@ fn create_temp_csv() -> String {
 
 fn create_temp_sqlite() -> String {
     use rusqlite::Connection;
-    let path = std::env::temp_dir().join(format!("test_jsonrpc_{}.db", std::process::id()));
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path =
+        std::env::temp_dir().join(format!("test_jsonrpc_{}_{}.db", std::process::id(), nanos));
     let _ = std::fs::remove_file(&path);
     let conn = Connection::open(&path).unwrap();
     conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", [])
@@ -371,6 +419,24 @@ fn catalog_lifecycle_test() {
         serde_json::json!(["items", "orders"])
     );
 
+    let first_table_page = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"list_source_tables","params":{"name":"my_sqlite","offset":0,"limit":1},"id":1031}"#,
+    );
+    assert_eq!(
+        first_table_page["result"]["tables"],
+        serde_json::json!(["items"])
+    );
+    assert_eq!(first_table_page["result"]["truncated"], true);
+
+    let second_table_page = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"list_source_tables","params":{"name":"my_sqlite","offset":1,"limit":1},"id":1032}"#,
+    );
+    assert_eq!(
+        second_table_page["result"]["tables"],
+        serde_json::json!(["orders"])
+    );
+    assert_eq!(second_table_page["result"]["truncated"], false);
+
     let query_res = rpc.request(
         r#"{"jsonrpc":"2.0","method":"query_start","params":{"sql":"SELECT i.name, o.quantity FROM my_sqlite.items i JOIN my_sqlite.orders o ON i.id = o.item_id"},"id":1030}"#,
     );
@@ -433,17 +499,18 @@ fn sql_connector_registration_rejects_invalid_params() {
 async fn optional_postgres_registration_redacts_credentials() {
     let url = std::env::var("QSQL_POSTGRES_URL")
         .expect("QSQL_POSTGRES_URL must be set to run Postgres live tests");
-    let connector = qsql_connectors::postgres::PostgresConnector::new(url.clone());
-    connector
-        .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_pg (id INT, name TEXT)")
+    let (client, connection) = tokio_postgres::connect(&url, tokio_postgres::NoTls)
         .await
         .unwrap();
-    connector
-        .execute_query("TRUNCATE qsql_phase4_rpc_pg")
-        .await
-        .unwrap();
-    connector
-        .execute_query("INSERT INTO qsql_phase4_rpc_pg VALUES (1, 'Alice')")
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_pg (id INT, name TEXT);
+             TRUNCATE qsql_phase4_rpc_pg;
+             INSERT INTO qsql_phase4_rpc_pg VALUES (1, 'Alice');",
+        )
         .await
         .unwrap();
 
@@ -478,19 +545,23 @@ async fn optional_postgres_registration_redacts_credentials() {
 async fn optional_mysql_registration_redacts_credentials() {
     let url = std::env::var("QSQL_MYSQL_URL")
         .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
-    let connector = qsql_connectors::mysql::MySqlConnector::mysql(url.clone());
-    connector
-        .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_mysql (id INT, name TEXT)")
+    let pool = mysql_async::Pool::new(mysql_async::Opts::from_url(&url).unwrap());
+    let mut conn = pool.get_conn().await.unwrap();
+    mysql_async::prelude::Queryable::query_drop(
+        &mut conn,
+        "CREATE TABLE IF NOT EXISTS qsql_phase4_rpc_mysql (id INT, name TEXT)",
+    )
+    .await
+    .unwrap();
+    mysql_async::prelude::Queryable::query_drop(&mut conn, "TRUNCATE TABLE qsql_phase4_rpc_mysql")
         .await
         .unwrap();
-    connector
-        .execute_query("TRUNCATE TABLE qsql_phase4_rpc_mysql")
-        .await
-        .unwrap();
-    connector
-        .execute_query("INSERT INTO qsql_phase4_rpc_mysql VALUES (1, 'Alice')")
-        .await
-        .unwrap();
+    mysql_async::prelude::Queryable::query_drop(
+        &mut conn,
+        "INSERT INTO qsql_phase4_rpc_mysql VALUES (1, 'Alice')",
+    )
+    .await
+    .unwrap();
 
     let mut rpc = RpcHarness::spawn();
 
@@ -619,6 +690,8 @@ fn sqlite_explain_uses_qualified_source_plan_keys() {
     assert_eq!(scan["source_ref"], "my_sqlite.items");
     assert_eq!(scan["native_plan_ref"], "my_sqlite.items");
     assert_eq!(scan["attributes"]["table"], "my_sqlite.items");
+    assert_eq!(scan["attributes"]["guarded_scan"], "true");
+    assert_eq!(scan["attributes"]["scan_budget_rows"], "1000000");
     assert!(scan["attributes"]["output_columns"]
         .as_str()
         .unwrap()
@@ -626,5 +699,6 @@ fn sqlite_explain_uses_qualified_source_plan_keys() {
     assert!(scan["metrics"]["estimated_rows"].is_null());
     assert!(scan["metrics"]["total_cost"].is_null());
 
+    drop(harness);
     std::fs::remove_file(db_path).unwrap();
 }

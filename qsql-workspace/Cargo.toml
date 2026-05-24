@@ -12,3 +12,16 @@ debug = 0
 # Minimal optimization to speed up proc-macro execution
 opt-level = 1
 
+[profile.bench]
+# Bench profile defaults to release semantics, which produced a 10-min cold compile
+# during Phase 6.2 while building bench-profile DataFusion + datafusion-table-providers
+# + Arrow. Mirror [profile.dev] so the bench artifacts can share the incremental
+# rebuild cache and benches stay buildable from CI without a release-grade compile.
+# Phase 0 benches are non-gating per implementation_plan.md, so absolute numbers
+# under this profile are NOT comparable to prior release-profile runs.
+debug = 0
+opt-level = 1
+codegen-units = 256
+lto = false
+incremental = true
+

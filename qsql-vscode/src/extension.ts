@@ -682,7 +682,16 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     });
 
+    const loadMoreTablesCommand = vscode.commands.registerCommand('qsql.loadMoreTables', async (sourceName: string) => {
+        try {
+            await dataSourcesProvider.loadMoreTables(sourceName);
+        } catch (e: any) {
+            vscode.window.showErrorMessage(`Failed to load more tables: ${e.message || JSON.stringify(e)}`);
+        }
+    });
+
     context.subscriptions.push(removeSourceCommand);
+    context.subscriptions.push(loadMoreTablesCommand);
 
     context.subscriptions.push(pingCommand);
     context.subscriptions.push(showVersionCommand);

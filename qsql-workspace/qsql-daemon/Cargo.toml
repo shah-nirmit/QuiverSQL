@@ -1,6 +1,6 @@
 [package]
 name = "qsql-daemon"
-version = "0.2.1-alpha.0"
+version = "0.3.0"
 edition = "2021"
 
 [dependencies]
@@ -10,8 +10,9 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.36", features = ["full"] }
 tokio-util = "0.7"
-datafusion = "44.0.0"
+datafusion = "53.1.0"
 regex = "1.12.3"
+async-trait = "0.1"
 
 [features]
 default = []
@@ -20,7 +21,12 @@ mysql = ["qsql-connectors/mysql", "qsql-core/mysql"]
 
 [dev-dependencies]
 criterion = "0.5"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
+mysql_async = "0.34"
+once_cell = "1.19"
+memory-stats = "1.2"
+sysinfo = { version = "0.30", default-features = false }
 
 [[bench]]
 name = "phase0_benchmarks"

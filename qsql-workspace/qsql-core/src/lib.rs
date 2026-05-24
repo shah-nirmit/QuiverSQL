@@ -1,8 +1,16 @@
+pub mod broadcast;
 pub mod engine;
 pub mod models;
 pub mod table_refs;
 
-pub use engine::QsqlEngine;
+pub use broadcast::{
+    apply_broadcast_rewrites, BroadcastApplication, BroadcastRewriteConfig, BroadcastRewriteInfo,
+    BroadcastSkip, SkipReason, DEFAULT_MAX_LOCAL_BYTES, DEFAULT_MAX_LOCAL_ROWS,
+};
+pub use engine::{
+    GuardedTableProvider, QsqlEngine, QueryResultHandle, ScanBudget,
+    DEFAULT_QUERY_MEMORY_LIMIT_BYTES, DEFAULT_REMOTE_SCAN_MAX_BYTES, DEFAULT_REMOTE_SCAN_MAX_ROWS,
+};
 pub use table_refs::{extract_database_table_refs, DatabaseTableReference};
 
 pub const QSQL_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");

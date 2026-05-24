@@ -17,8 +17,19 @@ Module.prototype.require = function (packageName: string, ...args: any[]) {
             TreeItem: class {
                 constructor(public label: string, public collapsibleState?: any) {}
             },
+            TreeItemCollapsibleState: {
+                None: 0,
+                Collapsed: 1,
+                Expanded: 2
+            },
             ThemeIcon: class {
                 constructor(public id: string) {}
+            },
+            ThemeColor: class {
+                constructor(public id: string) {}
+            },
+            MarkdownString: class {
+                constructor(public value: string) {}
             },
             EventEmitter: class {
                 event = () => {};
@@ -45,6 +56,7 @@ import {
     formatPlanMetrics,
     renderPlanVisualizationHtml
 } from '../planVisualizationPanel';
+import { DataSourcesProvider } from '../dataSourcesProvider';
 import { ExplainQueryResult, QueryPage } from '../models';
 
 // -------------------------------------------------------------
@@ -312,6 +324,26 @@ function testPlanVisualizationHtmlRendering() {
     console.log("OK testPlanVisualizationHtmlRendering passed!");
 }
 
+function testPlanVisualizationTruncationWarning() {
+    const result: ExplainQueryResult = {
+        sql: 'SELECT * FROM huge_plan',
+        federated_plan: {
+            root_ids: [],
+            node_count: 500,
+            truncated: true,
+            nodes: {}
+        },
+        source_plans: {},
+        raw: 'Synthetic truncated plan',
+        warnings: ['Plan graph exceeded 500 nodes and was truncated.']
+    };
+
+    const html = renderPlanVisualizationHtml(result, 'test-nonce');
+    assert.ok(html.includes('The plan graph was truncated because it is too large.'));
+    assert.ok(html.includes('Plan graph exceeded 500 nodes and was truncated.'));
+    console.log("OK testPlanVisualizationTruncationWarning passed!");
+}
+
 function testPagedGridEmptyState() {
     const page: QueryPage = {
         query_id: 'q_empty',
@@ -336,10 +368,55 @@ function testPagedGridEmptyState() {
     console.log("OK testPagedGridEmptyState passed!");
 }
 
+async function testDataSourcesProviderLazyTablePaging() {
+    const provider = new DataSourcesProvider();
+    const calls: any[] = [];
+    const daemon: any = {
+        listSources: async () => [{
+            name: 'pg_local',
+            kind: 'postgres',
+            connection_details: { tables_truncated: true },
+            tables: ['customers', 'orders', 'regions'],
+            status: 'ready'
+        }],
+        listSourceTables: async (name: string, offset: number, limit: number) => {
+            calls.push({ name, offset, limit });
+            return {
+                name,
+                tables: ['transactions'],
+                offset,
+                limit,
+                total_known: 4,
+                truncated: false
+            };
+        }
+    };
+    const sourceManager: any = {
+        getProfiles: () => [],
+        replayErrors: new Map()
+    };
+    provider.setContext(daemon, sourceManager);
+
+    const roots = await provider.getChildren();
+    assert.strictEqual(roots.length, 1);
+    let children = await provider.getChildren(roots[0]);
+    assert.strictEqual(children.length, 4);
+    assert.strictEqual(children[3].label, 'Load more tables...');
+
+    await provider.loadMoreTables('pg_local');
+    children = await provider.getChildren(roots[0]);
+    assert.deepStrictEqual(
+        children.map(child => child.label),
+        ['customers', 'orders', 'regions', 'transactions']
+    );
+    assert.deepStrictEqual(calls, [{ name: 'pg_local', offset: 3, limit: 250 }]);
+    console.log("OK testDataSourcesProviderLazyTablePaging passed!");
+}
+
 // -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
-function runAll() {
+async function runAll() {
     console.log("Starting QuiverSQL VS Code Extension Scanner Tests...\n");
     try {
         testSingleQuery();
@@ -357,7 +434,9 @@ function runAll() {
         testPagedGridRendering();
         testPlanMetricFormatting();
         testPlanVisualizationHtmlRendering();
+        testPlanVisualizationTruncationWarning();
         testPagedGridEmptyState();
+        await testDataSourcesProviderLazyTablePaging();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

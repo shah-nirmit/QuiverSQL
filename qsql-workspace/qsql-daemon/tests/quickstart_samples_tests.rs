@@ -48,8 +48,9 @@ async fn test_quickstart_samples_are_queryable() {
         .await
         .unwrap();
 
-    let compensation =
-        SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation").unwrap();
+    let compensation = SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
+        .await
+        .unwrap();
     engine
         .register_table("compensation", Arc::new(compensation))
         .unwrap();
