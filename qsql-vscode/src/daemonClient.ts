@@ -10,6 +10,7 @@ import {
     QueryPageRequest,
     QueryStartRequest,
     CatalogSource,
+    ListSourceTablesResult,
     RemoveSourceResult,
     RemoveSourceRequest,
     GetSourceMetadataRequest,
@@ -43,7 +44,7 @@ interface RpcResponse {
 export class DaemonClient {
     private process?: cp.ChildProcess;
     private pendingRequests = new Map<number, { resolve: (val: any) => void; reject: (err: QueryError) => void }>();
-    private buffer = '';
+    private buffer: Buffer = Buffer.alloc(0);
 
     constructor(private context: vscode.ExtensionContext) {}
 
@@ -64,8 +65,8 @@ export class DaemonClient {
                 reject(err);
             });
 
-            this.process.stdout?.on('data', (data) => {
-                this.buffer += data.toString();
+            this.process.stdout?.on('data', (data: Buffer) => {
+                this.buffer = Buffer.concat([this.buffer, data]);
                 this.processBuffer();
             });
 
@@ -128,47 +129,74 @@ export class DaemonClient {
     }
 
     private processBuffer() {
-        let newlineIndex;
-        while ((newlineIndex = this.buffer.indexOf('\n')) !== -1) {
-            const line = this.buffer.slice(0, newlineIndex).trim();
-            this.buffer = this.buffer.slice(newlineIndex + 1);
-
-            if (!line) continue;
-
-            try {
-                const response = JSON.parse(line) as RpcResponse;
-                if (response.id !== undefined && this.pendingRequests.has(response.id)) {
-                    const { resolve, reject } = this.pendingRequests.get(response.id)!;
-                    this.pendingRequests.delete(response.id);
-
-                    if (response.error) {
-                        const rpcErr = response.error;
-                        let details: string | undefined = undefined;
-                        if (rpcErr.data !== undefined) {
-                            if (typeof rpcErr.data === 'string') {
-                                details = rpcErr.data;
-                            } else if (typeof rpcErr.data === 'object' && rpcErr.data !== null) {
-                                details = typeof rpcErr.data.details === 'string'
-                                    ? rpcErr.data.details
-                                    : JSON.stringify(rpcErr.data);
-                            }
-                        } else if (typeof rpcErr.details === 'string') {
-                            details = rpcErr.details;
-                        }
-
-                        const queryError: QueryError = {
-                            code: typeof rpcErr.code === 'number' ? rpcErr.code : -32603,
-                            message: typeof rpcErr.message === 'string' ? rpcErr.message : 'Unknown error',
-                            details
-                        };
-                        reject(queryError);
-                    } else {
-                        resolve(response.result);
-                    }
+        while (this.buffer.length > 0) {
+            const headerStr = this.buffer.toString('utf8', 0, Math.min(this.buffer.length, 1024));
+            const headerMatch = headerStr.match(/^Content-Length:\s*(\d+)\r?\n\r?\n/i);
+            
+            if (headerMatch) {
+                const headerLength = Buffer.byteLength(headerMatch[0], 'utf8');
+                const bodyLength = Number(headerMatch[1]);
+                
+                if (this.buffer.length < headerLength + bodyLength) {
+                    return;
                 }
-            } catch (e) {
-                console.error(`Failed to parse daemon response: ${line}`, e);
+                
+                const body = this.buffer.subarray(headerLength, headerLength + bodyLength).toString('utf8');
+                this.buffer = this.buffer.subarray(headerLength + bodyLength);
+                this.processResponseFrame(body);
+                continue;
             }
+            if (/^Content-Length:/i.test(headerStr)) {
+                return;
+            }
+
+            const newlineIndex = this.buffer.indexOf('\n'.charCodeAt(0));
+            if (newlineIndex === -1) {
+                return;
+            }
+            const line = this.buffer.subarray(0, newlineIndex).toString('utf8').trim();
+            this.buffer = this.buffer.subarray(newlineIndex + 1);
+            if (!line) {
+                continue;
+            }
+            this.processResponseFrame(line);
+        }
+    }
+
+    private processResponseFrame(frame: string): void {
+        try {
+            const response = JSON.parse(frame) as RpcResponse;
+            if (response.id !== undefined && this.pendingRequests.has(response.id)) {
+                const { resolve, reject } = this.pendingRequests.get(response.id)!;
+                this.pendingRequests.delete(response.id);
+
+                if (response.error) {
+                    const rpcErr = response.error;
+                    let details: string | undefined = undefined;
+                    if (rpcErr.data !== undefined) {
+                        if (typeof rpcErr.data === 'string') {
+                            details = rpcErr.data;
+                        } else if (typeof rpcErr.data === 'object' && rpcErr.data !== null) {
+                            details = typeof rpcErr.data.details === 'string'
+                                ? rpcErr.data.details
+                                : JSON.stringify(rpcErr.data);
+                        }
+                    } else if (typeof rpcErr.details === 'string') {
+                        details = rpcErr.details;
+                    }
+
+                    const queryError: QueryError = {
+                        code: typeof rpcErr.code === 'number' ? rpcErr.code : -32603,
+                        message: typeof rpcErr.message === 'string' ? rpcErr.message : 'Unknown error',
+                        details
+                    };
+                    reject(queryError);
+                } else {
+                    resolve(response.result);
+                }
+            }
+        } catch (e) {
+            console.error(`Failed to parse daemon response: ${frame}`, e);
         }
     }
 
@@ -185,7 +213,8 @@ export class DaemonClient {
             id
         };
 
-        const reqStr = JSON.stringify(request) + '\n';
+        const body = JSON.stringify(request);
+        const reqStr = `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`;
         
         return new Promise<T>((resolve, reject) => {
             this.pendingRequests.set(id, { resolve, reject });
@@ -241,6 +270,10 @@ export class DaemonClient {
 
     public listSources(): Promise<CatalogSource[]> {
         return this.sendRequest<CatalogSource[]>('list_sources');
+    }
+
+    public listSourceTables(name: string, offset: number = 0, limit: number = 250): Promise<ListSourceTablesResult> {
+        return this.sendRequest<ListSourceTablesResult>('list_source_tables', { name, offset, limit });
     }
 
     public removeSource(name: string): Promise<RemoveSourceResult> {

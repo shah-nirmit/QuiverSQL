@@ -1,9 +1,26 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+//! Phase 0 baseline benchmarks.
+//!
+//! Bench profile is intentionally set to opt-level=1 in qsql-workspace/Cargo.toml so
+//! that `cargo bench --no-run` compiles in a few minutes (vs >10 min at release-grade
+//! optimization). Absolute numbers under this profile are NOT comparable to
+//! release-profile runs; they exist to catch compile-time regressions and large
+//! relative shifts. Phase 0 benches are non-gating per implementation_plan.md.
+//!
+//! Engine and Runtime are constructed once per bench group via OnceCell/Lazy to keep
+//! the timed body focused on the operation under test rather than SessionContext +
+//! federation-planner setup cost.
+
+use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion, Throughput};
+use once_cell::sync::Lazy;
 use qsql_connectors::sqlite::SqliteTableProvider;
-use qsql_core::engine::QsqlEngine;
+use qsql_core::broadcast::BroadcastRewriteConfig;
+use qsql_core::engine::{ExecutePageOptions, QsqlEngine};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+use tokio_util::sync::CancellationToken;
+
+static RT: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("tokio runtime"));
 
 fn repo_root() -> PathBuf {
     let mut starts = vec![std::env::current_dir().expect("current_dir")];
@@ -29,29 +46,22 @@ fn sample_path(file_name: &str) -> String {
         .into_owned()
 }
 
-async fn register_quickstart_files(engine: &QsqlEngine) {
-    engine
-        .register_file("employees", &sample_path("employees.csv"), "csv")
-        .await
-        .expect("register employees");
-    engine
-        .register_file("orders", &sample_path("orders.parquet"), "parquet")
-        .await
-        .expect("register orders");
-}
-
 fn benchmark_file_scans(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
+    let csv_engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        engine
+            .register_file("employees", &sample_path("employees.csv"), "csv")
+            .await
+            .expect("register csv");
+        engine
+    });
 
-    c.bench_function("csv_file_scan_to_json", |b| {
+    let mut group = c.benchmark_group("csv_file_scan_to_json");
+    group.throughput(Throughput::Elements(5));
+    group.bench_function("ordered_limit_5", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let engine = QsqlEngine::new();
-                engine
-                    .register_file("employees", &sample_path("employees.csv"), "csv")
-                    .await
-                    .expect("register csv");
-                let result = engine
+            RT.block_on(async {
+                let result = csv_engine
                     .execute_sql_to_json(
                         "SELECT id, name, salary FROM employees ORDER BY id LIMIT 5",
                     )
@@ -61,16 +71,23 @@ fn benchmark_file_scans(c: &mut Criterion) {
             });
         });
     });
+    group.finish();
 
-    c.bench_function("parquet_file_scan_to_json", |b| {
+    let parquet_engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        engine
+            .register_file("orders", &sample_path("orders.parquet"), "parquet")
+            .await
+            .expect("register parquet");
+        engine
+    });
+
+    let mut group = c.benchmark_group("parquet_file_scan_to_json");
+    group.throughput(Throughput::Elements(5));
+    group.bench_function("ordered_limit_5", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let engine = QsqlEngine::new();
-                engine
-                    .register_file("orders", &sample_path("orders.parquet"), "parquet")
-                    .await
-                    .expect("register parquet");
-                let result = engine
+            RT.block_on(async {
+                let result = parquet_engine
                     .execute_sql_to_json(
                         "SELECT order_id, employee_id, amount FROM orders ORDER BY order_id LIMIT 5",
                     )
@@ -80,21 +97,26 @@ fn benchmark_file_scans(c: &mut Criterion) {
             });
         });
     });
+    group.finish();
 }
 
 fn benchmark_sqlite_scan(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
+    let engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        let provider = SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
+            .await
+            .expect("sqlite provider");
+        engine
+            .register_table("compensation", Arc::new(provider))
+            .expect("register sqlite");
+        engine
+    });
 
-    c.bench_function("sqlite_table_scan_to_json", |b| {
+    let mut group = c.benchmark_group("sqlite_table_scan_to_json");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("ordered_scan", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let engine = QsqlEngine::new();
-                let provider =
-                    SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
-                        .expect("sqlite provider");
-                engine
-                    .register_table("compensation", Arc::new(provider))
-                    .expect("register sqlite");
+            RT.block_on(async {
                 let result = engine
                     .execute_sql_to_json(
                         "SELECT employee_id, bonus, review_score FROM compensation ORDER BY employee_id",
@@ -105,6 +127,7 @@ fn benchmark_sqlite_scan(c: &mut Criterion) {
             });
         });
     });
+    group.finish();
 }
 
 fn benchmark_json_serialization(c: &mut Criterion) {
@@ -119,55 +142,74 @@ fn benchmark_json_serialization(c: &mut Criterion) {
         })
         .collect();
 
-    c.bench_function("json_result_serialization_1000_rows", |b| {
+    let mut group = c.benchmark_group("json_result_serialization_1000_rows");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("serde_to_string", |b| {
         b.iter(|| {
             let encoded = serde_json::to_string(black_box(&rows)).expect("serialize rows");
             black_box(encoded);
         });
     });
+    group.finish();
 }
 
-fn benchmark_first_page_placeholder(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
-
-    c.bench_function("first_page_latency_placeholder_full_collect", |b| {
-        b.iter(|| {
-            rt.block_on(async {
-                let engine = QsqlEngine::new();
-                register_quickstart_files(&engine).await;
-                let result = engine
-                    .execute_sql_to_json(
-                        "SELECT e.name, o.product, o.amount
-                         FROM employees e
-                         JOIN orders o ON e.id = o.employee_id
-                         ORDER BY o.amount DESC
-                         LIMIT 1000",
-                    )
-                    .await
-                    .expect("first page placeholder query");
-                black_box(result);
-            });
-        });
+fn benchmark_first_page_latency(c: &mut Criterion) {
+    // First-page benchmark deliberately constructs a fresh engine per iter via
+    // iter_batched so that the streaming stream and per-request SessionContext
+    // start cold each iteration — this measures the contract "first page in N ms
+    // without forcing full materialization." Engine construction is the setup
+    // closure (not measured); only the page fetch is timed.
+    let mut group = c.benchmark_group("first_page_latency_1m_rows_streaming_json");
+    group.throughput(Throughput::Elements(1_000));
+    group.bench_function("page_0_size_1000", |b| {
+        b.iter_batched(
+            QsqlEngine::new,
+            |engine| {
+                RT.block_on(async {
+                    let page = engine
+                        .execute_sql_to_page(
+                            "bench_first_page",
+                            "SELECT * FROM generate_series(1, 1000000) AS t(value)",
+                            ExecutePageOptions {
+                                page_index: 0,
+                                page_size: 1_000,
+                                warning: None,
+                                cancellation_token: CancellationToken::new(),
+                                timeout_ms: None,
+                            },
+                        )
+                        .await
+                        .expect("first page query");
+                    black_box(page);
+                });
+            },
+            BatchSize::PerIteration,
+        );
     });
+    group.finish();
 }
 
 fn benchmark_federated_join(c: &mut Criterion) {
-    let rt = Runtime::new().expect("tokio runtime");
+    let engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        engine
+            .register_file("employees", &sample_path("employees.csv"), "csv")
+            .await
+            .expect("register employees");
+        let provider = SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
+            .await
+            .expect("sqlite provider");
+        engine
+            .register_table("compensation", Arc::new(provider))
+            .expect("register sqlite");
+        engine
+    });
 
-    c.bench_function("federated_csv_sqlite_join_to_json", |b| {
+    let mut group = c.benchmark_group("federated_csv_sqlite_join_to_json");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("inner_join_order_by_review", |b| {
         b.iter(|| {
-            rt.block_on(async {
-                let engine = QsqlEngine::new();
-                engine
-                    .register_file("employees", &sample_path("employees.csv"), "csv")
-                    .await
-                    .expect("register employees");
-                let provider =
-                    SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
-                        .expect("sqlite provider");
-                engine
-                    .register_table("compensation", Arc::new(provider))
-                    .expect("register sqlite");
+            RT.block_on(async {
                 let result = engine
                     .execute_sql_to_json(
                         "SELECT e.name, c.bonus, c.review_score
@@ -181,6 +223,76 @@ fn benchmark_federated_join(c: &mut Criterion) {
             });
         });
     });
+    group.finish();
+}
+
+fn benchmark_broadcast_rewrite_csv_join_sqlite(c: &mut Criterion) {
+    // Compares the same CSV ⋈ SQLite join with the broadcast-join rewrite
+    // enabled vs disabled. With rewrite enabled, the CSV side's distinct
+    // join keys get materialized once and pushed into the SQLite-side scan
+    // as an IN-list filter. Both bench groups share the same dataset for a
+    // direct apples-to-apples comparison.
+    let build = |config: BroadcastRewriteConfig| {
+        RT.block_on(async {
+            let engine = QsqlEngine::new().with_broadcast_config(config);
+            engine
+                .register_file("employees", &sample_path("employees.csv"), "csv")
+                .await
+                .expect("register employees");
+            let provider =
+                SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
+                    .await
+                    .expect("sqlite provider");
+            engine
+                .register_table("compensation", Arc::new(provider))
+                .expect("register sqlite");
+            engine
+        })
+    };
+
+    let engine_on = build(BroadcastRewriteConfig::default());
+    let engine_off = build(BroadcastRewriteConfig::disabled());
+
+    let sql = "SELECT e.name, c.bonus, c.review_score
+               FROM employees e
+               JOIN compensation c ON e.id = c.employee_id
+               ORDER BY c.review_score DESC";
+
+    let mut group = c.benchmark_group("broadcast_rewrite_csv_join_sqlite");
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("rewrite_on", |b| {
+        b.iter(|| {
+            RT.block_on(async {
+                let result = engine_on.execute_sql_to_json(sql).await.expect("rewrite_on");
+                black_box(result);
+            });
+        });
+    });
+    group.bench_function("rewrite_off", |b| {
+        b.iter(|| {
+            RT.block_on(async {
+                let result = engine_off.execute_sql_to_json(sql).await.expect("rewrite_off");
+                black_box(result);
+            });
+        });
+    });
+    group.finish();
+}
+
+fn benchmark_idle_daemon_rss_baseline(c: &mut Criterion) {
+    // Self-process RSS baseline for the bench runner. The real daemon-subprocess
+    // RSS measurement lives in integration tests (tests/common/memory.rs) which
+    // can attach to a PID via the daemon's CARGO_BIN_EXE handle. Here we record
+    // the test process's RSS as a sanity baseline for relative growth checks.
+    let mut group = c.benchmark_group("idle_process_rss_baseline");
+    group.sample_size(10);
+    group.bench_function("memory_stats_self", |b| {
+        b.iter(|| {
+            let stats = memory_stats::memory_stats();
+            black_box(stats);
+        });
+    });
+    group.finish();
 }
 
 fn configure() -> Criterion {
@@ -194,7 +306,9 @@ criterion_group! {
         benchmark_file_scans,
         benchmark_sqlite_scan,
         benchmark_json_serialization,
-        benchmark_first_page_placeholder,
-        benchmark_federated_join
+        benchmark_first_page_latency,
+        benchmark_federated_join,
+        benchmark_broadcast_rewrite_csv_join_sqlite,
+        benchmark_idle_daemon_rss_baseline
 }
 criterion_main!(phase0);

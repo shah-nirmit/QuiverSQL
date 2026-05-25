@@ -25,6 +25,8 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --locked --workspace
+      - name: Bench compile smoke
+        run: cargo bench --locked --no-run -p qsql-daemon --bench phase0_benchmarks
 
   vscode:
     name: VS Code Extension

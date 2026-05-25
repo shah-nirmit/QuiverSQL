@@ -3,14 +3,17 @@ import { DaemonClient } from './daemonClient';
 import { CatalogSource } from './models';
 import { SourceManager } from './sourceManager';
 
+const TABLE_TREE_PAGE_SIZE = 250;
+
 export class DataSourceItem extends vscode.TreeItem {
     constructor(
         public readonly source: CatalogSource,
-        public readonly tableName?: string
+        public readonly tableName?: string,
+        public readonly loadMore: boolean = false
     ) {
         super(
-            tableName ? tableName : source.name,
-            tableName ? vscode.TreeItemCollapsibleState.None : (source.tables && source.tables.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None)
+            loadMore ? 'Load more tables...' : (tableName ? tableName : source.name),
+            tableName || loadMore ? vscode.TreeItemCollapsibleState.None : (source.tables && source.tables.length > 0 ? vscode.TreeItemCollapsibleState.Collapsed : vscode.TreeItemCollapsibleState.None)
         );
 
         const typeLabel: Record<string, string> = {
@@ -40,7 +43,17 @@ export class DataSourceItem extends vscode.TreeItem {
         const isError = source.status === 'error';
         const typeStr = typeLabel[source.kind] || source.kind;
 
-        if (this.tableName) {
+        if (this.loadMore) {
+            this.description = 'More';
+            this.tooltip = `Load more tables from ${source.name}`;
+            this.iconPath = new vscode.ThemeIcon('ellipsis');
+            this.contextValue = 'qsqlDataSourceLoadMore';
+            this.command = {
+                command: 'qsql.loadMoreTables',
+                title: 'Load more tables',
+                arguments: [source.name]
+            };
+        } else if (this.tableName) {
             this.description = 'Table';
             this.tooltip = `Table: ${source.name}.${tableName}`;
             this.iconPath = new vscode.ThemeIcon('table');
@@ -94,6 +107,8 @@ export class DataSourcesProvider
     private daemonClient?: DaemonClient;
     private sourceManager?: SourceManager;
     private sources: CatalogSource[] = [];
+    private loadedTables = new Map<string, string[]>();
+    private hasMoreTables = new Map<string, boolean>();
 
     public setContext(daemonClient: DaemonClient, sourceManager: SourceManager) {
         this.daemonClient = daemonClient;
@@ -108,14 +123,52 @@ export class DataSourcesProvider
         return this.sources;
     }
 
+    public async loadMoreTables(sourceName: string): Promise<void> {
+        if (!this.daemonClient) {
+            return;
+        }
+
+        const source = this.sources.find(s => s.name === sourceName);
+        if (!source) {
+            return;
+        }
+
+        const loaded = this.loadedTables.get(sourceName) ?? [];
+        const page = await this.daemonClient.listSourceTables(
+            sourceName,
+            loaded.length,
+            TABLE_TREE_PAGE_SIZE
+        );
+        const next = [...loaded];
+        for (const table of page.tables) {
+            if (!next.includes(table)) {
+                next.push(table);
+            }
+        }
+        this.loadedTables.set(sourceName, next);
+        this.hasMoreTables.set(
+            sourceName,
+            page.truncated || (page.total_known !== undefined && next.length < page.total_known)
+        );
+        this._onDidChangeTreeData.fire();
+    }
+
     getTreeItem(element: DataSourceItem): vscode.TreeItem {
         return element;
     }
 
     async getChildren(element?: DataSourceItem): Promise<DataSourceItem[]> {
         if (element) {
+            if (element.loadMore || element.tableName) {
+                return [];
+            }
             if (element.source.tables && element.source.tables.length > 0) {
-                return element.source.tables.map(table => new DataSourceItem(element.source, table));
+                const tables = this.tablesForSource(element.source);
+                const children = tables.map(table => new DataSourceItem(element.source, table));
+                if (this.hasMoreTables.get(element.source.name)) {
+                    children.push(new DataSourceItem(element.source, undefined, true));
+                }
+                return children;
             }
             return [];
         }
@@ -185,6 +238,7 @@ export class DataSourcesProvider
             }
 
             this.sources = mergedSources;
+            this.pruneTableState(mergedSources);
             return mergedSources.map(s => new DataSourceItem(s));
         } catch (e: any) {
             this.sources = [];
@@ -194,6 +248,31 @@ export class DataSourcesProvider
             );
             errorItem.iconPath = new vscode.ThemeIcon('error');
             return [errorItem as unknown as DataSourceItem];
+        }
+    }
+
+    private tablesForSource(source: CatalogSource): string[] {
+        const existing = this.loadedTables.get(source.name);
+        if (existing) {
+            return existing;
+        }
+
+        const tables = (source.tables ?? []).slice(0, TABLE_TREE_PAGE_SIZE);
+        this.loadedTables.set(source.name, tables);
+        const hasMore =
+            Boolean(source.connection_details?.tables_truncated) ||
+            (source.tables ?? []).length > tables.length;
+        this.hasMoreTables.set(source.name, hasMore);
+        return tables;
+    }
+
+    private pruneTableState(sources: CatalogSource[]): void {
+        const names = new Set(sources.map(source => source.name));
+        for (const name of this.loadedTables.keys()) {
+            if (!names.has(name)) {
+                this.loadedTables.delete(name);
+                this.hasMoreTables.delete(name);
+            }
         }
     }
 }

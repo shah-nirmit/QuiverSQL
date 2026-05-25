@@ -70,11 +70,11 @@ const childProcessMock = {
                     }
                 }
             },
-            emitStdout: (data: string) => {
+            emitStdout: (data: string | Buffer) => {
                 const dataHandlers = stdoutEvents.get('data');
                 if (dataHandlers) {
                     for (const handler of dataHandlers) {
-                        handler(data);
+                        handler(Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8'));
                     }
                 }
             },
@@ -149,6 +149,19 @@ async function createClient(): Promise<DaemonClient> {
     return client;
 }
 
+function parseRpcRequestFrame(data: string): any {
+    const headerMatch = data.match(/^Content-Length:\s*(\d+)\r?\n\r?\n/i);
+    assert.ok(headerMatch, `expected Content-Length request frame, got ${data}`);
+    const headerLength = headerMatch[0].length;
+    const bodyLength = Number(headerMatch[1]);
+    return JSON.parse(data.slice(headerLength, headerLength + bodyLength));
+}
+
+function framedResponse(response: any): string {
+    const body = JSON.stringify(response);
+    return `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`;
+}
+
 // -------------------------------------------------------------
 // 3. Test Cases
 // -------------------------------------------------------------
@@ -159,7 +172,7 @@ async function testSuccessfulQuery() {
     
     // Register request handler to simulate success response
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         const mockResult: QueryPage = {
             query_id: "q_1",
             schema: {
@@ -185,7 +198,7 @@ async function testSuccessfulQuery() {
             result: mockResult,
             id: req.id
         };
-        mockProcessInstance.emitStdout(JSON.stringify(res) + "\n");
+        mockProcessInstance.emitStdout(framedResponse(res));
     };
 
     const response = await client.sendRequest<QueryPage>('execute_json', { sql: "SELECT * FROM users" });
@@ -205,7 +218,7 @@ async function testPagedQueryHelpersSendExpectedRpc() {
     const methods: string[] = [];
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         methods.push(req.method);
 
         if (req.method === 'query_start') {
@@ -287,7 +300,7 @@ async function testStandardErrorBubble() {
     const client = await createClient();
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         const res = {
             jsonrpc: "2.0",
             error: {
@@ -318,7 +331,7 @@ async function testErrorWithDetails() {
     const client = await createClient();
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         const res = {
             jsonrpc: "2.0",
             error: {
@@ -352,7 +365,7 @@ async function testErrorWithStringDataDetails() {
     const client = await createClient();
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         const res = {
             jsonrpc: "2.0",
             error: {
@@ -377,6 +390,30 @@ async function testErrorWithStringDataDetails() {
 
     client.stop();
     console.log("OK: testErrorWithStringDataDetails passed!");
+}
+
+async function testContentLengthResponseParsing() {
+    console.log("Running: testContentLengthResponseParsing");
+    const client = await createClient();
+
+    mockProcessInstance.onRequestWritten = (data: string) => {
+        const req = parseRpcRequestFrame(data);
+        const body = JSON.stringify({
+            jsonrpc: "2.0",
+            result: { ok: true, text: "line one\nline two" },
+            id: req.id
+        });
+        const frame = `Content-Length: ${Buffer.byteLength(body, 'utf8')}\r\n\r\n${body}`;
+        mockProcessInstance.emitStdout(frame.slice(0, 20));
+        mockProcessInstance.emitStdout(frame.slice(20));
+    };
+
+    const response = await client.sendRequest<any>('ping');
+    assert.strictEqual(response.ok, true);
+    assert.strictEqual(response.text, "line one\nline two");
+
+    client.stop();
+    console.log("OK: testContentLengthResponseParsing passed!");
 }
 
 function makeQueryPage(queryId: string, pageIndex: number): QueryPage {
@@ -411,7 +448,7 @@ async function testSourceCatalogMethods() {
     const methods: string[] = [];
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         methods.push(req.method);
 
         if (req.method === 'list_sources') {
@@ -425,6 +462,25 @@ async function testSourceCatalogMethods() {
                         status: "ok"
                     }
                 ],
+                id: req.id
+            }) + "\n");
+            return;
+        }
+
+        if (req.method === 'list_source_tables') {
+            assert.strictEqual(req.params.name, "my_csv");
+            assert.strictEqual(req.params.offset, 250);
+            assert.strictEqual(req.params.limit, 250);
+            mockProcessInstance.emitStdout(JSON.stringify({
+                jsonrpc: "2.0",
+                result: {
+                    name: "my_csv",
+                    tables: ["part_2"],
+                    offset: 250,
+                    limit: 250,
+                    total_known: 251,
+                    truncated: false
+                },
                 id: req.id
             }) + "\n");
             return;
@@ -471,6 +527,9 @@ async function testSourceCatalogMethods() {
     assert.strictEqual(sources[0].name, "my_csv");
     assert.strictEqual(sources[0].kind, "csv");
 
+    const tablePage = await client.listSourceTables("my_csv", 250, 250);
+    assert.deepStrictEqual(tablePage.tables, ["part_2"]);
+
     const removeResult = await client.removeSource("my_csv");
     assert.strictEqual(removeResult.name, "my_csv");
     assert.strictEqual(removeResult.removed, true);
@@ -478,7 +537,7 @@ async function testSourceCatalogMethods() {
     const metadata = await client.getSourceMetadata("my_csv");
     assert.strictEqual(metadata.name, "my_csv");
     assert.strictEqual(metadata.capabilities?.projection, true);
-    assert.deepStrictEqual(methods, ['list_sources', 'remove_source', 'get_source_metadata']);
+    assert.deepStrictEqual(methods, ['list_sources', 'list_source_tables', 'remove_source', 'get_source_metadata']);
 
     client.stop();
     console.log("OK: testSourceCatalogMethods passed!");
@@ -554,7 +613,7 @@ async function testExplainQuery() {
     await startPromise;
 
     mockProcessInstance.onRequestWritten = (data: string) => {
-        const req = JSON.parse(data.trim());
+        const req = parseRpcRequestFrame(data);
         if (req.method === 'explain_query') {
             mockProcessInstance.emitStdout(JSON.stringify({
                 jsonrpc: '2.0',
@@ -596,6 +655,7 @@ async function runAll() {
         await testStandardErrorBubble();
         await testErrorWithDetails();
         await testErrorWithStringDataDetails();
+        await testContentLengthResponseParsing();
         await testPendingRequestsRejectedOnDaemonClose();
         console.log("\nALL CLIENT TESTS PASSED SUCCESSFULLY!");
     } catch (err) {

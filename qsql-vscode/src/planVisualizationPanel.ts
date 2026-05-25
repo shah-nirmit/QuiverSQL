@@ -220,6 +220,11 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             fill: var(--vscode-textLink-foreground);
             font-size: 11px;
         }
+        .node-broadcast {
+            fill: var(--vscode-charts-orange);
+            font-size: 11px;
+            font-weight: 600;
+        }
         .edge {
             fill: none;
             stroke: var(--vscode-editorIndentGuide-background);
@@ -433,7 +438,17 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             if (node.native_plan_ref && sourcePlans[node.native_plan_ref]) {
                 lines.push({ text: 'Native plan available', cls: 'node-native' });
             }
-            return lines.slice(0, 5);
+            // Broadcast-rewrite badge — synthesized when the broadcast pass
+            // injected an IN-list filter above this scan path. Hover details
+            // are surfaced separately in the warning banner above the graph.
+            if (node.attributes && node.attributes.broadcast_rewrite === 'true') {
+                const count = node.attributes.broadcast_predicate_value_count;
+                const badge = count
+                    ? 'Broadcast: ' + count + ' keys'
+                    : 'Broadcast rewrite';
+                lines.push({ text: badge, cls: 'node-broadcast' });
+            }
+            return lines.slice(0, 6);
         }
 
         function renderTree() {

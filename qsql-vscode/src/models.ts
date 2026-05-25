@@ -120,6 +120,21 @@ export interface GetSourceMetadataRequest {
     name: string;
 }
 
+export interface ListSourceTablesRequest {
+    name: string;
+    offset?: number;
+    limit?: number;
+}
+
+export interface ListSourceTablesResult {
+    name: string;
+    tables: string[];
+    offset: number;
+    limit: number;
+    total_known?: number;
+    truncated: boolean;
+}
+
 export interface ExplainQueryRequest {
     sql: string;
     include_native?: boolean;

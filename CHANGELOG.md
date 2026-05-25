@@ -2,17 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.0-alpha.0 - Unreleased
+
+Changes since `0.2.1-alpha.0`.
+
+- Upgraded the workspace to DataFusion 53.1.0 and adopted `datafusion-table-providers` plus `datafusion-federation` for SQLite, Postgres, and MySQL/MariaDB connectors.
+- Reworked query execution around streaming `QueryResultHandle` responses, per-request `SessionContext` isolation, explicit memory limits, and cancellation coverage.
+- Added federation safeguards, including guarded scan budgets, broadcast-join optimization for small local inputs, generation-counter catalog updates, and strict credential redaction.
+- Hardened JSON-RPC transport with LSP-style `Content-Length` framing and byte-accurate VS Code client parsing for multi-byte UTF-8 payloads.
+- Hardened database registration, table discovery, and explain/lineage planning around concurrent catalog updates.
+- Added plan visualization truncation warnings, JSON-RPC framing documentation, architecture remediation notes, CI updates, and expanded federation/runtime tests.
+
 ## 0.2.1-alpha.0 - Unreleased
+
+Changes since `0.2.0-alpha.0`.
+
+- Added typed explain-plan models, JSON-RPC explain payloads, and serde coverage for visual query plans.
+- Added a VS Code visual query plan panel with metrics formatting, webview rendering, and client tests.
+- Added database-level SQL registration so SQLite/Postgres/MySQL/MariaDB sources register as one alias and query tables as `<alias>.<table_name>`.
+- Added bounded table discovery plus lazy JIT table-provider registration before execute, explain, and lineage planning.
+- Updated the VS Code source explorer to render database aliases as expandable nodes with table children.
+- Added JSON-RPC coverage for multi-table database discovery and querying joined tables through the alias-qualified path.
+
+## 0.2.0-alpha.0 - Unreleased
+
+Changes since `0.1.4-alpha.0`.
 
 - Added a shared SQL pushdown layer for projection, basic filters, and limits using DataFusion SQL unparsing.
 - Reworked SQLite scans to generate pushed-down SQL instead of always scanning `SELECT *`.
 - Added Postgres and MySQL/MariaDB connectors with schema introspection, table registration, and env-gated live tests.
 - Added daemon registration methods for Postgres, MySQL, and MariaDB with credential redaction in catalog responses.
 - Extended the VS Code connect wizard and source replay to support SQL database profiles backed by SecretStorage.
-- Added database-level SQL registration so SQLite/Postgres/MySQL/MariaDB sources register as one alias and query tables as `<alias>.<table_name>`.
-- Added bounded table discovery plus lazy JIT table-provider registration before execute, explain, and lineage planning.
-- Updated the VS Code source explorer to render database aliases as expandable nodes with table children.
-- Added JSON-RPC coverage for multi-table database discovery and querying joined tables through the alias-qualified path.
 
 ## 0.1.4-alpha.0 - 2026-05-20
 

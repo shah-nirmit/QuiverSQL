@@ -411,7 +411,11 @@ fn test_explain_query_models_golden() {
         source_plans: json!({}),
         raw: "raw_plan".to_string(),
         warnings: vec!["warn1".to_string()],
+        broadcast_rewrites: None,
     };
+    // `broadcast_rewrites` is `#[serde(skip_serializing_if = "Option::is_none")]`,
+    // so None is omitted from the wire format. Existing JSON-RPC clients that
+    // don't know about the field stay byte-identical.
     let result_expected = json!({
         "sql": "SELECT 1",
         "federated_plan": graph_expected,

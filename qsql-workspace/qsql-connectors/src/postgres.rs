@@ -7,14 +7,18 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::sql::unparser::dialect::PostgreSqlDialect;
+use datafusion::sql::TableReference;
+use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
+use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
+use secrecy::SecretString;
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio_postgres::{types::Type, NoTls, Row};
+use tokio_postgres::NoTls;
 
-use crate::sql::{
-    schema_from_fields, sql_capabilities, SqlDialectKind, SqlPushdownPlan, SqlTableProvider,
-    SqlTableRef,
-};
-use crate::RemoteConnector;
+use crate::sql::{quote_identifier, sql_capabilities, SqlDialectKind};
+use crate::{ConnectorResult, RemoteConnector};
 
 #[derive(Debug)]
 pub struct PostgresConnector {
@@ -45,7 +49,23 @@ impl RemoteConnector for PostgresConnector {
         "postgres"
     }
 
-    async fn explain_query(&self, sql: &str) -> Result<String, String> {
+    async fn table_provider(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        cached_schema: Option<SchemaRef>,
+    ) -> ConnectorResult<Arc<dyn TableProvider>> {
+        let provider = PostgresTableProvider::try_new_with_schema(
+            self.connection_string.clone(),
+            Some(schema.unwrap_or("public").to_string()),
+            table,
+            cached_schema,
+        )
+        .await?;
+        Ok(Arc::new(provider))
+    }
+
+    async fn explain_query(&self, sql: &str) -> ConnectorResult<String> {
         let explain_sql = format!("EXPLAIN (FORMAT JSON, COSTS TRUE) {}", sql);
         let client = self.client().await?;
         let rows = client
@@ -64,13 +84,27 @@ impl RemoteConnector for PostgresConnector {
         sql_capabilities(SqlDialectKind::Postgres)
     }
 
-    async fn list_tables(&self, schema: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+    async fn list_tables(
+        &self,
+        schema: Option<&str>,
+        limit: usize,
+    ) -> ConnectorResult<Vec<String>> {
+        self.list_tables_page(schema, 0, limit).await
+    }
+
+    async fn list_tables_page(
+        &self,
+        schema: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> ConnectorResult<Vec<String>> {
         let schema_name = schema.unwrap_or("public");
         let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
-        let sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT $2";
+        let offset = i64::try_from(offset).unwrap_or(i64::MAX);
+        let sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT $2 OFFSET $3";
         let client = self.client().await?;
         let rows = client
-            .query(sql, &[&schema_name, &limit])
+            .query(sql, &[&schema_name, &limit, &offset])
             .await
             .map_err(|e| format!("Failed to list tables: {}", e))?;
 
@@ -81,22 +115,14 @@ impl RemoteConnector for PostgresConnector {
         }
         Ok(tables)
     }
-
-    async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
-        let client = self.client().await?;
-        let rows = client
-            .query(sql, &[])
-            .await
-            .map_err(|e| format!("Postgres query failed: {e}"))?;
-
-        Ok(rows.iter().map(postgres_row_to_json).collect())
-    }
 }
 
 #[derive(Debug)]
 pub struct PostgresTableProvider {
     connector: Arc<PostgresConnector>,
-    inner: SqlTableProvider,
+    inner: Arc<dyn TableProvider>,
+    schema_name: String,
+    table_name: String,
 }
 
 impl PostgresTableProvider {
@@ -105,39 +131,47 @@ impl PostgresTableProvider {
         schema_name: Option<String>,
         table_name: impl Into<String>,
     ) -> Result<Self, String> {
+        Self::try_new_with_schema(connection_string, schema_name, table_name, None).await
+    }
+
+    pub async fn try_new_with_schema(
+        connection_string: impl Into<String>,
+        schema_name: Option<String>,
+        table_name: impl Into<String>,
+        schema: Option<SchemaRef>,
+    ) -> Result<Self, String> {
         let connection_string = connection_string.into();
         let table_name = table_name.into();
         let schema_name = schema_name.unwrap_or_else(|| "public".to_string());
-        let connector = Arc::new(PostgresConnector::new(connection_string));
-        let schema = introspect_postgres_schema(&connector, &schema_name, &table_name).await?;
-        let inner = SqlTableProvider::new(
-            connector.clone(),
-            SqlDialectKind::Postgres,
-            SqlTableRef::with_schema(schema_name, table_name),
-            schema,
-        );
+        let connector = Arc::new(PostgresConnector::new(connection_string.clone()));
+        let table_ref = TableReference::partial(schema_name.clone(), table_name.clone());
+        let inner = upstream_postgres_provider(&connection_string, table_ref, schema).await?;
 
-        Ok(Self { connector, inner })
+        Ok(Self {
+            connector,
+            inner,
+            schema_name,
+            table_name,
+        })
     }
 
     pub fn connector(&self) -> &Arc<PostgresConnector> {
         &self.connector
     }
 
-    pub fn build_select_sql(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<SqlPushdownPlan, String> {
-        self.inner.build_select_sql(projection, filters, limit)
+    pub fn native_select_sql(&self) -> String {
+        format!(
+            "SELECT * FROM {}.{}",
+            quote_identifier(&self.schema_name, SqlDialectKind::Postgres),
+            quote_identifier(&self.table_name, SqlDialectKind::Postgres)
+        )
     }
 }
 
 #[async_trait]
 impl TableProvider for PostgresTableProvider {
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        self.inner.as_any()
     }
 
     fn schema(&self) -> SchemaRef {
@@ -166,111 +200,111 @@ impl TableProvider for PostgresTableProvider {
     }
 }
 
-async fn introspect_postgres_schema(
-    connector: &PostgresConnector,
-    schema_name: &str,
-    table_name: &str,
-) -> Result<SchemaRef, String> {
-    let client = connector.client().await?;
-    let rows = client
-        .query(
-            r#"
-            SELECT column_name, data_type, is_nullable
-            FROM information_schema.columns
-            WHERE table_schema = $1 AND table_name = $2
-            ORDER BY ordinal_position
-            "#,
-            &[&schema_name, &table_name],
-        )
-        .await
-        .map_err(|e| format!("Postgres schema introspection failed: {e}"))?;
+async fn upstream_postgres_provider(
+    connection_string: &str,
+    table_ref: TableReference,
+    schema: Option<SchemaRef>,
+) -> Result<Arc<dyn TableProvider>, String> {
+    let pool = Arc::new(
+        PostgresConnectionPool::new(postgres_pool_params(connection_string)?)
+            .await
+            .map_err(|e| format!("Failed to create Postgres provider pool: {e}"))?,
+    );
 
-    if rows.is_empty() {
-        return Err(format!(
-            "Table '{}.{}' not found or has no columns",
-            schema_name, table_name
+    if let Some(schema) = schema {
+        let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
+        let table_provider = Arc::new(
+            SqlTable::new_with_schema("postgres", &dyn_pool, schema, table_ref)
+                .with_dialect(Arc::new(PostgreSqlDialect {})),
+        );
+        return Ok(Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| format!("Failed to create Postgres federated provider: {e}"))?,
         ));
     }
 
-    Ok(schema_from_fields(
-        rows.into_iter()
-            .map(|row| {
-                let name: String = row.get(0);
-                let sql_type: String = row.get(1);
-                let is_nullable: String = row.get(2);
-                (name, sql_type, is_nullable.eq_ignore_ascii_case("YES"))
-            })
-            .collect(),
-    ))
+    PostgresTableFactory::new(pool)
+        .table_provider(table_ref)
+        .await
+        .map_err(|e| format!("Failed to create Postgres provider: {e}"))
 }
 
-fn postgres_row_to_json(row: &Row) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
-    for (idx, column) in row.columns().iter().enumerate() {
-        let value = postgres_value_to_json(row, idx, column.type_());
-        obj.insert(column.name().to_string(), value);
-    }
-    serde_json::Value::Object(obj)
-}
+fn postgres_pool_params(connection_string: &str) -> Result<HashMap<String, SecretString>, String> {
+    let connection_string = connection_string.trim();
+    let mut params = HashMap::new();
 
-fn postgres_value_to_json(row: &Row, idx: usize, ty: &Type) -> serde_json::Value {
-    match *ty {
-        Type::BOOL => row
-            .try_get::<usize, Option<bool>>(idx)
-            .ok()
-            .flatten()
-            .map(serde_json::Value::Bool)
-            .unwrap_or(serde_json::Value::Null),
-        Type::INT2 => row
-            .try_get::<usize, Option<i16>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| serde_json::json!(v))
-            .unwrap_or(serde_json::Value::Null),
-        Type::INT4 => row
-            .try_get::<usize, Option<i32>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| serde_json::json!(v))
-            .unwrap_or(serde_json::Value::Null),
-        Type::INT8 => row
-            .try_get::<usize, Option<i64>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| serde_json::json!(v))
-            .unwrap_or(serde_json::Value::Null),
-        Type::FLOAT4 => row
-            .try_get::<usize, Option<f32>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| serde_json::json!(v as f64))
-            .unwrap_or(serde_json::Value::Null),
-        Type::FLOAT8 => row
-            .try_get::<usize, Option<f64>>(idx)
-            .ok()
-            .flatten()
-            .map(|v| serde_json::json!(v))
-            .unwrap_or(serde_json::Value::Null),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME => row
-            .try_get::<usize, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null),
-        _ => row
-            .try_get::<usize, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map(serde_json::Value::String)
-            .unwrap_or(serde_json::Value::Null),
+    if connection_string.starts_with("postgres://")
+        || connection_string.starts_with("postgresql://")
+    {
+        let url = url::Url::parse(connection_string)
+            .map_err(|e| format!("Invalid Postgres connection URL: {e}"))?;
+        if let Some(host) = url.host_str() {
+            params.insert("host".to_string(), SecretString::from(host.to_string()));
+        }
+        if let Some(port) = url.port() {
+            params.insert("port".to_string(), SecretString::from(port.to_string()));
+        }
+        if !url.username().is_empty() {
+            params.insert(
+                "user".to_string(),
+                SecretString::from(url.username().to_string()),
+            );
+        }
+        if let Some(password) = url.password() {
+            params.insert("pass".to_string(), SecretString::from(password.to_string()));
+        }
+        let db = url.path().trim_start_matches('/');
+        if !db.is_empty() {
+            params.insert("db".to_string(), SecretString::from(db.to_string()));
+        }
+        for (key, value) in url.query_pairs() {
+            match key.as_ref() {
+                "sslmode" | "sslrootcert" | "application_name" => {
+                    params.insert(key.to_string(), SecretString::from(value.to_string()));
+                }
+                _ => {}
+            }
+        }
+        params
+            .entry("sslmode".to_string())
+            .or_insert_with(|| SecretString::from("disable".to_string()));
+    } else {
+        params.insert(
+            "connection_string".to_string(),
+            SecretString::from(connection_string.to_string()),
+        );
+        if !connection_string.to_ascii_lowercase().contains("sslmode=") {
+            params.insert(
+                "sslmode".to_string(),
+                SecretString::from("disable".to_string()),
+            );
+        }
     }
+
+    Ok(params)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::{col, lit};
-    use std::ops::Add;
+    use qsql_core::QsqlEngine;
+    use secrecy::ExposeSecret;
+    use std::sync::Arc;
+
+    #[test]
+    fn postgres_url_params_preserve_local_no_tls_default() {
+        let params =
+            postgres_pool_params("postgres://qsql_test:qsql_test@localhost:5432/qsql_test")
+                .unwrap();
+
+        assert_eq!(params["host"].expose_secret(), "localhost");
+        assert_eq!(params["port"].expose_secret(), "5432");
+        assert_eq!(params["user"].expose_secret(), "qsql_test");
+        assert_eq!(params["pass"].expose_secret(), "qsql_test");
+        assert_eq!(params["db"].expose_secret(), "qsql_test");
+        assert_eq!(params["sslmode"].expose_secret(), "disable");
+    }
 
     #[tokio::test]
     #[cfg_attr(
@@ -299,17 +333,15 @@ mod tests {
         )
         .await
         .unwrap();
-        let sql = provider
-            .build_select_sql(Some(&vec![1]), &[col("id").eq(lit(1_i64))], Some(1))
-            .unwrap()
-            .sql;
-
-        assert_eq!(
-            sql,
-            "SELECT \"name\" FROM \"public\".\"qsql_phase4_pg\" WHERE (\"id\" = 1) LIMIT 1"
-        );
-        let rows = connector.execute_query(&sql).await.unwrap();
-        assert_eq!(rows.len(), 1);
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_pg", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json("SELECT name FROM qsql_phase4_pg WHERE id = 1 LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["name"], "Alice");
     }
     #[tokio::test]
@@ -340,32 +372,24 @@ mod tests {
         .await
         .unwrap();
 
-        // Test Between and Arithmetic
-        let sql1 = provider
-            .build_select_sql(
-                None,
-                &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))],
-                None,
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_pg_pushdowns", Arc::new(provider))
+            .unwrap();
+        let rows1 = engine
+            .execute_sql_to_json(
+                "SELECT name FROM qsql_phase4_pg_pushdowns WHERE price + 5 BETWEEN 11 AND 20",
             )
-            .unwrap()
-            .sql;
-        let rows1 = connector.execute_query(&sql1).await.unwrap();
-        assert_eq!(rows1.len(), 1); // 10.0 + 5 = 15 (Between 10 and 20) => Alice
+            .await
+            .unwrap();
+        assert_eq!(rows1.as_array().unwrap().len(), 1);
         assert_eq!(rows1[0]["name"], "Alice");
 
-        // Test Not and IsNull
-        let sql2 = provider
-            .build_select_sql(
-                None,
-                &[datafusion::logical_expr::expr::Expr::Not(Box::new(
-                    col("name").is_null(),
-                ))],
-                None,
-            )
-            .unwrap()
-            .sql;
-        let rows2 = connector.execute_query(&sql2).await.unwrap();
-        assert_eq!(rows2.len(), 3); // Alice, Bob, Dave
+        let rows2 = engine
+            .execute_sql_to_json("SELECT name FROM qsql_phase4_pg_pushdowns WHERE name IS NOT NULL")
+            .await
+            .unwrap();
+        assert_eq!(rows2.as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -396,21 +420,16 @@ mod tests {
         .await
         .unwrap();
 
-        // category LIKE 'A%' AND id IN (1, 3, 4) AND (score > 9.0 OR score < 5.0)
-        let sql = provider
-            .build_select_sql(
-                None,
-                &[
-                    col("category").like(lit("A%")),
-                    col("id").in_list(vec![lit(1_i64), lit(3_i64), lit(4_i64)], false),
-                    col("score").gt(lit(9.0)).or(col("score").lt(lit(5.0))),
-                ],
-                None,
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_pg_complex", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json(
+                "SELECT id FROM qsql_phase4_pg_complex WHERE category LIKE 'A%' AND id IN (1, 3, 4) AND (score > 9.0 OR score < 5.0)",
             )
-            .unwrap()
-            .sql;
-
-        let rows = connector.execute_query(&sql).await.unwrap();
-        assert_eq!(rows.len(), 2); // id 1 (Alpha, 9.5) and id 4 (Alpha, 3.0)
+            .await
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 }

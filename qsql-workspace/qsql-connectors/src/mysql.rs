@@ -7,14 +7,18 @@ use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::ExecutionPlan;
-use mysql_async::{prelude::Queryable, Opts, Pool, Row, Value};
+use datafusion::sql::unparser::dialect::MySqlDialect;
+use datafusion::sql::TableReference;
+use datafusion_table_providers::mysql::{DynMySQLConnectionPool, MySQLTableFactory};
+use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+use datafusion_table_providers::sql::sql_provider_datafusion::SqlTable;
+use mysql_async::{prelude::Queryable, Opts, Pool};
+use secrecy::SecretString;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::sql::{
-    schema_from_fields, sql_capabilities, sql_literal, SqlDialectKind, SqlPushdownPlan,
-    SqlTableProvider, SqlTableRef,
-};
-use crate::RemoteConnector;
+use crate::sql::{quote_identifier, sql_capabilities, sql_literal, SqlDialectKind};
+use crate::{ConnectorResult, RemoteConnector};
 
 #[derive(Debug)]
 pub struct MySqlConnector {
@@ -58,7 +62,24 @@ impl RemoteConnector for MySqlConnector {
         }
     }
 
-    async fn explain_query(&self, sql: &str) -> Result<String, String> {
+    async fn table_provider(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        cached_schema: Option<SchemaRef>,
+    ) -> ConnectorResult<Arc<dyn TableProvider>> {
+        let provider = MySqlTableProvider::try_new_with_schema(
+            self.connection_string.clone(),
+            self.dialect,
+            schema.map(str::to_string),
+            table,
+            cached_schema,
+        )
+        .await?;
+        Ok(Arc::new(provider))
+    }
+
+    async fn explain_query(&self, sql: &str) -> ConnectorResult<String> {
         use mysql_async::prelude::Queryable;
         let explain_sql = format!("EXPLAIN FORMAT=JSON {}", sql);
         let mut conn = self
@@ -84,7 +105,20 @@ impl RemoteConnector for MySqlConnector {
         sql_capabilities(self.dialect)
     }
 
-    async fn list_tables(&self, schema: Option<&str>, limit: usize) -> Result<Vec<String>, String> {
+    async fn list_tables(
+        &self,
+        schema: Option<&str>,
+        limit: usize,
+    ) -> ConnectorResult<Vec<String>> {
+        self.list_tables_page(schema, 0, limit).await
+    }
+
+    async fn list_tables_page(
+        &self,
+        schema: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> ConnectorResult<Vec<String>> {
         let schema_predicate = match schema {
             Some(schema) if !schema.trim().is_empty() => {
                 format!("table_schema = {}", sql_literal(schema))
@@ -92,8 +126,9 @@ impl RemoteConnector for MySqlConnector {
             _ => "table_schema = DATABASE()".to_string(),
         };
         let sql = format!(
-            "SELECT table_name FROM information_schema.tables WHERE {schema_predicate} AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT {}",
-            limit.max(1)
+            "SELECT table_name FROM information_schema.tables WHERE {schema_predicate} AND table_type = 'BASE TABLE' ORDER BY table_name LIMIT {} OFFSET {}",
+            limit.max(1),
+            offset
         );
         let pool = self.pool()?;
         let mut conn = pool
@@ -111,35 +146,17 @@ impl RemoteConnector for MySqlConnector {
                 tables.push(name);
             }
         }
-        drop(conn);
-        pool.disconnect()
-            .await
-            .map_err(|e| format!("Failed to close MySQL/MariaDB connection pool: {e}"))?;
         Ok(tables)
-    }
-
-    async fn execute_query(&self, sql: &str) -> Result<Vec<serde_json::Value>, String> {
-        let pool = self.pool()?;
-        let mut conn = pool
-            .get_conn()
-            .await
-            .map_err(|e| format!("Failed to connect to MySQL/MariaDB: {e}"))?;
-        let rows: Vec<Row> = conn
-            .query(sql)
-            .await
-            .map_err(|e| format!("MySQL/MariaDB query failed: {e}"))?;
-        drop(conn);
-        pool.disconnect()
-            .await
-            .map_err(|e| format!("Failed to close MySQL/MariaDB connection pool: {e}"))?;
-        Ok(rows.iter().map(mysql_row_to_json).collect())
     }
 }
 
 #[derive(Debug)]
 pub struct MySqlTableProvider {
     connector: Arc<MySqlConnector>,
-    inner: SqlTableProvider,
+    inner: Arc<dyn TableProvider>,
+    dialect: SqlDialectKind,
+    schema_name: Option<String>,
+    table_name: String,
 }
 
 impl MySqlTableProvider {
@@ -149,40 +166,57 @@ impl MySqlTableProvider {
         schema_name: Option<String>,
         table_name: impl Into<String>,
     ) -> Result<Self, String> {
+        Self::try_new_with_schema(connection_string, dialect, schema_name, table_name, None).await
+    }
+
+    pub async fn try_new_with_schema(
+        connection_string: impl Into<String>,
+        dialect: SqlDialectKind,
+        schema_name: Option<String>,
+        table_name: impl Into<String>,
+        schema: Option<SchemaRef>,
+    ) -> Result<Self, String> {
         let connection_string = connection_string.into();
         let table_name = table_name.into();
-        let connector = Arc::new(MySqlConnector::new(connection_string, dialect));
-        let schema =
-            introspect_mysql_schema(&connector, schema_name.as_deref(), &table_name).await?;
-        let table_ref = match schema_name {
+        let connector = Arc::new(MySqlConnector::new(connection_string.clone(), dialect));
+        let table_ref = match schema_name.as_deref() {
             Some(schema) if !schema.trim().is_empty() => {
-                SqlTableRef::with_schema(schema, table_name)
+                TableReference::partial(schema.to_string(), table_name.clone())
             }
-            _ => SqlTableRef::bare(table_name),
+            _ => TableReference::bare(table_name.clone()),
         };
-        let inner = SqlTableProvider::new(connector.clone(), dialect, table_ref, schema);
+        let inner = upstream_mysql_provider(&connection_string, table_ref, schema).await?;
+        let schema_name = schema_name.filter(|schema| !schema.trim().is_empty());
 
-        Ok(Self { connector, inner })
+        Ok(Self {
+            connector,
+            inner,
+            dialect,
+            schema_name,
+            table_name,
+        })
     }
 
     pub fn connector(&self) -> &Arc<MySqlConnector> {
         &self.connector
     }
 
-    pub fn build_select_sql(
-        &self,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<SqlPushdownPlan, String> {
-        self.inner.build_select_sql(projection, filters, limit)
+    pub fn native_select_sql(&self) -> String {
+        let table = quote_identifier(&self.table_name, self.dialect);
+        match self.schema_name.as_deref() {
+            Some(schema) => format!(
+                "SELECT * FROM {}.{table}",
+                quote_identifier(schema, self.dialect)
+            ),
+            None => format!("SELECT * FROM {table}"),
+        }
     }
 }
 
 #[async_trait]
 impl TableProvider for MySqlTableProvider {
     fn as_any(&self) -> &dyn std::any::Any {
-        self
+        self.inner.as_any()
     }
 
     fn schema(&self) -> SchemaRef {
@@ -211,92 +245,74 @@ impl TableProvider for MySqlTableProvider {
     }
 }
 
-async fn introspect_mysql_schema(
-    connector: &MySqlConnector,
-    schema_name: Option<&str>,
-    table_name: &str,
-) -> Result<SchemaRef, String> {
-    let schema_predicate = match schema_name {
-        Some(schema) if !schema.trim().is_empty() => {
-            format!("TABLE_SCHEMA = {}", sql_literal(schema))
-        }
-        _ => "TABLE_SCHEMA = DATABASE()".to_string(),
-    };
-    let sql = format!(
-        "SELECT COLUMN_NAME AS column_name, DATA_TYPE AS data_type, IS_NULLABLE AS is_nullable \
-         FROM information_schema.COLUMNS \
-         WHERE {schema_predicate} AND TABLE_NAME = {} \
-         ORDER BY ORDINAL_POSITION",
-        sql_literal(table_name)
+async fn upstream_mysql_provider(
+    connection_string: &str,
+    table_ref: TableReference,
+    schema: Option<SchemaRef>,
+) -> Result<Arc<dyn TableProvider>, String> {
+    let pool = Arc::new(
+        MySQLConnectionPool::new(mysql_pool_params(connection_string))
+            .await
+            .map_err(|e| format!("Failed to create MySQL/MariaDB provider pool: {e}"))?,
     );
 
-    let rows = connector.execute_query(&sql).await?;
-    if rows.is_empty() {
-        return Err(format!(
-            "Table '{}' not found or has no columns",
-            match schema_name {
-                Some(schema) if !schema.trim().is_empty() => format!("{schema}.{table_name}"),
-                _ => table_name.to_string(),
-            }
+    if let Some(schema) = schema {
+        let dyn_pool: Arc<DynMySQLConnectionPool> = pool;
+        let table_provider = Arc::new(
+            SqlTable::new_with_schema("mysql", &dyn_pool, schema, table_ref)
+                .with_dialect(Arc::new(MySqlDialect {})),
+        );
+        return Ok(Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| format!("Failed to create MySQL/MariaDB federated provider: {e}"))?,
         ));
     }
 
-    Ok(schema_from_fields(
-        rows.into_iter()
-            .filter_map(|row| {
-                let name = row.get("column_name")?.as_str()?.to_string();
-                let sql_type = row.get("data_type")?.as_str()?.to_string();
-                let nullable = row
-                    .get("is_nullable")
-                    .and_then(|value| value.as_str())
-                    .map(|value| value.eq_ignore_ascii_case("YES"))
-                    .unwrap_or(true);
-                Some((name, sql_type, nullable))
-            })
-            .collect(),
-    ))
+    MySQLTableFactory::new(pool)
+        .table_provider(table_ref)
+        .await
+        .map_err(|e| format!("Failed to create MySQL/MariaDB provider: {e}"))
 }
 
-fn mysql_row_to_json(row: &Row) -> serde_json::Value {
-    let mut obj = serde_json::Map::new();
-    for (idx, column) in row.columns_ref().iter().enumerate() {
-        let name = column.name_str().to_string();
-        let value = row
-            .as_ref(idx)
-            .map(mysql_value_to_json)
-            .unwrap_or(serde_json::Value::Null);
-        obj.insert(name, value);
+fn mysql_pool_params(connection_string: &str) -> HashMap<String, SecretString> {
+    let mut params = HashMap::new();
+    params.insert(
+        "connection_string".to_string(),
+        SecretString::from(connection_string.trim().to_string()),
+    );
+    if !connection_string.to_ascii_lowercase().contains("sslmode=") {
+        params.insert(
+            "sslmode".to_string(),
+            SecretString::from("disabled".to_string()),
+        );
     }
-    serde_json::Value::Object(obj)
-}
-
-fn mysql_value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::NULL => serde_json::Value::Null,
-        Value::Bytes(bytes) => {
-            serde_json::Value::String(String::from_utf8_lossy(bytes).into_owned())
-        }
-        Value::Int(value) => serde_json::json!(value),
-        Value::UInt(value) => serde_json::json!(value),
-        Value::Float(value) => serde_json::json!(*value as f64),
-        Value::Double(value) => serde_json::json!(value),
-        Value::Date(year, month, day, hour, minute, second, micros) => serde_json::Value::String(
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{micros:06}"),
-        ),
-        Value::Time(negative, days, hours, minutes, seconds, micros) => {
-            let sign = if *negative { "-" } else { "" };
-            serde_json::Value::String(format!(
-                "{sign}{days} {hours:02}:{minutes:02}:{seconds:02}.{micros:06}"
-            ))
-        }
-    }
+    params
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::{col, lit};
-    use std::ops::Add;
+    use qsql_core::QsqlEngine;
+    use secrecy::ExposeSecret;
+    use std::sync::Arc;
+
+    async fn mysql_query_drop(connector: &MySqlConnector, sql: &str) {
+        let pool = connector.pool().unwrap();
+        let mut conn = pool.get_conn().await.unwrap();
+        conn.query_drop(sql).await.unwrap();
+    }
+
+    #[test]
+    fn mysql_pool_params_preserve_local_no_tls_default() {
+        let params = mysql_pool_params("mysql://qsql_test:qsql_test@localhost:3306/qsql_test");
+
+        assert_eq!(
+            params["connection_string"].expose_secret(),
+            "mysql://qsql_test:qsql_test@localhost:3306/qsql_test"
+        );
+        assert_eq!(params["sslmode"].expose_secret(), "disabled");
+    }
 
     #[tokio::test]
     #[cfg_attr(
@@ -308,34 +324,31 @@ mod tests {
             .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
 
         let connector = MySqlConnector::mysql(url.clone());
-        connector
-            .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_mysql (id INT, name TEXT)")
-            .await
-            .unwrap();
-        connector
-            .execute_query("TRUNCATE TABLE qsql_phase4_mysql")
-            .await
-            .unwrap();
-        connector
-            .execute_query("INSERT INTO qsql_phase4_mysql VALUES (1, 'Alice'), (2, 'Bob')")
-            .await
-            .unwrap();
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_phase4_mysql (id INT, name TEXT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_phase4_mysql").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_phase4_mysql VALUES (1, 'Alice'), (2, 'Bob')",
+        )
+        .await;
 
         let provider =
             MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_phase4_mysql")
                 .await
                 .unwrap();
-        let sql = provider
-            .build_select_sql(Some(&vec![1]), &[col("id").eq(lit(1_i64))], Some(1))
-            .unwrap()
-            .sql;
-
-        assert_eq!(
-            sql,
-            "SELECT `name` FROM `qsql_phase4_mysql` WHERE (`id` = 1) LIMIT 1"
-        );
-        let rows = connector.execute_query(&sql).await.unwrap();
-        assert_eq!(rows.len(), 1);
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_mysql", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json("SELECT name FROM qsql_phase4_mysql WHERE id = 1 LIMIT 1")
+            .await
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["name"], "Alice");
     }
     #[tokio::test]
@@ -348,18 +361,17 @@ mod tests {
             .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
 
         let connector = MySqlConnector::mysql(url.clone());
-        connector
-            .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_mysql_pushdowns (id INT, name TEXT, price FLOAT)")
-            .await
-            .unwrap();
-        connector
-            .execute_query("TRUNCATE TABLE qsql_phase4_mysql_pushdowns")
-            .await
-            .unwrap();
-        connector
-            .execute_query("INSERT INTO qsql_phase4_mysql_pushdowns VALUES (1, 'Alice', 10.0), (2, 'Bob', 20.5), (3, NULL, 5.0), (4, 'Dave', NULL)")
-            .await
-            .unwrap();
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_phase4_mysql_pushdowns (id INT, name TEXT, price FLOAT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_phase4_mysql_pushdowns").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_phase4_mysql_pushdowns VALUES (1, 'Alice', 10.0), (2, 'Bob', 20.5), (3, NULL, 5.0), (4, 'Dave', NULL)",
+        )
+        .await;
 
         let provider = MySqlTableProvider::try_new(
             url,
@@ -370,32 +382,26 @@ mod tests {
         .await
         .unwrap();
 
-        // Test Between and Arithmetic
-        let sql1 = provider
-            .build_select_sql(
-                None,
-                &[col("price").add(lit(5.0)).between(lit(11.0), lit(20.0))],
-                None,
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_mysql_pushdowns", Arc::new(provider))
+            .unwrap();
+        let rows1 = engine
+            .execute_sql_to_json(
+                "SELECT name FROM qsql_phase4_mysql_pushdowns WHERE price + 5 BETWEEN 11 AND 20",
             )
-            .unwrap()
-            .sql;
-        let rows1 = connector.execute_query(&sql1).await.unwrap();
-        assert_eq!(rows1.len(), 1); // Alice
+            .await
+            .unwrap();
+        assert_eq!(rows1.as_array().unwrap().len(), 1);
         assert_eq!(rows1[0]["name"], "Alice");
 
-        // Test Not and IsNull
-        let sql2 = provider
-            .build_select_sql(
-                None,
-                &[datafusion::logical_expr::expr::Expr::Not(Box::new(
-                    col("name").is_null(),
-                ))],
-                None,
+        let rows2 = engine
+            .execute_sql_to_json(
+                "SELECT name FROM qsql_phase4_mysql_pushdowns WHERE name IS NOT NULL",
             )
-            .unwrap()
-            .sql;
-        let rows2 = connector.execute_query(&sql2).await.unwrap();
-        assert_eq!(rows2.len(), 3); // Alice, Bob, Dave
+            .await
+            .unwrap();
+        assert_eq!(rows2.as_array().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -408,18 +414,17 @@ mod tests {
             .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
 
         let connector = MySqlConnector::mysql(url.clone());
-        connector
-            .execute_query("CREATE TABLE IF NOT EXISTS qsql_phase4_mysql_complex (id INT, category TEXT, score FLOAT)")
-            .await
-            .unwrap();
-        connector
-            .execute_query("TRUNCATE TABLE qsql_phase4_mysql_complex")
-            .await
-            .unwrap();
-        connector
-            .execute_query("INSERT INTO qsql_phase4_mysql_complex VALUES (1, 'Alpha', 9.5), (2, 'Beta', 8.0), (3, 'Gamma', 4.0), (4, 'Alpha', 3.0)")
-            .await
-            .unwrap();
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_phase4_mysql_complex (id INT, category TEXT, score FLOAT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_phase4_mysql_complex").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_phase4_mysql_complex VALUES (1, 'Alpha', 9.5), (2, 'Beta', 8.0), (3, 'Gamma', 4.0), (4, 'Alpha', 3.0)",
+        )
+        .await;
 
         let provider = MySqlTableProvider::try_new(
             url,
@@ -430,21 +435,16 @@ mod tests {
         .await
         .unwrap();
 
-        // category LIKE 'A%' AND id IN (1, 3, 4) AND (score > 9.0 OR score < 5.0)
-        let sql = provider
-            .build_select_sql(
-                None,
-                &[
-                    col("category").like(lit("A%")),
-                    col("id").in_list(vec![lit(1_i64), lit(3_i64), lit(4_i64)], false),
-                    col("score").gt(lit(9.0)).or(col("score").lt(lit(5.0))),
-                ],
-                None,
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_phase4_mysql_complex", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json(
+                "SELECT id FROM qsql_phase4_mysql_complex WHERE category LIKE 'A%' AND id IN (1, 3, 4) AND (score > 9.0 OR score < 5.0)",
             )
-            .unwrap()
-            .sql;
-
-        let rows = connector.execute_query(&sql).await.unwrap();
-        assert_eq!(rows.len(), 2); // id 1 (Alpha, 9.5) and id 4 (Alpha, 3.0)
+            .await
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
     }
 }
