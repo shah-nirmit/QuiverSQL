@@ -37,6 +37,14 @@ Module.prototype.require = function (packageName: string, ...args: any[]) {
             },
             Disposable: class {
                 dispose() {}
+            },
+            Uri: {
+                joinPath: (base: any, ...segments: string[]) => ({
+                    fsPath: [base?.fsPath || base?.toString() || '', ...segments].join('/'),
+                    path: [base?.path || '', ...segments].join('/'),
+                    toString: function () { return this.fsPath; },
+                }),
+                file: (path: string) => ({ fsPath: path, path, toString: () => path }),
             }
         };
     }
@@ -50,14 +58,15 @@ import {
     formatCellValue,
     formatErrorMessage,
     getQueryPageColumns,
-    renderQueryPageHtml
+    renderQueryPageHtml,
+    renderErrorHtml
 } from '../webviewPanel';
 import {
     formatPlanMetrics,
     renderPlanVisualizationHtml
 } from '../planVisualizationPanel';
 import { DataSourcesProvider } from '../dataSourcesProvider';
-import { ExplainQueryResult, QueryPage } from '../models';
+import { ExplainQueryResult, QueryError, QueryPage, SCAN_GUARD_ERROR_CODE, isScanGuardError } from '../models';
 
 // -------------------------------------------------------------
 // 2. Mock vscode.TextDocument implementation
@@ -301,7 +310,12 @@ function testPlanVisualizationHtmlRendering() {
             }
         },
         source_plans: {
-            'pg_local.customers': { Plan: { 'Node Type': 'Seq Scan', 'Relation Name': 'customers' } }
+            'pg_local.customers': {
+                provider_kind: 'postgres',
+                native_sql: 'SELECT "name" FROM "public"."customers"',
+                native_explain: { Plan: { 'Node Type': 'Seq Scan', 'Relation Name': 'customers' } },
+                dialect: 'postgresql',
+            },
         },
         raw: 'TableScan: pg_local.customers projection=[name]',
         warnings: []
@@ -316,8 +330,13 @@ function testPlanVisualizationHtmlRendering() {
     assert.ok(html.includes('mousemove'));
     assert.ok(html.includes('data-copy-key="logical"'));
     assert.ok(html.includes('data-copy-key="native:pg_local.customers"'));
+    assert.ok(html.includes('data-copy-key="sql:pg_local.customers"'));
     assert.ok(html.includes('pg_local.customers'));
-    assert.ok(html.includes('Native plan available'));
+    assert.ok(html.includes('PostgreSQL'));
+    assert.ok(html.includes('Native SQL'));
+    assert.ok(html.includes('SELECT &quot;name&quot; FROM &quot;public&quot;.&quot;customers&quot;'));
+    assert.ok(html.includes('id="source-card-pg_local-customers"'));
+    assert.ok(html.includes('href="#icon-postgres"'));
     assert.ok(!html.includes('Node Details'));
     assert.ok(!html.includes('Rows: null'));
     assert.ok(!html.includes('Cost: null'));
@@ -414,6 +433,218 @@ async function testDataSourcesProviderLazyTablePaging() {
 }
 
 // -------------------------------------------------------------
+// 3b. Scan-Guard UX Tests
+// -------------------------------------------------------------
+
+function testIsScanGuardErrorHelper() {
+    const guardErr: QueryError = { code: SCAN_GUARD_ERROR_CODE, message: "scan budget exceeded" };
+    assert.strictEqual(isScanGuardError(guardErr), true, "should detect scan guard error code");
+
+    const genericErr: QueryError = { code: -32001, message: "execution error" };
+    assert.strictEqual(isScanGuardError(genericErr), false, "should not detect non-guard error");
+
+    const internalErr: QueryError = { code: -32603, message: "internal" };
+    assert.strictEqual(isScanGuardError(internalErr), false, "should not detect internal error");
+
+    const zeroErr: QueryError = { code: 0, message: "ok" };
+    assert.strictEqual(isScanGuardError(zeroErr), false, "should not detect zero code");
+
+    console.log("OK testIsScanGuardErrorHelper passed!");
+}
+
+function testScanGuardErrorRendersSuggestionBanner() {
+    const error: QueryError = { code: SCAN_GUARD_ERROR_CODE, message: "Remote scan exceeded budget." };
+    const html = renderErrorHtml(error.message, 42, error);
+    assert.ok(html.includes("Scan budget exceeded"), "should include scan guard heading");
+    assert.ok(html.includes("LIMIT") || html.includes("budget"), "should include actionable suggestion");
+    console.log("OK testScanGuardErrorRendersSuggestionBanner passed!");
+}
+
+function testGenericExecutionErrorNoSuggestionBanner() {
+    const error: QueryError = { code: -32603, message: "Some internal error." };
+    const html = renderErrorHtml(error.message, 42, error);
+    assert.ok(!html.includes("Scan budget exceeded"), "should NOT include scan guard hint for generic error");
+    console.log("OK testGenericExecutionErrorNoSuggestionBanner passed!");
+}
+
+function testScanGuardErrorCodeConstant() {
+    assert.strictEqual(SCAN_GUARD_ERROR_CODE, -32100, "SCAN_GUARD_ERROR_CODE should be -32100");
+    console.log("OK testScanGuardErrorCodeConstant passed!");
+}
+
+// -------------------------------------------------------------
+// 3c. Provider-Icon Tests
+// -------------------------------------------------------------
+
+import { allIconKinds, iconSymbolIdFor, labelFor, svgSymbolsLibrary } from '../providerIcons';
+
+function testProviderIconsHaveEntryForEverySourceKind() {
+    const kinds = allIconKinds();
+    // Every SourceKind variant in models.ts must have an entry — fails the
+    // build if someone adds a new connector kind without an icon.
+    const required: string[] = [
+        'csv', 'parquet', 'json', 'ndjson', 'sqlite', 'fixed_width',
+        'postgres', 'mysql', 'mariadb',
+    ];
+    required.forEach(k => {
+        assert.ok(kinds.includes(k as any), `provider icon missing for kind: ${k}`);
+    });
+    console.log("OK testProviderIconsHaveEntryForEverySourceKind passed!");
+}
+
+function testProviderIconLabelsAreHumanReadable() {
+    assert.strictEqual(labelFor('postgres'), 'PostgreSQL');
+    assert.strictEqual(labelFor('mysql'), 'MySQL');
+    assert.strictEqual(labelFor('mariadb'), 'MariaDB');
+    assert.strictEqual(labelFor('sqlite'), 'SQLite');
+    assert.strictEqual(labelFor(undefined), 'Unknown');
+    // Unknown kinds fall back gracefully so the UI never explodes when a new
+    // connector lands daemon-side before the client knows about it.
+    assert.strictEqual(labelFor('martian_db'), 'Unknown');
+    console.log("OK testProviderIconLabelsAreHumanReadable passed!");
+}
+
+function testIconSymbolIdsAreStable() {
+    assert.strictEqual(iconSymbolIdFor('postgres'), 'icon-postgres');
+    assert.strictEqual(iconSymbolIdFor('mysql'), 'icon-mysql');
+    assert.strictEqual(iconSymbolIdFor(undefined), 'icon-unknown');
+    console.log("OK testIconSymbolIdsAreStable passed!");
+}
+
+function testSvgSymbolsLibraryEmbedsAllKinds() {
+    const lib = svgSymbolsLibrary();
+    assert.ok(lib.startsWith('<defs>'), "library should be wrapped in <defs>");
+    assert.ok(lib.includes('id="icon-postgres"'));
+    assert.ok(lib.includes('id="icon-mysql"'));
+    assert.ok(lib.includes('id="icon-mariadb"'));
+    assert.ok(lib.includes('id="icon-sqlite"'));
+    assert.ok(lib.includes('id="icon-csv"'));
+    assert.ok(lib.includes('id="icon-ndjson"'));
+    assert.ok(lib.includes('id="icon-json"'));
+    assert.ok(lib.includes('id="icon-parquet"'));
+    assert.ok(lib.includes('id="icon-fixed_width"'));
+    assert.ok(lib.includes('id="icon-unknown"'));
+    console.log("OK testSvgSymbolsLibraryEmbedsAllKinds passed!");
+}
+
+// -------------------------------------------------------------
+// 3d. Restructured Source-Tab Tests
+// -------------------------------------------------------------
+
+function testPlanVisualizationRendersPerTableCards() {
+    const result: ExplainQueryResult = {
+        sql: 'SELECT * FROM pg.customers JOIN mysql.orders ON ...',
+        federated_plan: {
+            root_ids: ['df_0'],
+            node_count: 2,
+            truncated: false,
+            nodes: {
+                df_0: {
+                    id: 'df_0', origin: 'DataFusion', node_type: 'TableScan',
+                    label: 'TableScan: pg.customers',
+                    children: [], attributes: {}, metrics: {},
+                    source_ref: 'pg.customers', native_plan_ref: 'pg.customers',
+                    provider_kind: 'postgres',
+                    remote_sql: 'SELECT "id" FROM "public"."customers"',
+                },
+                df_1: {
+                    id: 'df_1', origin: 'DataFusion', node_type: 'TableScan',
+                    label: 'TableScan: mysql.orders',
+                    children: [], attributes: {}, metrics: {},
+                    source_ref: 'mysql.orders', native_plan_ref: 'mysql.orders',
+                    provider_kind: 'mysql',
+                },
+            },
+        },
+        source_plans: {
+            'pg.customers': {
+                provider_kind: 'postgres',
+                native_sql: 'SELECT "id" FROM "public"."customers" WHERE "id" IN (1,2,3)',
+                native_explain: { Plan: { 'Node Type': 'Index Scan' } },
+                dialect: 'postgresql',
+            },
+            'mysql.orders': {
+                provider_kind: 'mysql',
+                native_sql: 'SELECT `id`, `amount` FROM `qsql_test`.`orders`',
+                native_explain: { rows: 1234 },
+                dialect: 'mysql',
+            },
+        },
+        raw: 'TableScan: pg.customers\nTableScan: mysql.orders',
+        warnings: [],
+        physical_plan_text: 'VirtualExecutionPlan name=postgres base_sql=...',
+    };
+
+    const html = renderPlanVisualizationHtml(result, 'nonce-1');
+
+    // Each remote table gets its own anchored card.
+    assert.ok(html.includes('id="source-card-pg-customers"'),
+        'expected pg.customers card anchor');
+    assert.ok(html.includes('id="source-card-mysql-orders"'),
+        'expected mysql.orders card anchor');
+
+    // Both providers' icons must be referenced in the plan SVG (via <use>)
+    // AND inlined as symbol definitions in <defs>.
+    assert.ok(html.includes('href="#icon-postgres"'));
+    assert.ok(html.includes('href="#icon-mysql"'));
+    assert.ok(html.includes('id="icon-postgres"'));
+    assert.ok(html.includes('id="icon-mysql"'));
+
+    // The actual pushed-down SQL must appear in the rendered cards, not the
+    // old generic `SELECT *` placeholder.
+    assert.ok(html.includes('IN (1,2,3)'),
+        'expected real pushed-down SQL with IN clause to appear in card');
+    assert.ok(html.includes('SELECT `id`, `amount`'),
+        'expected MySQL pushed-down SQL with projection to appear in card');
+
+    // Legend bar + collapsible physical plan section.
+    assert.ok(html.includes('legend-bar'));
+    assert.ok(html.includes('DataFusion Physical Plan'));
+    assert.ok(html.includes('data-copy-key="physical"'));
+
+    // Copy buttons for SQL / explain / fragment per table.
+    assert.ok(html.includes('data-copy-key="sql:pg.customers"'));
+    assert.ok(html.includes('data-copy-key="native:pg.customers"'));
+    assert.ok(html.includes('data-copy-key="fragment:pg.customers"'));
+
+    console.log("OK testPlanVisualizationRendersPerTableCards passed!");
+}
+
+function testPlanVisualizationGracefulWhenNoRemoteSources() {
+    // Pure-local query (CSV only): source_plans empty, no remote SQL.
+    // Should still render without throwing and explain to the user why
+    // there are no per-table cards.
+    const result: ExplainQueryResult = {
+        sql: 'SELECT * FROM employees',
+        federated_plan: {
+            root_ids: ['df_0'],
+            node_count: 1,
+            truncated: false,
+            nodes: {
+                df_0: {
+                    id: 'df_0', origin: 'DataFusion', node_type: 'TableScan',
+                    label: 'TableScan: employees', children: [],
+                    attributes: {}, metrics: {},
+                    source_ref: 'employees', native_plan_ref: 'employees',
+                    provider_kind: 'csv',
+                },
+            },
+        },
+        source_plans: {},
+        raw: 'TableScan: employees',
+        warnings: [],
+    };
+    const html = renderPlanVisualizationHtml(result, 'nonce-empty');
+    assert.ok(html.includes('No remote tables in this query'),
+        'expected helpful empty-state message when no remote sources');
+    // CSV icon symbol is embedded in the SVG <defs> at the page root, even
+    // when no per-table cards are rendered. The runtime <use href> linking
+    // to it happens in JS, so we check the static definition instead.
+    assert.ok(html.includes('id="icon-csv"'));
+    console.log("OK testPlanVisualizationGracefulWhenNoRemoteSources passed!");
+}
+
+// -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
 async function runAll() {
@@ -437,6 +668,16 @@ async function runAll() {
         testPlanVisualizationTruncationWarning();
         testPagedGridEmptyState();
         await testDataSourcesProviderLazyTablePaging();
+        testIsScanGuardErrorHelper();
+        testScanGuardErrorRendersSuggestionBanner();
+        testGenericExecutionErrorNoSuggestionBanner();
+        testScanGuardErrorCodeConstant();
+        testProviderIconsHaveEntryForEverySourceKind();
+        testProviderIconLabelsAreHumanReadable();
+        testIconSymbolIdsAreStable();
+        testSvgSymbolsLibraryEmbedsAllKinds();
+        testPlanVisualizationRendersPerTableCards();
+        testPlanVisualizationGracefulWhenNoRemoteSources();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

@@ -20,9 +20,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use common::memory::{
-    sample_baseline_rss, wait_until_rss_settles, DEFAULT_RSS_TOLERANCE_BYTES,
-};
+use common::memory::{sample_baseline_rss, wait_until_rss_settles, DEFAULT_RSS_TOLERANCE_BYTES};
 
 const STREAMING_SQL: &str = "SELECT * FROM generate_series(1, 1000000) AS t(value)";
 const CONCURRENT_QUERIES: usize = 32;
@@ -102,9 +100,7 @@ fn cancellation_returns_rss_near_baseline() {
             // OS doesn't expose RSS — skip the assertion but keep exercising
             // the cancellation path. We still want the cancellation behavior
             // to run in CI even when the memory metric is unavailable.
-            eprintln!(
-                "process_rss_bytes unavailable on this platform; skipping RSS assertion"
-            );
+            eprintln!("process_rss_bytes unavailable on this platform; skipping RSS assertion");
             run_cancellation_workload(&mut rpc);
             return;
         }

@@ -39,10 +39,15 @@ use crate::engine::GuardedTableProvider;
 /// Default upper bound on the number of distinct local-side join keys we will
 /// materialize before falling back to the un-rewritten plan.
 pub const DEFAULT_MAX_LOCAL_ROWS: usize = 10_000;
-
-/// Default upper bound on the byte size of the materialized local-side key
-/// values. `RecordBatch::get_array_memory_size` is the unit of account.
 pub const DEFAULT_MAX_LOCAL_BYTES: usize = 8 * 1024 * 1024;
+
+pub fn get_max_local_rows() -> usize {
+    crate::models::get_env_usize("QSQL_MAX_LOCAL_ROWS", DEFAULT_MAX_LOCAL_ROWS)
+}
+
+pub fn get_max_local_bytes() -> usize {
+    crate::models::get_env_usize("QSQL_MAX_LOCAL_BYTES", DEFAULT_MAX_LOCAL_BYTES)
+}
 
 /// Knobs controlling the rewrite. Default settings are tuned for "join my CSV
 /// to a filtered Postgres dimension"-shaped queries; tests/benches pass
@@ -58,8 +63,8 @@ impl Default for BroadcastRewriteConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_local_rows: DEFAULT_MAX_LOCAL_ROWS,
-            max_local_bytes: DEFAULT_MAX_LOCAL_BYTES,
+            max_local_rows: get_max_local_rows(),
+            max_local_bytes: get_max_local_bytes(),
         }
     }
 }
@@ -151,8 +156,7 @@ fn rewrite_node<'a>(
     config: &'a BroadcastRewriteConfig,
     cancellation: &'a CancellationToken,
     info: &'a mut BroadcastRewriteInfo,
-) -> Pin<Box<dyn std::future::Future<Output = Result<LogicalPlan, DataFusionError>> + Send + 'a>>
-{
+) -> Pin<Box<dyn std::future::Future<Output = Result<LogicalPlan, DataFusionError>> + Send + 'a>> {
     Box::pin(async move {
         // Recurse into children first so nested joins get a chance to rewrite
         // independently. The natural bottom-up order also means the parent
@@ -269,38 +273,37 @@ async fn try_rewrite_join(
     // Materialize DISTINCT local_col with LIMIT max_local_rows + 1. Overflow
     // detection is single-row past the cap, not a full second pass.
     let started = Instant::now();
-    let materialized = match materialize_distinct_keys(
-        ctx,
-        local_input.as_ref(),
-        local_col,
-        config,
-        cancellation,
-    )
-    .await
-    {
-        Materialization::Values { batches, rows, bytes } => (batches, rows, bytes),
-        Materialization::Cancelled => {
-            info.skipped.push(BroadcastSkip {
-                reason: SkipReason::CancellationRequested,
-                detail: "rewrite cancelled before local side materialized".to_string(),
-            });
-            return Ok(None);
-        }
-        Materialization::ExceededCap { detail } => {
-            info.skipped.push(BroadcastSkip {
-                reason: SkipReason::LocalSideMaterializationExceededCap,
-                detail,
-            });
-            return Ok(None);
-        }
-        Materialization::Error { detail } => {
-            info.skipped.push(BroadcastSkip {
-                reason: SkipReason::LocalSideMaterializationError,
-                detail,
-            });
-            return Ok(None);
-        }
-    };
+    let materialized =
+        match materialize_distinct_keys(ctx, local_input.as_ref(), local_col, config, cancellation)
+            .await
+        {
+            Materialization::Values {
+                batches,
+                rows,
+                bytes,
+            } => (batches, rows, bytes),
+            Materialization::Cancelled => {
+                info.skipped.push(BroadcastSkip {
+                    reason: SkipReason::CancellationRequested,
+                    detail: "rewrite cancelled before local side materialized".to_string(),
+                });
+                return Ok(None);
+            }
+            Materialization::ExceededCap { detail } => {
+                info.skipped.push(BroadcastSkip {
+                    reason: SkipReason::LocalSideMaterializationExceededCap,
+                    detail,
+                });
+                return Ok(None);
+            }
+            Materialization::Error { detail } => {
+                info.skipped.push(BroadcastSkip {
+                    reason: SkipReason::LocalSideMaterializationError,
+                    detail,
+                });
+                return Ok(None);
+            }
+        };
     let (batches, local_rows, local_bytes) = materialized;
 
     // Empty local side: the inner join must produce zero rows. Short-circuit
@@ -640,7 +643,6 @@ fn collect_table_names(plan: &LogicalPlan, out: &mut Vec<String>) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -680,7 +682,8 @@ mod tests {
             ],
         )
         .unwrap();
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
         Arc::new(GuardedTableProvider::with_budget(
             "test_remote".to_string(),
             mem,
@@ -702,11 +705,7 @@ mod tests {
     #[tokio::test]
     async fn disabled_config_skips_walk() {
         let ctx = build_ctx().await;
-        let logical = ctx
-            .state()
-            .create_logical_plan("SELECT 1")
-            .await
-            .unwrap();
+        let logical = ctx.state().create_logical_plan("SELECT 1").await.unwrap();
         let (out, info) = apply_broadcast_rewrites(
             &ctx,
             logical.clone(),
@@ -718,7 +717,10 @@ mod tests {
         assert_eq!(info.considered, 0);
         assert!(info.applied.is_empty());
         assert!(info.skipped.is_empty());
-        assert_eq!(format!("{}", out.display()), format!("{}", logical.display()));
+        assert_eq!(
+            format!("{}", out.display()),
+            format!("{}", logical.display())
+        );
     }
 
     #[tokio::test]
@@ -727,9 +729,7 @@ mod tests {
         ctx.register_table("locals2", small_local_table()).unwrap();
         let logical = ctx
             .state()
-            .create_logical_plan(
-                "SELECT a.id FROM locals a JOIN locals2 b ON a.id = b.id",
-            )
+            .create_logical_plan("SELECT a.id FROM locals a JOIN locals2 b ON a.id = b.id")
             .await
             .unwrap();
         let optimized = ctx.state().optimize(&logical).unwrap();
@@ -777,8 +777,7 @@ mod tests {
         let rendered = format!("{}", rewritten.display_indent());
         assert!(
             rendered.contains("user_id IN")
-                || rendered.contains("Filter")
-                && rendered.contains("user_id"),
+                || rendered.contains("Filter") && rendered.contains("user_id"),
             "expected an IN-list filter on user_id, got:\n{rendered}"
         );
     }
@@ -799,9 +798,7 @@ mod tests {
 
         let logical = ctx
             .state()
-            .create_logical_plan(
-                "SELECT b.id FROM big_local b JOIN remotes r ON b.id = r.user_id",
-            )
+            .create_logical_plan("SELECT b.id FROM big_local b JOIN remotes r ON b.id = r.user_id")
             .await
             .unwrap();
         let optimized = ctx.state().optimize(&logical).unwrap();
@@ -859,9 +856,7 @@ mod tests {
         let ctx = build_ctx().await;
         let logical = ctx
             .state()
-            .create_logical_plan(
-                "SELECT l.id FROM locals l JOIN remotes r ON l.id = r.user_id",
-            )
+            .create_logical_plan("SELECT l.id FROM locals l JOIN remotes r ON l.id = r.user_id")
             .await
             .unwrap();
         let optimized = ctx.state().optimize(&logical).unwrap();
@@ -905,8 +900,10 @@ mod tests {
     #[tokio::test]
     async fn both_sides_federated_is_skipped() {
         let ctx = SessionContext::new();
-        ctx.register_table("remote_a", small_remote_table()).unwrap();
-        ctx.register_table("remote_b", small_remote_table()).unwrap();
+        ctx.register_table("remote_a", small_remote_table())
+            .unwrap();
+        ctx.register_table("remote_b", small_remote_table())
+            .unwrap();
         let logical = ctx
             .state()
             .create_logical_plan(
@@ -935,9 +932,7 @@ mod tests {
         let ctx = build_ctx().await;
         let logical = ctx
             .state()
-            .create_logical_plan(
-                "SELECT r.bonus FROM remotes r JOIN locals l ON r.user_id = l.id",
-            )
+            .create_logical_plan("SELECT r.bonus FROM remotes r JOIN locals l ON r.user_id = l.id")
             .await
             .unwrap();
         let optimized = ctx.state().optimize(&logical).unwrap();
@@ -971,10 +966,7 @@ mod tests {
             DataType::Date32,
             DataType::Date64,
         ] {
-            assert!(
-                is_supported_key_type(&ty),
-                "{ty:?} should be supported"
-            );
+            assert!(is_supported_key_type(&ty), "{ty:?} should be supported");
         }
         assert!(!is_supported_key_type(&DataType::Binary));
         assert!(!is_supported_key_type(&DataType::Null));
@@ -1001,9 +993,9 @@ mod tests {
 
     #[test]
     fn column_of_extracts_from_cast_and_alias() {
+        use datafusion::arrow::datatypes::DataType;
         use datafusion::common::Column;
         use datafusion::logical_expr::{Cast, Expr};
-        use datafusion::arrow::datatypes::DataType;
 
         let col_expr = Expr::Column(Column::new_unqualified("id"));
         // Direct column

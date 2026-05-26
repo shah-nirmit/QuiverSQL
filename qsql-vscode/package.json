@@ -2,7 +2,7 @@
   "name": "qsql-vscode",
   "displayName": "QuiverSQL Developer Tools",
   "description": "Developer-first, Arrow-native query virtualization layer for VS Code",
-  "version": "0.3.0-alpha.0",
+  "version": "0.3.1-alpha.0",
   "license": "Apache-2.0",
   "engines": {
     "vscode": "^1.85.0"
@@ -60,6 +60,36 @@
           "type": "string",
           "default": "",
           "description": "Absolute path to the qsql-daemon binary. When empty, QuiverSQL tries a bundled binary and then the local debug build."
+        },
+        "qsql.defaultPageSize": {
+          "type": "integer",
+          "default": 1000,
+          "description": "The default number of rows returned per page in a query result."
+        },
+        "qsql.maxPageSize": {
+          "type": "integer",
+          "default": 10000,
+          "description": "The maximum limit of rows returned per page."
+        },
+        "qsql.queryMemoryLimit": {
+          "type": "integer",
+          "default": 268435456,
+          "description": "The execution memory limit (in bytes) per query."
+        },
+        "qsql.remoteScanMaxRows": {
+          "type": "integer",
+          "default": 1000000,
+          "description": "The remote scan row ceiling budget before the Scan Guard aborts the query."
+        },
+        "qsql.remoteScanMaxBytes": {
+          "type": "integer",
+          "default": 1073741824,
+          "description": "The remote scan byte ceiling budget before the Scan Guard aborts the query."
+        },
+        "qsql.remoteQueryTimeout": {
+          "type": "integer",
+          "default": 30,
+          "description": "The timeout (in seconds) for executing remote database queries."
         }
       }
     },

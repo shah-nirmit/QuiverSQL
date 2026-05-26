@@ -1,13 +1,13 @@
 # QuiverSQL
 
-**Current version:** `0.2.1-alpha.0`<br>
+**Current version:** `0.3.1-alpha.0`<br>
 **Release status:** alpha prototype
 
 QuiverSQL is a developer-first, Arrow-native query virtualization layer: lighter than Dremio, Denodo, Trino, and Starburst; broader than DuckDB or Apache DataFusion alone; and focused first on interactive SQL over files plus heterogeneous databases from VS Code.
 
 The project is currently an alpha prototype. The intended product direction is a Q3 2026 interactive launch for the VSIX and translation engine, followed by API and CLI hardening toward Q4 2027.
 
-QuiverSQL is local-first today: a TypeScript VS Code extension talks to a Rust daemon over JSON-RPC, the daemon embeds DataFusion, and results move through Arrow/DataFusion into a VS Code result grid. This repository is not production ready yet, but it now contains the core shape of the original architecture: local SQL execution, file-backed virtual tables, SQLite and SQL database federation, paged result delivery, source replay, basic explain output, and basic lineage.
+QuiverSQL is local-first today: a TypeScript VS Code extension talks to a Rust daemon over JSON-RPC, the daemon embeds DataFusion, and results move through Arrow/DataFusion into a VS Code result grid. This repository is not production ready yet, but it now contains the core shape of the original architecture: local SQL execution, file-backed virtual tables, SQLite and SQL database federation, paged result delivery, source replay, federated explain visualisation with per-table pushdown SQL, sort/broadcast pushdown badges, and basic lineage.
 
 ## Product Thesis
 
@@ -114,7 +114,8 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] JSON result delivery
 - [x] Paged JSON result delivery
 - [x] VS Code result grid
-- [x] Basic DataFusion `EXPLAIN`
+- [x] Federated `EXPLAIN` with per-table pushed-down SQL, Remote EXPLAIN, and DataFusion physical plan
+- [x] Plan-graph badges for broadcast and sort pushdowns (multi-surface, evidence-driven)
 - [x] Basic table/column lineage from resolved logical plans
 - [x] Basic joins across registered file, SQLite, Postgres, and MySQL/MariaDB tables
 - [x] Quickstart sample data
@@ -126,11 +127,13 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] Predicate pushdown for supported SQL connector filters
 - [x] Projection pushdown for SQL connectors
 - [x] Limit pushdown for SQL connectors
-- [ ] Sort / top-k pushdown
+- [x] Sort / top-k pushdown for SQL connectors
+- [x] Broadcast-join rewrite for small local input ⋈ remote fact tables
+- [x] Provider-specific icons in the Data Sources explorer and plan graph
+- [x] Federated plan visualization with per-table pushed-down SQL cards
 - [ ] Aggregate pushdown
 - [ ] Cost-aware federated optimizer
 - [ ] Join placement strategy
-- [ ] Temp-table or broadcast strategy for cross-source joins
 - [ ] Connector-specific SQL translation output
 - [ ] OpenLineage-compatible run events
 - [x] Paged result grid
@@ -155,19 +158,19 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 | Quickstart sample data | Supported now | CSV, NDJSON, JSON, Parquet, and SQLite samples live in `samples/quickstart/`. |
 | Runtime catalog | Supported now | Daemon tracks source metadata, schema, status, and connector capabilities. |
 | Persisted source replay | Supported now | VS Code stores source profiles and replays them on activation. Database connection strings are stored in SecretStorage. |
-| Projection/filter/limit pushdown | Supported now | Implemented for SQLite, Postgres, MySQL, and MariaDB for supported simple filters. Aggregates, joins, and sort/top-k are not pushed yet. |
+| Projection/filter/limit pushdown | Supported now | Implemented for SQLite, Postgres, MySQL, and MariaDB through `datafusion-federation`'s SQL unparser. |
+| Sort / top-k pushdown | Supported now | `ORDER BY` (with optional `LIMIT`) is embedded into the remote SQL when the entire sort subtree is a single federated source. Cross-source sorts still execute locally in DataFusion. |
+| Broadcast-join rewrite | Supported now | Small local input ⋈ remote fact tables: the rewrite materialises the local DISTINCT key set, injects it as an `IN (…)` filter on the remote scan, and re-optimises so federation embeds the predicate in the source-native SQL. |
 | Query paging | Supported now | `query_start`, `query_page`, and `query_cancel` provide paged JSON result delivery and cancellation. |
-| Federated joins | Partial | Local DataFusion can join registered file and SQL tables, but join placement and cross-source cost planning are early. |
-| Explain plan | Partial | DataFusion `EXPLAIN` output is available; connector translation explain is planned. |
+| Federated joins | Partial | Local DataFusion can join registered file and SQL tables; broadcast rewrite covers the small-local + remote-fact case. Join placement and cross-source cost planning are early. |
+| Explain plan | Supported now | Federated plan graph with provider-specific icons, per-table cards showing Native SQL → Remote EXPLAIN → Logical fragment, collapsible DataFusion physical plan, and evidence-driven broadcast / sort pushdown badges. |
 | Lineage | Partial | Basic table/column lineage from resolved logical plans exists; OpenLineage-compatible events are planned. |
 | Daemon discovery | Partial | `qsql.daemonPath` is configurable; packaged binaries and installers are planned. |
 | Result grid | Partial | Current grid supports paged JSON results and cancellation; true streaming/Arrow IPC pages are planned. |
 | Excel `.xlsx` | Planned | Part of the original file-provider goal. |
 | Fixed-width files | Planned | Expected to require explicit schema/layout files first. |
 | SQL Server connector | Planned | Connector trait and SQL emitter work needed first. |
-| Sort / top-k pushdown | Planned | Next SQL pushdown expansion: simple column `ORDER BY` plus optional `LIMIT`. |
 | Aggregate pushdown and join placement | Planned | Needed for serious cross-source federation. |
-| Temp-table or broadcast join strategy | Planned | Needed for larger cross-source joins. |
 | OpenLineage events | Planned | QuiverSQL-specific logical lineage exists first; OpenLineage sink comes later. |
 | Public CLI / API | Planned | Designed early, hardened toward Q4 2027. |
 | Marketplace VSIX / installers | Not started | The repo is currently source-first for contributors. |
@@ -332,11 +335,13 @@ The daemon exposes a JSON-RPC `version` method with product, daemon, core, conne
 | Phase 2 | Complete | `query_start`, `query_page`, `query_cancel`, first-page metadata, paged grid, cancellation/timeouts. |
 | Phase 3 | Complete | Runtime catalog, persisted source profiles, activation replay, SecretStorage-backed credentials. |
 | Phase 4 | Complete | SQL emission hooks, SQLite/Postgres/MySQL/MariaDB connectors, projection/filter/limit pushdown. |
-| Phase 5 | Current | Large local data, memory guards, generated large fixtures, and simple SQL sort/top-k pushdown. |
-| Phase 6 | Planned | Fixed-width file provider and wizard support. |
-| Phase 7 | Planned | Arrow IPC result pages with JSON fallback. |
-| Phase 8 | Planned | Richer explain, lineage graph, metrics visibility, and full-scan warnings. |
-| Phase 9 | Planned | Packaging, release artifacts, benchmark report gates, and installer smoke tests. |
+| Phase 5 | Complete | Query plan visualization: federated plan graph, Tree/Table/Source tabs, native source plans, truncation safeguards. |
+| Phase 6 | Complete | Database-level registration, architecture-review remediation (streaming runtime, scan guards, broadcast-join rewrite, schema cache, generation counters, credential redaction at the JSON-RPC boundary, LSP-style framing). |
+| Phase 7 | Complete | Sort / top-k pushdown formalisation, scan-guard structured error code + UX, evidence-driven broadcast & sort badges, per-table pushed-down SQL cards in the Explain panel, provider-specific icons in the Data Sources explorer. |
+| Phase 8 | Planned | Fixed-width file provider and wizard support. |
+| Phase 9 | Planned | Arrow IPC result pages with JSON fallback. |
+| Phase 10 | Planned | Aggregate pushdown, cost-aware federated optimizer, lineage graph view. |
+| Phase 11 | Planned | Packaging, release artifacts, benchmark report gates, and installer smoke tests. |
 
 ## Contributing
 

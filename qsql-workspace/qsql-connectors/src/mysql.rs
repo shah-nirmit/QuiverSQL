@@ -293,9 +293,72 @@ fn mysql_pool_params(connection_string: &str) -> HashMap<String, SecretString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::datasource::TableProvider;
+    use qsql_core::broadcast::{BroadcastRewriteConfig, SkipReason};
+    use qsql_core::GuardedTableProvider;
     use qsql_core::QsqlEngine;
     use secrecy::ExposeSecret;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static MYSQL_TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn mysql_temp_suffix() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let seq = MYSQL_TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}_{}_{}", std::process::id(), nanos, seq)
+    }
+
+    fn mysql_temp_csv(rows: &[(i64, &str, &str)]) -> String {
+        let path =
+            std::env::temp_dir().join(format!("test_qsql_mysql_users_{}.csv", mysql_temp_suffix()));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "id,name,role").unwrap();
+        for (id, name, role) in rows {
+            writeln!(file, "{id},{name},{role}").unwrap();
+        }
+        path.to_str().unwrap().to_string()
+    }
+
+    async fn mysql_collect_sorted_rows(engine: &QsqlEngine, sql: &str) -> Vec<String> {
+        let value = engine
+            .execute_sql_to_json(sql)
+            .await
+            .expect("execute query");
+        let arr = value.as_array().expect("expected JSON array").clone();
+        let mut rendered: Vec<String> = arr
+            .into_iter()
+            .map(|v| serde_json::to_string(&v).expect("serialize row"))
+            .collect();
+        rendered.sort();
+        rendered
+    }
+
+    async fn mysql_build_broadcast_engine(
+        url: &str,
+        table: &str,
+        csv_path: &str,
+        config: BroadcastRewriteConfig,
+    ) -> QsqlEngine {
+        let provider =
+            MySqlTableProvider::try_new(url.to_string(), SqlDialectKind::Mysql, None, table)
+                .await
+                .unwrap();
+        let guarded: Arc<dyn TableProvider> =
+            Arc::new(GuardedTableProvider::new(table, Arc::new(provider)));
+        let engine = QsqlEngine::new().with_broadcast_config(config);
+        engine
+            .register_file("users", csv_path, "csv")
+            .await
+            .expect("register csv");
+        engine.register_table(table, guarded).unwrap();
+        engine
+    }
 
     async fn mysql_query_drop(connector: &MySqlConnector, sql: &str) {
         let pool = connector.pool().unwrap();
@@ -483,12 +546,608 @@ mod tests {
     #[test]
     fn mysql_pool_params_sslmode_not_duplicated_when_present() {
         let params = mysql_pool_params("mysql://root:pw@localhost/mydb?sslmode=required");
-        assert!(!params.contains_key("sslmode"), "sslmode already in URL, should not be inserted separately");
+        assert!(
+            !params.contains_key("sslmode"),
+            "sslmode already in URL, should not be inserted separately"
+        );
     }
 
     #[test]
     fn mysql_pool_with_malformed_url_returns_error() {
         let connector = MySqlConnector::mysql("not a valid url !!!");
         assert!(connector.pool().is_err(), "malformed URL should fail");
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_sort_asc_parity() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_sort_mysql_asc (id INT, label VARCHAR(64))",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_sort_mysql_asc").await;
+        // Insert evens first, then odds — physical row order ≠ sort order
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_sort_mysql_asc (id, label) VALUES \
+             (2,'row_2'),(4,'row_4'),(6,'row_6'),(8,'row_8'),(10,'row_10'),\
+             (12,'row_12'),(14,'row_14'),(16,'row_16'),(18,'row_18'),(20,'row_20')",
+        )
+        .await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_sort_mysql_asc (id, label) VALUES \
+             (1,'row_1'),(3,'row_3'),(5,'row_5'),(7,'row_7'),(9,'row_9'),\
+             (11,'row_11'),(13,'row_13'),(15,'row_15'),(17,'row_17'),(19,'row_19')",
+        )
+        .await;
+
+        let provider =
+            MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_sort_mysql_asc")
+                .await
+                .unwrap();
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_sort_mysql_asc", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json("SELECT id FROM qsql_sort_mysql_asc ORDER BY id ASC LIMIT 10")
+            .await
+            .unwrap();
+
+        let ids: Vec<i64> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 10);
+        assert_eq!(ids[0], 1, "first id should be 1");
+        assert_eq!(ids[9], 10, "last id should be 10");
+        for w in ids.windows(2) {
+            assert!(w[0] < w[1], "rows not in ascending order: {:?}", ids);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_sort_desc_parity() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_sort_mysql_desc (id INT, label VARCHAR(64))",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_sort_mysql_desc").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_sort_mysql_desc (id, label) VALUES \
+             (2,'row_2'),(4,'row_4'),(6,'row_6'),(8,'row_8'),(10,'row_10'),\
+             (12,'row_12'),(14,'row_14'),(16,'row_16'),(18,'row_18'),(20,'row_20')",
+        )
+        .await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_sort_mysql_desc (id, label) VALUES \
+             (1,'row_1'),(3,'row_3'),(5,'row_5'),(7,'row_7'),(9,'row_9'),\
+             (11,'row_11'),(13,'row_13'),(15,'row_15'),(17,'row_17'),(19,'row_19')",
+        )
+        .await;
+
+        let provider =
+            MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_sort_mysql_desc")
+                .await
+                .unwrap();
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_sort_mysql_desc", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json("SELECT id FROM qsql_sort_mysql_desc ORDER BY id DESC LIMIT 5")
+            .await
+            .unwrap();
+
+        let ids: Vec<i64> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 5);
+        assert_eq!(ids[0], 20, "first id should be max (20)");
+        for w in ids.windows(2) {
+            assert!(w[0] > w[1], "rows not in descending order: {:?}", ids);
+        }
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_medium_sort_smoke() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_sort_mysql_medium (id INT, label VARCHAR(64))",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_sort_mysql_medium").await;
+        // Generate 1000 rows via recursive CTE (requires MySQL 8.0+ / MariaDB 10.2+)
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_sort_mysql_medium (id, label)
+             WITH RECURSIVE gen(n) AS (
+               SELECT 1 UNION ALL SELECT n + 1 FROM gen WHERE n < 1000
+             )
+             SELECT n, CONCAT('item_', n) FROM gen",
+        )
+        .await;
+
+        let provider =
+            MySqlTableProvider::try_new(url, SqlDialectKind::Mysql, None, "qsql_sort_mysql_medium")
+                .await
+                .unwrap();
+        let engine = QsqlEngine::new();
+        engine
+            .register_table("qsql_sort_mysql_medium", Arc::new(provider))
+            .unwrap();
+        let rows = engine
+            .execute_sql_to_json("SELECT id FROM qsql_sort_mysql_medium ORDER BY id DESC LIMIT 3")
+            .await
+            .unwrap();
+
+        let ids: Vec<i64> = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(ids[0], 1000, "expected top id to be 1000, got {}", ids[0]);
+        assert_eq!(ids[1], 999);
+        assert_eq!(ids[2], 998);
+    }
+
+    // ── broadcast join tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_broadcast_join_csv_parity() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_bcast_mysql_parity
+               (employee_id INT, salary DOUBLE, bonus INT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_bcast_mysql_parity").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_bcast_mysql_parity VALUES
+               (1, 120000.0, 8000), (2, 95000.0, 5000),
+               (3, 80000.0, 4000), (4, 70000.0, 2000)",
+        )
+        .await;
+
+        let csv = mysql_temp_csv(&[
+            (1, "Alice", "Engineer"),
+            (2, "Bob", "Manager"),
+            (3, "Charlie", "Designer"),
+        ]);
+        let sql = "SELECT u.id, u.name, c.bonus \
+                   FROM users u \
+                   JOIN qsql_bcast_mysql_parity c ON u.id = c.employee_id";
+
+        let engine_on = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_parity",
+            &csv,
+            BroadcastRewriteConfig::default(),
+        )
+        .await;
+        let engine_off = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_parity",
+            &csv,
+            BroadcastRewriteConfig::disabled(),
+        )
+        .await;
+
+        let rows_on = mysql_collect_sorted_rows(&engine_on, sql).await;
+        let rows_off = mysql_collect_sorted_rows(&engine_off, sql).await;
+        assert_eq!(
+            rows_on, rows_off,
+            "broadcast rewrite must not change result set"
+        );
+        assert_eq!(rows_on.len(), 3, "expected 3 inner-join matches");
+
+        let (_, info_on) = engine_on
+            .get_logical_plan_with_broadcast(sql)
+            .await
+            .expect("explain rewrite_on");
+        assert_eq!(
+            info_on.applied.len(),
+            1,
+            "expected one applied rewrite: {info_on:?}"
+        );
+        assert_eq!(info_on.applied[0].predicate_value_count, 3);
+
+        let (_, info_off) = engine_off
+            .get_logical_plan_with_broadcast(sql)
+            .await
+            .expect("explain rewrite_off");
+        assert!(
+            info_off.applied.is_empty(),
+            "disabled config must not apply rewrites: {info_off:?}"
+        );
+        assert_eq!(info_off.considered, 0);
+
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_broadcast_join_empty_local_side() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_bcast_mysql_empty
+               (employee_id INT, salary DOUBLE, bonus INT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_bcast_mysql_empty").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_bcast_mysql_empty VALUES (1, 1.0, 100), (2, 2.0, 200)",
+        )
+        .await;
+
+        let csv = mysql_temp_csv(&[]); // empty local side — only header row
+        let sql = "SELECT u.id, u.name, c.bonus \
+                   FROM users u \
+                   JOIN qsql_bcast_mysql_empty c ON u.id = c.employee_id";
+
+        let engine_on = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_empty",
+            &csv,
+            BroadcastRewriteConfig::default(),
+        )
+        .await;
+        let engine_off = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_empty",
+            &csv,
+            BroadcastRewriteConfig::disabled(),
+        )
+        .await;
+
+        let rows_on = mysql_collect_sorted_rows(&engine_on, sql).await;
+        let rows_off = mysql_collect_sorted_rows(&engine_off, sql).await;
+        assert_eq!(rows_on, rows_off);
+        assert!(rows_on.is_empty(), "empty inner join should produce 0 rows");
+
+        let (_, info) = engine_on
+            .get_logical_plan_with_broadcast(sql)
+            .await
+            .expect("explain empty-side");
+        assert_eq!(
+            info.applied.len(),
+            1,
+            "empty-side rewrite still counts as applied: {info:?}"
+        );
+        assert_eq!(info.applied[0].predicate_value_count, 0);
+
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_broadcast_join_large_local_exceeds_cap() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_bcast_mysql_large
+               (employee_id INT, salary DOUBLE, bonus INT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_bcast_mysql_large").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_bcast_mysql_large VALUES
+               (0, 1.0, 100), (1, 2.0, 200), (49, 3.0, 300)",
+        )
+        .await;
+
+        // 50-row CSV exceeds max_local_rows=10 cap
+        let csv_path =
+            std::env::temp_dir().join(format!("test_qsql_mysql_large_{}.csv", mysql_temp_suffix()));
+        {
+            let mut f = std::fs::File::create(&csv_path).unwrap();
+            writeln!(f, "id,name,role").unwrap();
+            for i in 0..50i64 {
+                writeln!(f, "{i},x,y").unwrap();
+            }
+        }
+        let csv = csv_path.to_str().unwrap().to_string();
+        let sql = "SELECT u.id, u.name, c.bonus \
+                   FROM users u \
+                   JOIN qsql_bcast_mysql_large c ON u.id = c.employee_id";
+
+        let config_capped = BroadcastRewriteConfig {
+            enabled: true,
+            max_local_rows: 10,
+            max_local_bytes: qsql_core::broadcast::DEFAULT_MAX_LOCAL_BYTES,
+        };
+        let engine_capped =
+            mysql_build_broadcast_engine(&url, "qsql_bcast_mysql_large", &csv, config_capped).await;
+        let engine_off = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_large",
+            &csv,
+            BroadcastRewriteConfig::disabled(),
+        )
+        .await;
+
+        let rows_capped = mysql_collect_sorted_rows(&engine_capped, sql).await;
+        let rows_off = mysql_collect_sorted_rows(&engine_off, sql).await;
+        assert_eq!(
+            rows_capped, rows_off,
+            "cap fallback must produce identical rows to the unrewritten plan"
+        );
+
+        let (_, info) = engine_capped
+            .get_logical_plan_with_broadcast(sql)
+            .await
+            .expect("explain over-cap");
+        assert!(
+            info.applied.is_empty(),
+            "over-cap rewrite must abort: {info:?}"
+        );
+        assert!(
+            info.skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::LocalSideMaterializationExceededCap),
+            "expected LocalSideMaterializationExceededCap skip: {info:?}"
+        );
+
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_broadcast_join_left_join_not_eligible() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_bcast_mysql_left
+               (employee_id INT, salary DOUBLE, bonus INT)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_bcast_mysql_left").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_bcast_mysql_left VALUES
+               (1, 1.0, 10), (2, 2.0, 20), (3, 3.0, 30)",
+        )
+        .await;
+
+        let csv = mysql_temp_csv(&[(1, "Alice", "E"), (2, "Bob", "M")]);
+        let sql = "SELECT u.id, u.name, c.bonus \
+                   FROM users u \
+                   LEFT JOIN qsql_bcast_mysql_left c ON u.id = c.employee_id";
+        let engine = mysql_build_broadcast_engine(
+            &url,
+            "qsql_bcast_mysql_left",
+            &csv,
+            BroadcastRewriteConfig::default(),
+        )
+        .await;
+
+        let (_, info) = engine
+            .get_logical_plan_with_broadcast(sql)
+            .await
+            .expect("explain left join");
+        assert!(info.applied.is_empty(), "LEFT JOIN must not rewrite");
+        assert!(
+            info.skipped
+                .iter()
+                .any(|s| s.reason == SkipReason::NotInnerEquiJoin),
+            "expected NotInnerEquiJoin skip: {info:?}"
+        );
+
+        let _ = std::fs::remove_file(csv);
+    }
+
+    // ── federation cross-source + same-source tests ───────────────────────────
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_federated_cross_source_join() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_fedj_mysql_comp
+               (employee_id INT, salary DOUBLE)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_fedj_mysql_comp").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_fedj_mysql_comp VALUES
+               (1, 120000.0), (2, 95000.0), (3, 80000.0)",
+        )
+        .await;
+
+        let csv = mysql_temp_csv(&[
+            (1, "Alice", "Engineer"),
+            (2, "Bob", "Manager"),
+            (3, "Charlie", "Designer"),
+        ]);
+        let engine = QsqlEngine::new();
+        engine
+            .register_file("users", &csv, "csv")
+            .await
+            .expect("register users csv");
+        let provider = MySqlTableProvider::try_new(
+            url.clone(),
+            SqlDialectKind::Mysql,
+            None,
+            "qsql_fedj_mysql_comp",
+        )
+        .await
+        .unwrap();
+        engine
+            .register_table("qsql_fedj_mysql_comp", Arc::new(provider))
+            .unwrap();
+
+        let sql = "
+            SELECT u.name, u.role, c.salary
+            FROM users u
+            JOIN qsql_fedj_mysql_comp c ON u.id = c.employee_id
+            WHERE c.salary > 90000.0
+            ORDER BY c.salary DESC
+        ";
+        let result = engine.execute_sql_to_json(sql).await.unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "Alice");
+        assert_eq!(rows[0]["role"], "Engineer");
+        assert_eq!(rows[0]["salary"], 120000.0);
+        assert_eq!(rows[1]["name"], "Bob");
+        assert_eq!(rows[1]["role"], "Manager");
+        assert_eq!(rows[1]["salary"], 95000.0);
+
+        let _ = std::fs::remove_file(csv);
+    }
+
+    #[tokio::test]
+    #[cfg_attr(
+        not(qsql_live_mysql_tests),
+        ignore = "requires a live MySQL/MariaDB database and QSQL_MYSQL_URL"
+    )]
+    async fn mysql_same_source_join_uses_federation() {
+        let url = std::env::var("QSQL_MYSQL_URL")
+            .expect("QSQL_MYSQL_URL must be set to run MySQL/MariaDB live tests");
+
+        let connector = MySqlConnector::mysql(url.clone());
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_fedj_mysql_customers
+               (id INT, name TEXT, region TEXT)",
+        )
+        .await;
+        mysql_query_drop(
+            &connector,
+            "CREATE TABLE IF NOT EXISTS qsql_fedj_mysql_orders
+               (id INT, customer_id INT, total DOUBLE)",
+        )
+        .await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_fedj_mysql_customers").await;
+        mysql_query_drop(&connector, "TRUNCATE TABLE qsql_fedj_mysql_orders").await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_fedj_mysql_customers VALUES
+               (1, 'Acme', 'west'), (2, 'Globex', 'east')",
+        )
+        .await;
+        mysql_query_drop(
+            &connector,
+            "INSERT INTO qsql_fedj_mysql_orders VALUES
+               (10, 1, 125.0), (11, 1, 90.0), (12, 2, 60.0)",
+        )
+        .await;
+
+        let engine = QsqlEngine::new();
+        let customers = MySqlTableProvider::try_new(
+            url.clone(),
+            SqlDialectKind::Mysql,
+            None,
+            "qsql_fedj_mysql_customers",
+        )
+        .await
+        .unwrap();
+        let orders = MySqlTableProvider::try_new(
+            url.clone(),
+            SqlDialectKind::Mysql,
+            None,
+            "qsql_fedj_mysql_orders",
+        )
+        .await
+        .unwrap();
+        engine
+            .register_table("qsql_fedj_mysql_customers", Arc::new(customers))
+            .unwrap();
+        engine
+            .register_table("qsql_fedj_mysql_orders", Arc::new(orders))
+            .unwrap();
+
+        let sql = "
+            SELECT c.name, SUM(o.total) AS order_total
+            FROM qsql_fedj_mysql_customers c
+            JOIN qsql_fedj_mysql_orders o ON c.id = o.customer_id
+            WHERE c.region = 'west'
+            GROUP BY c.name
+        ";
+        let plan = engine.get_logical_plan(sql).await.unwrap();
+        let plan_text = format!("{plan:?}");
+        assert!(
+            plan_text.contains("Federated"),
+            "expected same-source MySQL subplan to be federated, got:\n{plan_text}"
+        );
+
+        let result = engine.execute_sql_to_json(sql).await.unwrap();
+        let rows = result.as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Acme");
+        assert_eq!(rows[0]["order_total"], 215.0);
     }
 }

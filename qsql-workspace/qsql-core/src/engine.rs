@@ -35,10 +35,31 @@ use crate::models::{
 };
 
 const MAX_BUFFERED_RESULT_ROWS: usize = 100_000;
-const MAX_BUFFERED_RESULT_BYTES: usize = DEFAULT_QUERY_MEMORY_LIMIT_BYTES;
 pub const DEFAULT_QUERY_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_REMOTE_SCAN_MAX_ROWS: usize = 1_000_000;
 pub const DEFAULT_REMOTE_SCAN_MAX_BYTES: usize = 1024 * 1024 * 1024;
+
+pub fn get_query_memory_limit_bytes() -> usize {
+    crate::models::get_env_usize(
+        "QSQL_QUERY_MEMORY_LIMIT_BYTES",
+        DEFAULT_QUERY_MEMORY_LIMIT_BYTES,
+    )
+}
+pub fn get_remote_scan_max_rows() -> usize {
+    crate::models::get_env_usize("QSQL_REMOTE_SCAN_MAX_ROWS", DEFAULT_REMOTE_SCAN_MAX_ROWS)
+}
+pub fn get_remote_scan_max_bytes() -> usize {
+    crate::models::get_env_usize("QSQL_REMOTE_SCAN_MAX_BYTES", DEFAULT_REMOTE_SCAN_MAX_BYTES)
+}
+pub fn get_max_buffered_result_rows() -> usize {
+    crate::models::get_env_usize("QSQL_MAX_BUFFERED_RESULT_ROWS", MAX_BUFFERED_RESULT_ROWS)
+}
+pub fn get_max_buffered_result_bytes() -> usize {
+    crate::models::get_env_usize(
+        "QSQL_MAX_BUFFERED_RESULT_BYTES",
+        DEFAULT_QUERY_MEMORY_LIMIT_BYTES,
+    )
+}
 
 pub struct QsqlEngine {
     runtime: Arc<RuntimeEnv>,
@@ -101,8 +122,8 @@ pub struct ScanBudget {
 impl Default for ScanBudget {
     fn default() -> Self {
         Self {
-            max_rows: DEFAULT_REMOTE_SCAN_MAX_ROWS,
-            max_bytes: DEFAULT_REMOTE_SCAN_MAX_BYTES,
+            max_rows: get_remote_scan_max_rows(),
+            max_bytes: get_remote_scan_max_bytes(),
         }
     }
 }
@@ -395,15 +416,16 @@ impl QueryResultHandle {
         self.buffered_bytes = self
             .buffered_bytes
             .saturating_add(batch.get_array_memory_size());
-        if self.buffered_rows > MAX_BUFFERED_RESULT_ROWS {
+        let max_rows = get_max_buffered_result_rows();
+        let max_bytes = get_max_buffered_result_bytes();
+        if self.buffered_rows > max_rows {
             return Err(resource_limit_error(format!(
-                "Result buffer exceeded {MAX_BUFFERED_RESULT_ROWS} rows; request a smaller page window or add a LIMIT/filter."
+                "Result buffer exceeded {max_rows} rows; request a smaller page window or add a LIMIT/filter."
             )));
         }
-        if self.buffered_bytes > MAX_BUFFERED_RESULT_BYTES {
+        if self.buffered_bytes > max_bytes {
             return Err(resource_limit_error(format!(
-                "Result buffer exceeded {} bytes; request a smaller page window or add a LIMIT/filter.",
-                MAX_BUFFERED_RESULT_BYTES
+                "Result buffer exceeded {max_bytes} bytes; request a smaller page window or add a LIMIT/filter."
             )));
         }
         self.batches.push_back(batch.clone());
@@ -827,10 +849,7 @@ impl QsqlEngine {
     pub async fn get_logical_plan_with_broadcast(
         &self,
         sql: &str,
-    ) -> Result<
-        (datafusion::logical_expr::LogicalPlan, BroadcastRewriteInfo),
-        String,
-    > {
+    ) -> Result<(datafusion::logical_expr::LogicalPlan, BroadcastRewriteInfo), String> {
         let ctx = self.execution_context()?;
         let plan = ctx
             .state()
@@ -849,9 +868,29 @@ impl QsqlEngine {
         let final_plan = if info.applied.is_empty() {
             rewritten
         } else {
-            ctx.state().optimize(&rewritten).map_err(|e| e.to_string())?
+            ctx.state()
+                .optimize(&rewritten)
+                .map_err(|e| e.to_string())?
         };
         Ok((final_plan, info))
+    }
+
+    /// Produces the DataFusion physical plan for a logical plan that was
+    /// already optimized + broadcast-rewritten. The physical plan is where
+    /// `datafusion-federation` materialises the actual SQL string sent to each
+    /// remote DBMS (embedded in the `fmt_as` of `VirtualExecutionPlan` /
+    /// `SqlExec` leaves), which the explain endpoint then scrapes to surface
+    /// the real pushed-down SQL — not the placeholder `SELECT *` we used
+    /// before.
+    pub async fn create_physical_plan_for_explain(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<Arc<dyn ExecutionPlan>, String> {
+        let ctx = self.execution_context()?;
+        ctx.state()
+            .create_physical_plan(plan)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn get_query_lineage(&self, sql: &str) -> Result<QueryLineage, String> {
@@ -958,7 +997,7 @@ fn qsql_session_state(runtime: Arc<RuntimeEnv>) -> SessionState {
 fn qsql_runtime_env() -> Arc<RuntimeEnv> {
     Arc::new(
         RuntimeEnvBuilder::new()
-            .with_memory_limit(DEFAULT_QUERY_MEMORY_LIMIT_BYTES, 1.0)
+            .with_memory_limit(get_query_memory_limit_bytes(), 1.0)
             .build()
             .expect("QuiverSQL runtime env should initialize"),
     )
@@ -1017,11 +1056,22 @@ fn is_database_source(source: &CatalogSource) -> bool {
     ) && source.tables.is_some()
 }
 
+const SCAN_GUARD_SENTINEL: &str = "[QSQL_SCAN_GUARD] ";
+
 fn query_execution_error(error: impl ToString) -> QueryError {
-    QueryError {
-        code: -32001,
-        message: error.to_string(),
-        details: None,
+    let msg = error.to_string();
+    if let Some(clean) = msg.strip_prefix(SCAN_GUARD_SENTINEL) {
+        QueryError {
+            code: crate::models::SCAN_GUARD_ERROR_CODE,
+            message: clean.to_string(),
+            details: Some("scan_guard".to_string()),
+        }
+    } else {
+        QueryError {
+            code: -32001,
+            message: msg,
+            details: None,
+        }
     }
 }
 
@@ -1069,7 +1119,7 @@ fn scan_budget_error(
     limit: usize,
 ) -> DataFusionError {
     DataFusionError::Execution(format!(
-        "Remote scan '{source_ref}' estimated {estimated} {metric}, exceeding the configured budget of {limit} {metric}. Add a LIMIT, use tighter filters, or raise the source scan budget."
+        "[QSQL_SCAN_GUARD] Remote scan '{source_ref}' estimated {estimated} {metric}, exceeding the configured budget of {limit} {metric}. Add a LIMIT, use tighter filters, or raise the source scan budget."
     ))
 }
 
@@ -1664,10 +1714,17 @@ mod tests {
     #[tokio::test]
     async fn guarded_provider_accessors() {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))])
+                .unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
 
         // new() constructor
         let g = GuardedTableProvider::new("mysource", Arc::clone(&mem));
@@ -1678,7 +1735,14 @@ mod tests {
         let _ = g.inner();
 
         // with_budget constructor
-        let g2 = GuardedTableProvider::with_budget("s2", Arc::clone(&mem), ScanBudget { max_rows: 5, max_bytes: 100 });
+        let g2 = GuardedTableProvider::with_budget(
+            "s2",
+            Arc::clone(&mem),
+            ScanBudget {
+                max_rows: 5,
+                max_bytes: 100,
+            },
+        );
         assert_eq!(g2.budget().max_rows, 5);
     }
 
@@ -1686,10 +1750,17 @@ mod tests {
     async fn guarded_provider_scan_within_budget_passes() {
         // No statistics → budget check is a no-op
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))])
+                .unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
         let g = GuardedTableProvider::new("s", mem);
         let engine = QsqlEngine::new();
         let ctx = engine.execution_context().unwrap();
@@ -1736,22 +1807,42 @@ mod tests {
     async fn engine_register_schema_table_and_table_registered() {
         let engine = QsqlEngine::new();
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
-        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))])
+                .unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+            as Arc<dyn TableProvider>;
 
         assert!(!engine.table_registered_in_schema("myschema", "mytable"));
-        engine.register_schema_table("myschema", "mytable", mem).unwrap();
+        engine
+            .register_schema_table("myschema", "mytable", mem)
+            .unwrap();
         assert!(engine.table_registered_in_schema("myschema", "mytable"));
 
         // Registering again returns "already registered" message
         let schema2 = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
-            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
         ]));
-        let batch2 = RecordBatch::try_new(schema2.clone(), vec![Arc::new(Int64Array::from(vec![2i64]))]).unwrap();
-        let mem2 = Arc::new(MemTable::try_new(schema2, vec![vec![batch2]]).unwrap()) as Arc<dyn TableProvider>;
-        let msg = engine.register_schema_table("myschema", "mytable", mem2).unwrap();
+        let batch2 = RecordBatch::try_new(
+            schema2.clone(),
+            vec![Arc::new(Int64Array::from(vec![2i64]))],
+        )
+        .unwrap();
+        let mem2 = Arc::new(MemTable::try_new(schema2, vec![vec![batch2]]).unwrap())
+            as Arc<dyn TableProvider>;
+        let msg = engine
+            .register_schema_table("myschema", "mytable", mem2)
+            .unwrap();
         assert!(msg.contains("already registered"));
     }
 
@@ -1771,7 +1862,10 @@ mod tests {
     #[tokio::test]
     async fn engine_execute_sql_to_string_success() {
         let engine = QsqlEngine::new();
-        let result = engine.execute_sql_to_string("SELECT 42 AS answer").await.unwrap();
+        let result = engine
+            .execute_sql_to_string("SELECT 42 AS answer")
+            .await
+            .unwrap();
         assert!(result.contains("42"));
     }
 
@@ -1845,7 +1939,10 @@ mod tests {
     #[tokio::test]
     async fn register_file_unsupported_format_returns_error() {
         let engine = QsqlEngine::new();
-        let err = engine.register_file("t", "/tmp/f.xyz", "xml").await.unwrap_err();
+        let err = engine
+            .register_file("t", "/tmp/f.xyz", "xml")
+            .await
+            .unwrap_err();
         assert!(err.contains("Unsupported format"));
     }
 
@@ -1874,9 +1971,9 @@ mod tests {
 
     #[test]
     fn estimate_effective_bytes_branches() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
         use datafusion::common::stats::Precision;
         use datafusion::common::Statistics;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         // No byte stats → None
@@ -1936,5 +2033,4 @@ mod tests {
         assert!(message.contains("LIMIT"));
         assert!(message.contains("raise the source scan budget"));
     }
-
 }

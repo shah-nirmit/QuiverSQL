@@ -72,6 +72,47 @@ impl From<&str> for ConnectorError {
 
 pub type ConnectorResult<T> = Result<T, ConnectorError>;
 
+/// A trait implemented by every remote data-source connector.
+/// Connectors expose upstream DataFusion table providers plus QuiverSQL-owned
+/// catalog and source-native explain surfaces.
+#[async_trait]
+pub trait RemoteConnector: Send + Sync {
+    /// A human-readable name for this connector (e.g. "sqlite", "postgres").
+    fn connector_type(&self) -> &'static str;
+
+    /// Build a DataFusion table provider backed by the source engine.
+    async fn table_provider(
+        &self,
+        schema: Option<&str>,
+        table: &str,
+        cached_schema: Option<SchemaRef>,
+    ) -> ConnectorResult<Arc<dyn TableProvider>>;
+
+    /// Returns the capabilities of this connector.
+    fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities;
+
+    /// Execute a native EXPLAIN query and return the result as a raw string or JSON representation.
+    async fn explain_query(&self, sql: &str) -> ConnectorResult<String>;
+
+    async fn list_tables(&self, schema: Option<&str>, limit: usize)
+        -> ConnectorResult<Vec<String>>;
+
+    async fn list_tables_page(
+        &self,
+        schema: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> ConnectorResult<Vec<String>> {
+        let fetch = offset.saturating_add(limit.max(1));
+        let tables = self.list_tables(schema, fetch).await?;
+        Ok(tables.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+// Tests live at the end of the module so clippy's
+// `items_after_test_module` lint is happy — the `RemoteConnector` trait
+// above is referenced by the tests, and clippy requires every public item
+// to come before any `#[cfg(test)] mod tests` block.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +182,7 @@ mod tests {
                 projection: false,
                 filter: false,
                 limit: false,
+                sort: false,
                 aggregate: false,
                 joins: false,
                 dialect_name: "stub".to_string(),
@@ -176,42 +218,5 @@ mod tests {
         // limit=0 is clamped to 1 by saturating max
         let page = connector.list_tables_page(None, 0, 0).await.unwrap();
         assert!(page.is_empty());
-    }
-}
-
-/// A trait implemented by every remote data-source connector.
-/// Connectors expose upstream DataFusion table providers plus QuiverSQL-owned
-/// catalog and source-native explain surfaces.
-#[async_trait]
-pub trait RemoteConnector: Send + Sync {
-    /// A human-readable name for this connector (e.g. "sqlite", "postgres").
-    fn connector_type(&self) -> &'static str;
-
-    /// Build a DataFusion table provider backed by the source engine.
-    async fn table_provider(
-        &self,
-        schema: Option<&str>,
-        table: &str,
-        cached_schema: Option<SchemaRef>,
-    ) -> ConnectorResult<Arc<dyn TableProvider>>;
-
-    /// Returns the capabilities of this connector.
-    fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities;
-
-    /// Execute a native EXPLAIN query and return the result as a raw string or JSON representation.
-    async fn explain_query(&self, sql: &str) -> ConnectorResult<String>;
-
-    async fn list_tables(&self, schema: Option<&str>, limit: usize)
-        -> ConnectorResult<Vec<String>>;
-
-    async fn list_tables_page(
-        &self,
-        schema: Option<&str>,
-        offset: usize,
-        limit: usize,
-    ) -> ConnectorResult<Vec<String>> {
-        let fetch = offset.saturating_add(limit.max(1));
-        let tables = self.list_tables(schema, fetch).await?;
-        Ok(tables.into_iter().skip(offset).take(limit).collect())
     }
 }

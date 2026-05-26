@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
-import { ExplainQueryResult, PlanMetrics, PlanNode } from './models';
+import { ExplainQueryResult, PlanMetrics, PlanNode, SourcePlanEntry } from './models';
+import { iconSymbolIdFor, labelFor, svgSymbolsLibrary } from './providerIcons';
 
 export function escapePlanHtml(unsafe: unknown): string {
     if (unsafe === null || unsafe === undefined) {
@@ -52,32 +53,103 @@ export function nodeDisplayTitle(node: PlanNode): string {
         node.node_type;
 }
 
+/**
+ * Returns a per-table-name index of the `label` of every `TableScan` node
+ * in the plan graph. Used to populate step 3 ("Logical plan fragment") of
+ * each per-table card in the Source tab without dropping back to text-search
+ * the raw plan dump.
+ */
+function collectLogicalFragmentsByTable(
+    nodes: Record<string, PlanNode>,
+): Map<string, string> {
+    const map = new Map<string, string>();
+    for (const node of Object.values(nodes)) {
+        if (node.node_type === 'TableScan' && node.source_ref) {
+            map.set(node.source_ref, node.label);
+        }
+    }
+    return map;
+}
+
+/**
+ * Stable, HTML-id-safe slug — used to build `id="source-card-…"` anchors that
+ * the Tree-tab click-through scrolls into view. Keeps letters/digits/dashes
+ * as-is and replaces every other char with `-` to avoid CSS-selector
+ * surprises when a table name contains dots or quotes.
+ */
+function slugifyForId(value: string): string {
+    return value.replace(/[^A-Za-z0-9_-]+/g, '-');
+}
+
 export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: string): string {
     const graphJson = JSON.stringify(result.federated_plan).replace(/</g, '\\u003c');
-    const sourcePlans = result.source_plans || {};
+    const sourcePlans: Record<string, SourcePlanEntry> = result.source_plans || {};
     const sourcePlansJson = JSON.stringify(sourcePlans).replace(/</g, '\\u003c');
     const rawPlan = result.raw || '';
     let rawText = rawPlan;
     if (rawText.length > 50000) {
         rawText = rawText.substring(0, 50000) + "\n\n... [TRUNCATED - PLAN TOO LARGE] ...";
     }
+    const physicalText = result.physical_plan_text || '';
 
     const copyPayloads: Record<string, string> = {
-        logical: rawText
+        logical: rawText,
     };
+    if (physicalText) {
+        copyPayloads['physical'] = physicalText;
+    }
 
+    // Each remote table gets a stacked card showing the three layers of a
+    // federated query in the order they execute: Native SQL → Remote EXPLAIN
+    // → Logical-plan fragment (the DataFusion TableScan that consumes the
+    // returned rows). This replaces the old wall-of-text "Native Source
+    // Plans" section that showed only the EXPLAIN output disconnected from
+    // its SQL.
     const nativePlanEntries = Object.entries(sourcePlans).sort(([left], [right]) => left.localeCompare(right));
-    const nativePlansHtml = nativePlanEntries.map(([sourceRef, sourcePlan]) => {
-        const copyKey = `native:${sourceRef}`;
-        const display = formatPlanForDisplay(sourcePlan);
-        copyPayloads[copyKey] = display;
+    const logicalFragmentByTable = collectLogicalFragmentsByTable(result.federated_plan.nodes);
+    const sourceCardsHtml = nativePlanEntries.map(([sourceRef, entry]) => {
+        const sqlCopyKey = `sql:${sourceRef}`;
+        const explainCopyKey = `native:${sourceRef}`;
+        const fragmentCopyKey = `fragment:${sourceRef}`;
+        const explainText = formatPlanForDisplay(entry.native_explain);
+        const fragmentText = logicalFragmentByTable.get(sourceRef) || '(not found in logical plan)';
+        copyPayloads[sqlCopyKey] = entry.native_sql || '';
+        copyPayloads[explainCopyKey] = explainText;
+        copyPayloads[fragmentCopyKey] = fragmentText;
+        const cardAnchor = `source-card-${slugifyForId(sourceRef)}`;
+        const providerLabel = labelFor(entry.provider_kind);
+        const iconId = iconSymbolIdFor(entry.provider_kind);
         return `
-            <section class="plan-source-section">
-                <div class="section-heading">
-                    <span>${escapePlanHtml(sourceRef)}</span>
-                    <button class="icon-button copy-button" data-copy-key="${escapePlanHtml(copyKey)}" title="Copy native source plan" aria-label="Copy native source plan">&#x2398;</button>
+            <section class="source-card" id="${escapePlanHtml(cardAnchor)}">
+                <header class="source-card-header">
+                    <svg class="source-card-icon" width="18" height="18" viewBox="0 0 16 16" aria-hidden="true"><use href="#${escapePlanHtml(iconId)}"/></svg>
+                    <span class="source-card-title">${escapePlanHtml(sourceRef)}</span>
+                    <span class="source-card-meta">${escapePlanHtml(providerLabel)} &middot; ${escapePlanHtml(entry.dialect || '')}</span>
+                </header>
+                <div class="source-card-step">
+                    <div class="step-heading">
+                        <span class="step-num">1</span>
+                        <span class="step-label">Native SQL</span>
+                        <button class="icon-button copy-button" data-copy-key="${escapePlanHtml(sqlCopyKey)}" title="Copy native SQL">&#x2398;</button>
+                    </div>
+                    <pre class="step-sql">${escapePlanHtml(entry.native_sql || '(no SQL captured)')}</pre>
                 </div>
-                <pre>${escapePlanHtml(display)}</pre>
+                <div class="source-card-step">
+                    <div class="step-heading">
+                        <span class="step-num">2</span>
+                        <span class="step-label">Remote EXPLAIN</span>
+                        <button class="icon-button copy-button" data-copy-key="${escapePlanHtml(explainCopyKey)}" title="Copy remote EXPLAIN">&#x2398;</button>
+                    </div>
+                    <pre>${escapePlanHtml(explainText)}</pre>
+                </div>
+                <div class="source-card-step">
+                    <div class="step-heading">
+                        <span class="step-num">3</span>
+                        <span class="step-label">Logical plan fragment</span>
+                        <button class="icon-button copy-button" data-copy-key="${escapePlanHtml(fragmentCopyKey)}" title="Copy logical fragment">&#x2398;</button>
+                    </div>
+                    <pre>${escapePlanHtml(fragmentText)}</pre>
+                </div>
             </section>
         `;
     }).join('');
@@ -89,6 +161,7 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
     const truncatedHtml = result.federated_plan.truncated
         ? `<div class="warning-banner"><strong>Warning:</strong> The plan graph was truncated because it is too large.</div>`
         : '';
+    const symbolsLibrary = svgSymbolsLibrary();
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -225,6 +298,11 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             font-size: 11px;
             font-weight: 600;
         }
+        .node-sort-pushed {
+            fill: var(--vscode-charts-blue, #4fc1ff);
+            font-size: 11px;
+            font-weight: 600;
+        }
         .edge {
             fill: none;
             stroke: var(--vscode-editorIndentGuide-background);
@@ -276,6 +354,109 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         .section-heading:first-child {
             margin-top: 0;
         }
+        /* Legend bar above the plan tree — explains badge colours so users
+           don't have to read the docs to know what orange/blue mean. */
+        .legend-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 14px;
+            padding: 4px 10px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+            background: var(--vscode-editorGroupHeader-noTabsBackground);
+        }
+        .legend-item { display: inline-flex; align-items: center; gap: 5px; }
+        .legend-swatch {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+        }
+        .swatch-broadcast { background: var(--vscode-charts-orange); }
+        .swatch-sort      { background: var(--vscode-charts-blue, #4fc1ff); }
+        .swatch-scan      { background: transparent; border: 1.5px solid var(--vscode-focusBorder); }
+        /* TableScan node icon is rendered in the SVG at (8, 8); shift the
+           node-type label right so it doesn't overlap. */
+        .node-type-with-icon { transform: translate(20px, 0); }
+        /* Clickable TableScan groups in the plan tree — hint with a pointer
+           cursor and a subtle highlight on hover. */
+        .plan-node.table-scan { cursor: pointer; }
+        .plan-node.table-scan:hover .node-rect {
+            stroke-width: 2;
+            filter: brightness(1.1);
+        }
+        /* Global Logical / Physical plan sections in the Source tab — wrapped
+           in <details> so users can collapse them; the per-table cards
+           below are the main content. */
+        .global-plan-section { margin-bottom: 12px; }
+        .global-plan-section > summary {
+            cursor: pointer;
+            list-style: revert;
+        }
+        .global-plan-section > summary::-webkit-details-marker {
+            display: revert;
+        }
+        /* Per-table card in the Source tab: Native SQL → Remote EXPLAIN →
+           Logical fragment, stacked in execution order. */
+        .source-card {
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 6px;
+            margin: 10px 0 16px 0;
+            background: var(--vscode-editorWidget-background);
+            overflow: hidden;
+        }
+        .source-card-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 10px;
+            background: var(--vscode-editorGroupHeader-noTabsBackground);
+            border-bottom: 1px solid var(--vscode-panel-border);
+        }
+        .source-card-icon { flex: 0 0 18px; }
+        .source-card-title {
+            font-weight: 700;
+            font-family: var(--vscode-editor-font-family, monospace);
+        }
+        .source-card-meta {
+            margin-left: auto;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .source-card-step { padding: 8px 10px; border-bottom: 1px solid var(--vscode-panel-border); }
+        .source-card-step:last-child { border-bottom: none; }
+        .step-heading {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 4px;
+            font-size: 11px;
+            color: var(--vscode-descriptionForeground);
+        }
+        .step-num {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 50%;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            font-weight: 700;
+            font-size: 11px;
+        }
+        .step-label { font-weight: 600; color: var(--vscode-editor-foreground); }
+        .step-heading .copy-button { margin-left: auto; }
+        .step-sql {
+            background: var(--vscode-textCodeBlock-background, var(--vscode-editor-background));
+            border: 1px solid var(--vscode-panel-border);
+            border-radius: 4px;
+            padding: 8px 10px;
+            font-family: var(--vscode-editor-font-family, monospace);
+        }
+        .source-card.highlight { box-shadow: 0 0 0 2px var(--vscode-focusBorder); }
+        .muted-text { color: var(--vscode-descriptionForeground); font-style: italic; padding: 8px 0; }
     </style>
 </head>
 <body>
@@ -294,10 +475,16 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             <button class="icon-button" id="tree-zoom-out" title="Zoom out" aria-label="Zoom out">-</button>
             <button class="icon-button" id="tree-fit" title="Fit plan" aria-label="Fit plan">Fit</button>
             <button class="icon-button" id="tree-reset" title="Reset pan and zoom" aria-label="Reset pan and zoom">Reset</button>
-            <span class="toolbar-label">Drag the canvas to pan</span>
+            <span class="toolbar-label">Drag to pan, scroll to zoom, click a TableScan for its Source card</span>
+        </div>
+        <div class="legend-bar" role="note" aria-label="Plan badge legend">
+            <span class="legend-item"><span class="legend-swatch swatch-broadcast"></span>Broadcast pushdown</span>
+            <span class="legend-item"><span class="legend-swatch swatch-sort"></span>Sort pushdown</span>
+            <span class="legend-item"><span class="legend-swatch swatch-scan"></span>TableScan</span>
         </div>
         <div id="tree-container">
             <svg id="plan-svg" role="img" aria-label="Federated query plan tree">
+                ${symbolsLibrary}
                 <g id="plan-viewport"></g>
             </svg>
         </div>
@@ -321,12 +508,25 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
 
     <div id="source-tab" class="tab-content">
         <div id="source-container">
-            <div class="section-heading">
-                <span>Federated Logical Plan</span>
-                <button class="icon-button copy-button" data-copy-key="logical" title="Copy logical plan" aria-label="Copy logical plan">&#x2398;</button>
-            </div>
-            <pre>${escapePlanHtml(rawText)}</pre>
-            ${nativePlanEntries.length > 0 ? `<div class="section-heading"><span>Native Source Plans</span></div>${nativePlansHtml}` : ''}
+            <details class="global-plan-section" open>
+                <summary class="section-heading">
+                    <span>Federated Logical Plan</span>
+                    <button class="icon-button copy-button" data-copy-key="logical" title="Copy logical plan" aria-label="Copy logical plan">&#x2398;</button>
+                </summary>
+                <pre>${escapePlanHtml(rawText)}</pre>
+            </details>
+            ${physicalText ? `
+            <details class="global-plan-section">
+                <summary class="section-heading">
+                    <span>DataFusion Physical Plan</span>
+                    <button class="icon-button copy-button" data-copy-key="physical" title="Copy physical plan" aria-label="Copy physical plan">&#x2398;</button>
+                </summary>
+                <pre>${escapePlanHtml(physicalText)}</pre>
+            </details>` : ''}
+            ${nativePlanEntries.length > 0 ? `
+            <div class="section-heading"><span>Per-Table Pushdowns</span></div>
+            ${sourceCardsHtml}
+            ` : '<div class="section-heading"><span>Per-Table Pushdowns</span></div><p class="muted-text">No remote tables in this query — every scan is local (CSV / JSON / SQLite file). The Native SQL cards only appear for Postgres, MySQL, MariaDB, and remote SQLite sources.</p>'}
         </div>
     </div>
 
@@ -427,7 +627,13 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         }
 
         function nodeLines(node) {
-            const lines = [{ text: node.node_type, cls: 'node-type' }];
+            const isTableScan = node.node_type === 'TableScan';
+            const lines = [{
+                text: node.node_type,
+                // Shift label right so it doesn't overlap the provider icon
+                // we render at (8, 8) on TableScan nodes.
+                cls: isTableScan ? 'node-type node-type-with-icon' : 'node-type',
+            }];
             wrapText(displayTitle(node), 42, 2).forEach(function(line) {
                 if (line) lines.push({ text: line, cls: 'node-text' });
             });
@@ -436,19 +642,60 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             const metrics = formatMetrics(node.metrics);
             if (metrics) lines.push({ text: metrics, cls: 'node-muted' });
             if (node.native_plan_ref && sourcePlans[node.native_plan_ref]) {
-                lines.push({ text: 'Native plan available', cls: 'node-native' });
+                lines.push({ text: 'Click for Native SQL ↦', cls: 'node-native' });
             }
-            // Broadcast-rewrite badge — synthesized when the broadcast pass
-            // injected an IN-list filter above this scan path. Hover details
-            // are surfaced separately in the warning banner above the graph.
+            // Broadcast-rewrite badge. The daemon stamps the rewrite metadata
+            // on up to three surfaces per BroadcastApplication — the remote
+            // TableScan, the rewritten Join, and (if it survives optimization)
+            // the synthesized Filter — each tagged with a broadcast_role
+            // attribute. The badge text mirrors that role so the user can
+            // tell at a glance which side of the broadcast they are looking at.
             if (node.attributes && node.attributes.broadcast_rewrite === 'true') {
                 const count = node.attributes.broadcast_predicate_value_count;
-                const badge = count
-                    ? 'Broadcast: ' + count + ' keys'
-                    : 'Broadcast rewrite';
-                lines.push({ text: badge, cls: 'node-broadcast' });
+                const role = node.attributes.broadcast_role || 'filter';
+                const suffix = count ? count + ' keys' : 'rewrite';
+                let prefix;
+                switch (role) {
+                    case 'remote_scan': prefix = 'Broadcast IN ↓ '; break;
+                    case 'local_scan':  prefix = 'Broadcast keys ↑ '; break;
+                    case 'join':        prefix = 'Broadcast ⇆ '; break;
+                    case 'filter':      prefix = 'Broadcast: '; break;
+                    default:            prefix = 'Broadcast: ';
+                }
+                lines.push({ text: prefix + suffix, cls: 'node-broadcast' });
+            }
+            // Sort-pushdown badge — appears on both the Sort node and the
+            // TableScan it feeds. The daemon stamps the attribute on a remote
+            // TableScan whenever its captured remote_sql contains ORDER BY,
+            // so users see exactly which scan is returning pre-sorted rows.
+            if (node.attributes && node.attributes.sort_pushed_down === 'true') {
+                lines.push({ text: 'Sort ↓ pushed', cls: 'node-sort-pushed' });
             }
             return lines.slice(0, 6);
+        }
+
+        function nodeTooltip(node) {
+            // Hover tooltip surfaces full attributes (predicates, sorts,
+            // projection lists) that get truncated in the visible node body.
+            // Native SVG <title> works inside webviews without extra JS or
+            // CSP relaxation.
+            const lines = [node.node_type];
+            if (node.label) lines.push(node.label);
+            const attrs = node.attributes || {};
+            Object.keys(attrs).sort().forEach(function(key) {
+                const value = attrs[key];
+                if (value !== undefined && value !== '') {
+                    lines.push(key + ': ' + value);
+                }
+            });
+            if (node.remote_sql) {
+                lines.push('remote_sql: ' + node.remote_sql);
+            }
+            return lines.join('\\n');
+        }
+
+        function slugForId(value) {
+            return String(value || '').replace(/[^A-Za-z0-9_-]+/g, '-');
         }
 
         function renderTree() {
@@ -524,9 +771,24 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             Object.keys(layouts).forEach(function(id) {
                 const layout = layouts[id];
                 const node = layout.node;
-                const className = node.node_type === 'TableScan' ? 'plan-node table-scan' : 'plan-node';
-                svgContent += '<g class="' + className + '" transform="translate(' + layout.x + ', ' + layout.y + ')">';
+                const isTableScan = node.node_type === 'TableScan';
+                const className = isTableScan ? 'plan-node table-scan' : 'plan-node';
+                // data-source-ref lets the click handler look up the
+                // matching Source-tab card without re-parsing the node label.
+                const dataAttr = isTableScan && node.source_ref
+                    ? ' data-source-ref="' + escapeHtml(node.source_ref) + '"'
+                    : '';
+                svgContent += '<g class="' + className + '" transform="translate(' + layout.x + ', ' + layout.y + ')"' + dataAttr + '>';
+                svgContent += '<title>' + escapeHtml(nodeTooltip(node)) + '</title>';
                 svgContent += '<rect class="node-rect" width="' + nodeWidth + '" height="' + nodeHeight + '" />';
+                // Provider icon: TableScan nodes get a 16x16 glyph at the
+                // top-left so users can tell Postgres from MySQL from CSV at
+                // a glance. We embedded each kind as a <symbol> in the SVG
+                // <defs> at the root; reference it via <use href="#icon-…">.
+                if (isTableScan) {
+                    const kind = node.provider_kind || 'unknown';
+                    svgContent += '<use class="plan-node-icon" href="#icon-' + escapeHtml(kind) + '" x="8" y="8" width="16" height="16"/>';
+                }
                 nodeLines(node).forEach(function(line, index) {
                     const y = 22 + index * 18;
                     svgContent += '<text class="node-text ' + line.cls + '" x="12" y="' + y + '">' + escapeHtml(shortText(line.text, 48)) + '</text>';
@@ -591,24 +853,69 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         const treeContainer = document.getElementById('tree-container');
         treeContainer.addEventListener('mousedown', function(event) {
             if (event.button !== 0) return;
-            panState = { x: event.clientX, y: event.clientY, startX: treeState.x, startY: treeState.y };
+            panState = {
+                x: event.clientX,
+                y: event.clientY,
+                startX: treeState.x,
+                startY: treeState.y,
+                moved: false,
+            };
             treeContainer.classList.add('dragging');
             event.preventDefault();
         });
         window.addEventListener('mousemove', function(event) {
             if (!panState) return;
-            treeState.x = panState.startX + event.clientX - panState.x;
-            treeState.y = panState.startY + event.clientY - panState.y;
+            const dx = event.clientX - panState.x;
+            const dy = event.clientY - panState.y;
+            if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+                panState.moved = true;
+            }
+            treeState.x = panState.startX + dx;
+            treeState.y = panState.startY + dy;
             applyTreeTransform();
         });
-        window.addEventListener('mouseup', function() {
+        window.addEventListener('mouseup', function(event) {
+            const wasClick = panState && !panState.moved;
             panState = null;
             treeContainer.classList.remove('dragging');
+            if (!wasClick) return;
+            // Treat a drag-free mousedown→mouseup as a click. If it landed
+            // inside a TableScan group, jump to the matching Source-tab card.
+            const target = event.target;
+            if (!(target instanceof Element)) return;
+            const scanGroup = target.closest('g.plan-node.table-scan');
+            if (!scanGroup) return;
+            const sourceRef = scanGroup.getAttribute('data-source-ref');
+            if (!sourceRef) return;
+            revealSourceCard(sourceRef);
         });
         treeContainer.addEventListener('wheel', function(event) {
             event.preventDefault();
             zoomTree(event.deltaY < 0 ? 1.08 : 1 / 1.08);
         }, { passive: false });
+
+        function revealSourceCard(sourceRef) {
+            // Programmatically switch to the Source tab and scroll the
+            // matching card into view. Briefly highlight it so the user
+            // sees what they jumped to.
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(function(t) {
+                t.classList.toggle('active', t.dataset.target === 'source-tab');
+            });
+            document.querySelectorAll('.tab-content').forEach(function(c) {
+                c.classList.toggle('active', c.id === 'source-tab');
+            });
+            const card = document.getElementById('source-card-' + slugForId(sourceRef));
+            if (!card) return;
+            // Force expanded state on the global Logical/Physical sections so
+            // the user's jump-target is visible without an extra click.
+            const card_parent = card.parentElement;
+            if (card_parent) {
+                card.scrollIntoView({ block: 'start', behavior: 'smooth' });
+            }
+            card.classList.add('highlight');
+            setTimeout(function() { card.classList.remove('highlight'); }, 1400);
+        }
 
         function renderTable() {
             const flatNodes = [];

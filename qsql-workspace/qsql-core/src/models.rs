@@ -2,6 +2,22 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PAGE_SIZE: usize = 1_000;
 pub const MAX_PAGE_SIZE: usize = 10_000;
+pub const SCAN_GUARD_ERROR_CODE: i32 = -32100;
+
+pub fn get_env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+pub fn default_page_size() -> usize {
+    get_env_usize("QSQL_DEFAULT_PAGE_SIZE", DEFAULT_PAGE_SIZE)
+}
+
+pub fn max_page_size() -> usize {
+    get_env_usize("QSQL_MAX_PAGE_SIZE", MAX_PAGE_SIZE)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +51,7 @@ pub struct ConnectorCapabilities {
     pub projection: bool,
     pub filter: bool,
     pub limit: bool,
+    pub sort: bool,
     pub aggregate: bool,
     pub joins: bool,
     pub dialect_name: String,
@@ -94,11 +111,25 @@ pub struct ExplainQueryRequest {
 pub struct ExplainQueryResult {
     pub sql: String,
     pub federated_plan: PlanGraph,
-    pub source_plans: serde_json::Value,
+    pub source_plans: std::collections::HashMap<String, SourcePlanEntry>,
     pub raw: String,
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub broadcast_rewrites: Option<crate::broadcast::BroadcastRewriteInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub physical_plan_text: Option<String>,
+}
+
+/// One entry in `ExplainQueryResult.source_plans`, keyed by qualified table name.
+/// Captures the actual SQL QuiverSQL pushes down to the remote DBMS plus the
+/// DBMS's EXPLAIN for that SQL — what the UI shows in the per-table Source
+/// card. Local file scans omit this entry; only DB-backed scans appear here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePlanEntry {
+    pub provider_kind: String,
+    pub native_sql: String,
+    pub native_explain: serde_json::Value,
+    pub dialect: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -120,6 +151,10 @@ pub struct PlanNode {
     pub metrics: PlanMetrics,
     pub source_ref: Option<String>,
     pub native_plan_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_sql: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -179,20 +214,22 @@ pub struct QueryExecutionResult {
 pub fn normalize_page_size(
     page_size: Option<usize>,
 ) -> Result<(usize, Option<String>), QueryError> {
+    let max_size = max_page_size();
+    let def_size = default_page_size();
     match page_size {
         Some(0) => Err(QueryError {
             code: -32602,
             message: "page_size must be greater than zero".to_string(),
             details: None,
         }),
-        Some(size) if size > MAX_PAGE_SIZE => Ok((
-            MAX_PAGE_SIZE,
+        Some(size) if size > max_size => Ok((
+            max_size,
             Some(format!(
-                "Requested page_size {size} exceeded the maximum {MAX_PAGE_SIZE}; using {MAX_PAGE_SIZE}."
+                "Requested page_size {size} exceeded the maximum {max_size}; using {max_size}."
             )),
         )),
         Some(size) => Ok((size, None)),
-        None => Ok((DEFAULT_PAGE_SIZE, None)),
+        None => Ok((def_size, None)),
     }
 }
 
@@ -339,17 +376,28 @@ mod tests {
 
     #[test]
     fn serde_round_trip_remove_source() {
-        let req = RemoveSourceRequest { name: "s1".to_string() };
-        let res = RemoveSourceResult { name: "s1".to_string(), removed: true };
-        let req2: RemoveSourceRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
-        let res2: RemoveSourceResult = serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
+        let req = RemoveSourceRequest {
+            name: "s1".to_string(),
+        };
+        let res = RemoveSourceResult {
+            name: "s1".to_string(),
+            removed: true,
+        };
+        let req2: RemoveSourceRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let res2: RemoveSourceResult =
+            serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
         assert_eq!(req2.name, "s1");
         assert!(res2.removed);
     }
 
     #[test]
     fn serde_round_trip_list_source_tables() {
-        let req = ListSourceTablesRequest { name: "db".to_string(), offset: Some(5), limit: Some(10) };
+        let req = ListSourceTablesRequest {
+            name: "db".to_string(),
+            offset: Some(5),
+            limit: Some(10),
+        };
         let result = ListSourceTablesResult {
             name: "db".to_string(),
             tables: vec!["a".to_string(), "b".to_string()],
@@ -358,8 +406,10 @@ mod tests {
             total_known: Some(20),
             truncated: false,
         };
-        let req2: ListSourceTablesRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
-        let res2: ListSourceTablesResult = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        let req2: ListSourceTablesRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let res2: ListSourceTablesResult =
+            serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
         assert_eq!(req2.offset, Some(5));
         assert_eq!(res2.tables.len(), 2);
         assert_eq!(res2.total_known, Some(20));
@@ -367,9 +417,81 @@ mod tests {
 
     #[test]
     fn serde_round_trip_get_source_metadata_request() {
-        let req = GetSourceMetadataRequest { name: "src".to_string() };
-        let req2: GetSourceMetadataRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let req = GetSourceMetadataRequest {
+            name: "src".to_string(),
+        };
+        let req2: GetSourceMetadataRequest =
+            serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
         assert_eq!(req2.name, "src");
+    }
+
+    #[test]
+    fn serde_round_trip_source_plan_entry_preserves_native_sql() {
+        let entry = SourcePlanEntry {
+            provider_kind: "postgres".to_string(),
+            native_sql: "SELECT \"id\" FROM \"public\".\"customers\" WHERE \"id\" IN (1,2)"
+                .to_string(),
+            native_explain: json!({"Plan": {"Node Type": "Index Scan"}}),
+            dialect: "postgresql".to_string(),
+        };
+        let back: SourcePlanEntry =
+            serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
+        assert_eq!(back.provider_kind, "postgres");
+        assert!(back.native_sql.contains("IN (1,2)"));
+        assert_eq!(back.dialect, "postgresql");
+    }
+
+    #[test]
+    fn plan_node_serde_skips_none_provider_and_remote_sql() {
+        let node = PlanNode {
+            id: "df_0".to_string(),
+            origin: "DataFusion".to_string(),
+            node_type: "Filter".to_string(),
+            label: "Filter: x > 0".to_string(),
+            children: vec![],
+            attributes: std::collections::HashMap::new(),
+            metrics: PlanMetrics {
+                estimated_rows: None,
+                estimated_bytes: None,
+                startup_cost: None,
+                total_cost: None,
+            },
+            source_ref: None,
+            native_plan_ref: None,
+            provider_kind: None,
+            remote_sql: None,
+        };
+        let s = serde_json::to_string(&node).unwrap();
+        assert!(!s.contains("provider_kind"));
+        assert!(!s.contains("remote_sql"));
+    }
+
+    #[test]
+    fn plan_node_serde_emits_provider_kind_and_remote_sql_when_set() {
+        let node = PlanNode {
+            id: "df_3".to_string(),
+            origin: "DataFusion".to_string(),
+            node_type: "TableScan".to_string(),
+            label: "TableScan: pg.customers".to_string(),
+            children: vec![],
+            attributes: std::collections::HashMap::new(),
+            metrics: PlanMetrics {
+                estimated_rows: None,
+                estimated_bytes: None,
+                startup_cost: None,
+                total_cost: None,
+            },
+            source_ref: Some("pg.customers".to_string()),
+            native_plan_ref: Some("pg.customers".to_string()),
+            provider_kind: Some("postgres".to_string()),
+            remote_sql: Some("SELECT \"id\" FROM \"public\".\"customers\"".to_string()),
+        };
+        let s = serde_json::to_string(&node).unwrap();
+        assert!(s.contains("\"provider_kind\":\"postgres\""));
+        assert!(s.contains("remote_sql"));
+        let back: PlanNode = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.provider_kind.as_deref(), Some("postgres"));
+        assert!(back.remote_sql.unwrap().contains("FROM"));
     }
 }
 

@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## 0.3.1-alpha.0 - Unreleased
+
+Changes since `0.3.0-alpha.0`. Finalises Phase 7 (Sort/Top-K Pushdown + Scan-Guard UX) and revamps the Explain Plan around evidence-driven attribution.
+
+- Formalised sort / top-k pushdown for SQL connectors: `sort: true` capability flag, parity tests across SQLite/Postgres/MySQL, medium-fixture sort smoke tests, and a `sort_pushdown_sqlite_1k_rows` benchmark for regression tracking.
+- Added structured scan-guard error code `-32100` with the `[QSQL_SCAN_GUARD]` sentinel and a VS Code suggestion banner that proposes `LIMIT`, additional `WHERE`, or a budget bump when a remote scan exceeds its row/byte budget.
+- Captured the *actual* pushed-down SQL per remote `TableScan` by walking the DataFusion physical plan and parsing both `datafusion-federation`'s `VirtualExecutionPlan` and `datafusion-table-providers`' generic `SqlExec` plus DB-specific variants (`MySQLSQLExec`). Replaced the `EXPLAIN SELECT * FROM table` placeholder with the real query — including projection, filter, sort, limit, and broadcast `IN (…)` pushdowns.
+- Replaced the Explain panel's "Native Source Plans" wall of text with per-table cards stacked in execution order: Native SQL → Remote EXPLAIN of that SQL → DataFusion logical fragment, with copy-to-clipboard on each section and a clickable cross-link from the Tree-tab `TableScan` to its card.
+- Added provider-specific icons for the Data Sources sidebar and plan-graph `TableScan` nodes (Postgres, MySQL, MariaDB, SQLite, CSV, NDJSON, JSON, Parquet, fixed-width). New `providerIcons` module centralises the icon/label registry.
+- Reworked the broadcast-rewrite badge to drive off `BroadcastRewriteInfo.applied` rather than structural Filter-node pattern matching, so the badge survives downstream optimiser rearrangements. Stamps three surfaces per rewrite — remote `TableScan` (`Broadcast IN ↓ N keys`), local `TableScan` (`Broadcast keys ↑ N keys`), and the rewritten `Join` (`Broadcast ⇆ N keys`) — with a `broadcast_role` discriminator on each.
+- Reworked the sort-pushdown badge to fire only when every `TableScan` in the Sort's subtree has a captured `remote_sql` containing `ORDER BY` — eliminates the false positive on multi-source federated joins where the join (and therefore the sort) must execute locally.
+- Added a collapsible `DataFusion Physical Plan` section to the Source tab (collapsed by default) and a legend bar above the plan graph explaining badge colours.
+- Added an `Explain Plan` walkthrough (`USER_GUIDE.md` §8) covering provider icons, the per-table card layout, click-through from Tree to Source, and how each pushdown surfaces visually.
+- The daemon honours `QSQL_EXPLAIN_TRACE=1` as a developer diagnostic that emits one stderr line per physical-plan node during Explain — useful for future Explain capture issues, not exposed as a VS Code setting.
+
 ## 0.3.0-alpha.0 - Unreleased
 
 Changes since `0.2.1-alpha.0`.

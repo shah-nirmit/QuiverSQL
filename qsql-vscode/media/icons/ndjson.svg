@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" width="16" height="16" role="img" aria-label="NDJSON file">
+  <g fill="none" stroke="#FFB300" stroke-width="1.1" stroke-linejoin="round" stroke-linecap="round">
+    <path d="M4 3.2c-.6 0-1 .4-1 1v1.5c0 .5-.3.8-.8.8v1c.5 0 .8.3.8.8v1.5c0 .6.4 1 1 1"/>
+    <path d="M12 3.2c.6 0 1 .4 1 1v1.5c0 .5.3.8.8.8v1c-.5 0-.8.3-.8.8v1.5c0 .6-.4 1-1 1"/>
+    <path d="M6 5.5h4"/>
+    <path d="M6 8h4"/>
+    <path d="M6 10.5h4"/>
+  </g>
+</svg>

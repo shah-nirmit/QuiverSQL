@@ -27,8 +27,12 @@ const TABLE_LIST_LIMIT: usize = 5_000;
 const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(300);
 const MAX_CONCURRENT_QUERY_TASKS: usize = 16;
 const SQLITE_SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
-const REMOTE_SOURCE_TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEMA_INTROSPECTION_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub fn get_remote_source_timeout() -> Duration {
+    let secs = qsql_core::models::get_env_usize("QSQL_REMOTE_QUERY_TIMEOUT_SECS", 30);
+    Duration::from_secs(secs as u64)
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct RpcRequest {
@@ -527,7 +531,7 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
             match list_tables_with_truncation(
                 &connector,
                 postgres_req.schema.as_deref(),
-                REMOTE_SOURCE_TIMEOUT,
+                get_remote_source_timeout(),
             )
             .await
             {
@@ -610,7 +614,7 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 match list_tables_with_truncation(
                     &connector,
                     mysql_req.schema.as_deref(),
-                    REMOTE_SOURCE_TIMEOUT,
+                    get_remote_source_timeout(),
                 )
                 .await
                 {
@@ -695,16 +699,36 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 .broadcast_rewrites_applied_total
                 .fetch_add(broadcast_info.applied.len() as u64, Ordering::Relaxed);
 
-            let federated_plan =
-                explain::build_plan_graph_with_broadcast(&logical_plan, Some(&broadcast_info));
+            // Build the physical plan so we can scrape the real pushed-down
+            // SQL from datafusion-federation's VirtualExecutionPlan leaves.
+            // Failures here are non-fatal: the explain still works, the UI
+            // just falls back to showing only the logical plan (no per-table
+            // Native SQL card). Common cause for failure: the remote DB is
+            // offline and the federation layer cannot resolve schemas.
+            let physical_plan = state
+                .engine
+                .create_physical_plan_for_explain(&logical_plan)
+                .await
+                .ok();
             let database_sources = state.database_sources.read().unwrap().clone();
+            let remote_sqls = physical_plan
+                .as_ref()
+                .map(|pp| {
+                    explain::collect_remote_sql_for_scans(pp, &logical_plan, &database_sources)
+                })
+                .unwrap_or_default();
+            let physical_plan_text = physical_plan
+                .as_ref()
+                .map(explain::format_physical_plan)
+                .map(|raw| explain::truncate_raw_plan(&raw).0);
+            let federated_plan = explain::build_plan_graph_with_broadcast(
+                &logical_plan,
+                Some(&broadcast_info),
+                Some(&remote_sqls),
+                Some(&database_sources),
+            );
             let source_plans =
-                explain::extract_source_plans(&logical_plan, &database_sources).await;
-
-            let mut source_plans_json = serde_json::Map::new();
-            for (k, v) in source_plans {
-                source_plans_json.insert(k, v);
-            }
+                explain::extract_source_plans(&logical_plan, &database_sources, &remote_sqls).await;
 
             let raw_plan = format!("{}", logical_plan.display_indent());
             let (raw_plan, raw_warning) = explain::truncate_raw_plan(&raw_plan);
@@ -712,17 +736,28 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
             if federated_plan.truncated {
                 warnings.push(format!(
                     "Plan graph exceeded {} nodes and was truncated.",
-                    explain::MAX_PLAN_NODES
+                    explain::get_max_plan_nodes()
                 ));
             }
             if let Some(raw_warning) = raw_warning {
                 warnings.push(raw_warning);
             }
+            if physical_plan.is_none() {
+                warnings.push(
+                    "Physical plan unavailable (remote source may be offline); per-table \
+                     Native SQL cards will be missing in the Source tab."
+                        .to_string(),
+                );
+            }
             for app in &broadcast_info.applied {
                 warnings.push(format!(
                     "Applied broadcast rewrite: {} key{} from {} pushed to {} ({}ms)",
                     app.predicate_value_count,
-                    if app.predicate_value_count == 1 { "" } else { "s" },
+                    if app.predicate_value_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
                     app.local_table,
                     app.remote_table,
                     app.elapsed_ms,
@@ -738,10 +773,11 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
             let res = ExplainQueryResult {
                 sql: req.sql.clone(),
                 federated_plan,
-                source_plans: serde_json::Value::Object(source_plans_json),
+                source_plans,
                 raw: raw_plan,
                 warnings,
                 broadcast_rewrites,
+                physical_plan_text,
             };
 
             make_success(serde_json::to_value(res).unwrap())
@@ -1024,8 +1060,10 @@ async fn list_database_tables_page(
 ) -> Result<Vec<String>, QueryError> {
     let timeout = match registration.kind {
         SourceKind::Sqlite => SQLITE_SOURCE_TIMEOUT,
-        SourceKind::Postgres | SourceKind::Mysql | SourceKind::Mariadb => REMOTE_SOURCE_TIMEOUT,
-        _ => REMOTE_SOURCE_TIMEOUT,
+        SourceKind::Postgres | SourceKind::Mysql | SourceKind::Mariadb => {
+            get_remote_source_timeout()
+        }
+        _ => get_remote_source_timeout(),
     };
 
     let list = async {
@@ -1522,7 +1560,7 @@ mod tests {
             ConnectorErrorKind::Other,
         ];
         for kind in kinds {
-            let err = ConnectorError::new(kind.clone(), "test message");
+            let err = ConnectorError::new(kind, "test message");
             let qe = connector_query_error(err);
             assert_eq!(qe.code, -32001, "unexpected code for kind {kind:?}");
             assert_eq!(qe.message, "test message");
@@ -1693,31 +1731,44 @@ mod tests {
     #[tokio::test]
     async fn handle_request_query_start_invalid_page_size_returns_32602() {
         let params = serde_json::json!({"sql": "SELECT 1", "page_size": 0});
-        let resp =
-            handle_request(make_req("query_start", Some(params), 13), fresh_state()).await;
+        let resp = handle_request(make_req("query_start", Some(params), 13), fresh_state()).await;
         assert_eq!(resp.error.as_ref().unwrap()["code"], -32602);
     }
 
     #[tokio::test]
     async fn handle_request_query_start_and_page_then_cancel() {
         let state = fresh_state();
-        let start_params = serde_json::json!({"sql": "SELECT 1 AS v UNION ALL SELECT 2 AS v", "page_size": 1});
-        let start = handle_request(make_req("query_start", Some(start_params), 14), state.clone()).await;
+        let start_params =
+            serde_json::json!({"sql": "SELECT 1 AS v UNION ALL SELECT 2 AS v", "page_size": 1});
+        let start = handle_request(
+            make_req("query_start", Some(start_params), 14),
+            state.clone(),
+        )
+        .await;
         assert!(start.error.is_none(), "start failed: {:?}", start.error);
-        let query_id = start.result.as_ref().unwrap()["query_id"].as_str().unwrap().to_string();
+        let query_id = start.result.as_ref().unwrap()["query_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
 
         let page_params = serde_json::json!({"query_id": query_id, "page_index": 1});
-        let page = handle_request(make_req("query_page", Some(page_params), 15), state.clone()).await;
+        let page =
+            handle_request(make_req("query_page", Some(page_params), 15), state.clone()).await;
         assert!(page.error.is_none(), "page failed: {:?}", page.error);
 
         // Session persists until explicitly cancelled; first cancel should succeed
         let cancel_params = serde_json::json!({"query_id": query_id});
-        let cancel = handle_request(make_req("query_cancel", Some(cancel_params), 16), state.clone()).await;
+        let cancel = handle_request(
+            make_req("query_cancel", Some(cancel_params), 16),
+            state.clone(),
+        )
+        .await;
         assert_eq!(cancel.result.as_ref().unwrap()["cancelled"], true);
 
         // Second cancel on the same id returns false (already removed)
         let cancel2_params = serde_json::json!({"query_id": query_id});
-        let cancel2 = handle_request(make_req("query_cancel", Some(cancel2_params), 17), state).await;
+        let cancel2 =
+            handle_request(make_req("query_cancel", Some(cancel2_params), 17), state).await;
         assert_eq!(cancel2.result.as_ref().unwrap()["cancelled"], false);
     }
 
@@ -1726,17 +1777,30 @@ mod tests {
         use rusqlite::Connection;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("qsql_lib_test_{}_{}.db", std::process::id(), nanos));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("qsql_lib_test_{}_{}.db", std::process::id(), nanos));
         let _ = std::fs::remove_file(&path);
         let conn = Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)", []).unwrap();
-        conn.execute("INSERT INTO widgets (name) VALUES ('Sprocket')", []).unwrap();
+        conn.execute(
+            "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO widgets (name) VALUES ('Sprocket')", [])
+            .unwrap();
         drop(conn);
 
         let state = fresh_state();
         let reg_params = serde_json::json!({"db_path": path.to_str().unwrap(), "alias": "mydb"});
-        let reg = handle_request(make_req("register_sqlite", Some(reg_params), 20), state.clone()).await;
+        let reg = handle_request(
+            make_req("register_sqlite", Some(reg_params), 20),
+            state.clone(),
+        )
+        .await;
         assert!(reg.error.is_none(), "register failed: {:?}", reg.error);
 
         let q_params = serde_json::json!({"sql": "SELECT name FROM mydb.widgets", "page_size": 10});
@@ -1771,15 +1835,23 @@ mod tests {
         use std::io::Write;
         use std::time::{SystemTime, UNIX_EPOCH};
 
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("qsql_lib_csv_{}_{}.csv", std::process::id(), nanos));
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path =
+            std::env::temp_dir().join(format!("qsql_lib_csv_{}_{}.csv", std::process::id(), nanos));
         let mut f = std::fs::File::create(&path).unwrap();
         writeln!(f, "id,val\n1,hello").unwrap();
         drop(f);
 
         let state = fresh_state();
         let reg_params = serde_json::json!({"table_name": "lib_test_csv", "path": path.to_str().unwrap(), "format": "csv"});
-        let reg = handle_request(make_req("register_file", Some(reg_params), 30), state.clone()).await;
+        let reg = handle_request(
+            make_req("register_file", Some(reg_params), 30),
+            state.clone(),
+        )
+        .await;
         assert!(reg.error.is_none(), "register_file failed: {:?}", reg.error);
 
         let list = handle_request(make_req("list_sources", None, 31), state.clone()).await;
@@ -1788,7 +1860,8 @@ mod tests {
         assert_eq!(sources[0]["name"], "lib_test_csv");
 
         let remove_params = serde_json::json!({"name": "lib_test_csv"});
-        let remove = handle_request(make_req("remove_source", Some(remove_params), 32), state).await;
+        let remove =
+            handle_request(make_req("remove_source", Some(remove_params), 32), state).await;
         assert_eq!(remove.result.as_ref().unwrap()["removed"], true);
 
         let _ = std::fs::remove_file(path);

@@ -58,33 +58,52 @@ export class DaemonClient {
                 return;
             }
 
-            this.process = cp.spawn(daemonPath);
+            const config = vscode.workspace.getConfiguration('qsql');
+            const env: Record<string, string> = {
+                ...process.env,
+                QSQL_DEFAULT_PAGE_SIZE: config.get<number>('defaultPageSize', 1000).toString(),
+                QSQL_MAX_PAGE_SIZE: config.get<number>('maxPageSize', 10000).toString(),
+                QSQL_QUERY_MEMORY_LIMIT_BYTES: config.get<number>('queryMemoryLimit', 268435456).toString(),
+                QSQL_REMOTE_SCAN_MAX_ROWS: config.get<number>('remoteScanMaxRows', 1000000).toString(),
+                QSQL_REMOTE_SCAN_MAX_BYTES: config.get<number>('remoteScanMaxBytes', 1073741824).toString(),
+                QSQL_REMOTE_QUERY_TIMEOUT_SECS: config.get<number>('remoteQueryTimeout', 30).toString(),
+            };
+            // The daemon also honors `QSQL_EXPLAIN_TRACE=1` for one-line-per-node
+            // physical-plan tracing to stderr — useful when diagnosing Explain
+            // capture issues. Not exposed as a VS Code setting (it's a
+            // developer diagnostic): set it in your shell before launching
+            // VS Code or in a launch.json `env` block if you need it.
 
-            this.process.on('error', (err) => {
+            const proc = cp.spawn(daemonPath, [], { env });
+            this.process = proc;
+
+            proc.on('error', (err) => {
                 vscode.window.showErrorMessage(`Failed to start QuiverSQL Daemon: ${err.message}`);
                 reject(err);
             });
 
-            this.process.stdout?.on('data', (data: Buffer) => {
+            proc.stdout?.on('data', (data: Buffer) => {
                 this.buffer = Buffer.concat([this.buffer, data]);
                 this.processBuffer();
             });
 
-            this.process.stderr?.on('data', (data) => {
+            proc.stderr?.on('data', (data) => {
                 console.error(`QuiverSQL Daemon stderr: ${data}`);
             });
 
-            this.process.on('close', (code) => {
+            proc.on('close', (code) => {
                 console.log(`QuiverSQL Daemon exited with code ${code}`);
-                this.process = undefined;
-                this.rejectPendingRequests({
-                    code: -32010,
-                    message: `QuiverSQL Daemon exited with code ${code}`,
-                    details: undefined
-                });
+                if (this.process === proc) {
+                    this.process = undefined;
+                    this.rejectPendingRequests({
+                        code: -32010,
+                        message: `QuiverSQL Daemon exited with code ${code}`,
+                        details: undefined
+                    });
+                }
             });
 
-            this.process.on('spawn', () => {
+            proc.on('spawn', () => {
                 // Resolve as soon as the OS confirms the process has spawned
                 resolve();
             });

@@ -73,6 +73,7 @@ fn test_connector_capabilities_golden() {
         projection: true,
         filter: false,
         limit: true,
+        sort: true,
         aggregate: false,
         joins: true,
         dialect_name: "postgres".to_string(),
@@ -82,6 +83,7 @@ fn test_connector_capabilities_golden() {
         "projection": true,
         "filter": false,
         "limit": true,
+        "sort": true,
         "aggregate": false,
         "joins": true,
         "dialect_name": "postgres"
@@ -373,6 +375,8 @@ fn test_explain_query_models_golden() {
         metrics: metrics.clone(),
         source_ref: None,
         native_plan_ref: None,
+        provider_kind: None,
+        remote_sql: None,
     };
     let node_expected = json!({
         "id": "n1",
@@ -408,14 +412,16 @@ fn test_explain_query_models_golden() {
     let result = ExplainQueryResult {
         sql: "SELECT 1".to_string(),
         federated_plan: graph.clone(),
-        source_plans: json!({}),
+        source_plans: HashMap::new(),
         raw: "raw_plan".to_string(),
         warnings: vec!["warn1".to_string()],
         broadcast_rewrites: None,
+        physical_plan_text: None,
     };
-    // `broadcast_rewrites` is `#[serde(skip_serializing_if = "Option::is_none")]`,
-    // so None is omitted from the wire format. Existing JSON-RPC clients that
-    // don't know about the field stay byte-identical.
+    // `broadcast_rewrites` and `physical_plan_text` are both
+    // `#[serde(skip_serializing_if = "Option::is_none")]`, so None values are
+    // omitted from the wire format. Existing JSON-RPC clients that don't know
+    // about either field stay byte-identical.
     let result_expected = json!({
         "sql": "SELECT 1",
         "federated_plan": graph_expected,

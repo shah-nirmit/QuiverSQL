@@ -4,4 +4,5 @@
 // they need. Items unused by a given test crate trigger dead-code warnings —
 // the allow above silences them at the module boundary.
 
+pub mod fixtures;
 pub mod memory;

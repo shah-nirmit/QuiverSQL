@@ -107,7 +107,7 @@ Completed verification:
 - `npm run typecheck`
 - `npm run test`
 
-### Phase 6.2: Architecture Review Remediation - Current
+### Phase 6.2: Architecture Review Remediation - Complete
 Phase 6.2 absorbs the principal architecture review before Phase 7. The order is intentional: shrink the connector/planner code first, then replace the result/session runtime, then harden the surviving surface.
 
 #### 6.2A: DataFusion Ecosystem Adoption
@@ -148,11 +148,63 @@ Phase 6.2 absorbs the principal architecture review before Phase 7. The order is
 - Plan safety: a synthetic 10K-node plan returns `truncated: true` and the webview shows a clear warning.
 - Compatibility: `cargo test --locked --workspace`, `npm run typecheck`, `npm run test`, and benchmark compile smoke remain green with no material regression.
 
-### Phase 7: Sort/Top-K Pushdown And Guard UX
-- Verify whether upstream providers already push simple `ORDER BY` plus optional `LIMIT`; if so, focus on parity tests, explain visibility, and user-facing metrics.
-- Surface byte/row limit errors from Phase 6.2 in the VS Code result grid and explain panel.
-- Generate medium/large local fixtures during tests instead of committing them.
-- Tests: SQL sort/top-k golden/parity tests, result-size guard rendering tests, generated large CSV/Parquet smoke tests, and benchmark regression checks.
+### Phase 7: Sort/Top-K Pushdown And Guard UX - Complete
+
+**Key technical fact**: `datafusion-federation`'s SQL unparser converts the full pushable logical plan — including `Sort` nodes — into a complete SQL string (with `ORDER BY` + `LIMIT` embedded) before calling `SQLExecutor::execute()`. Sort pushdown therefore already works automatically via the federation layer for all SQL connectors (confirmed by comparison with spiceai's approach). Phase 7 tracks this capability formally, proves it with parity tests, and improves guard error UX.
+
+#### 7A: Sort Capability Flag
+- Add `sort: bool` field to `ConnectorCapabilities` in `qsql-core/src/models.rs`.
+- Set `sort: true` in `sql_capabilities()` for all SQL dialects (SQLite, Postgres, MySQL/MariaDB).
+- Update the `ConnectorCapabilities` serde golden test to include `"sort": true`.
+- Update the `sql_capabilities_reflects_dialect_name` unit test to assert `caps.sort`.
+
+#### 7B: Sort Parity And Verification Tests
+- Write `qsql-workspace/qsql-daemon/tests/sort_pushdown_tests.rs` with a shuffled-insert SQLite helper so natural row order ≠ sort order.
+- Tests: ASC single-column parity, DESC single-column parity, no-LIMIT full sort, combined filter+sort+limit, SQLite EXPLAIN QUERY PLAN output contains ORDER BY, env-gated Postgres parity, env-gated MySQL parity.
+- Medium fixture smoke tests: generate 100K-row CSV and 100K-row SQLite at test time via `tests/common/fixtures.rs`; run `ORDER BY id DESC LIMIT 3` and assert first `id = 100000`.
+
+#### 7C: Sort Explain Visibility
+- In `qsql-workspace/qsql-daemon/src/explain.rs`, add `sort_columns` and `sort_pushed_down` attributes to `LogicalPlan::Sort` nodes in `traverse_plan()`.
+- In `qsql-vscode/src/planVisualizationPanel.ts`, render a "Sort ↓ pushed" badge on Sort nodes where `sort_pushed_down = "true"`.
+
+#### 7D: Structured Scan-Guard Error Codes
+- In `qsql-workspace/qsql-core/src/engine.rs`, prefix `scan_budget_error()` messages with `[QSQL_SCAN_GUARD]`.
+- In `qsql-workspace/qsql-daemon/src/lib.rs`, detect the sentinel and map to `QueryError { code: -32100 }` instead of the generic `-32603`.
+- Add `SCAN_GUARD_ERROR_CODE: i32 = -32100` constant in `qsql-core/src/models.rs`.
+- In `qsql-vscode/src/models.ts`, add `SCAN_GUARD_ERROR_CODE` constant and `isScanGuardError()` helper.
+- In `qsql-vscode/src/webviewPanel.ts`, render an actionable suggestion banner (Add LIMIT, Add WHERE filter, Raise budget) when the error code is `-32100`.
+
+#### 7E: Medium/Large Fixture Generation
+- Add `qsql-workspace/qsql-daemon/tests/common/fixtures.rs` with `generate_medium_csv()`, `generate_medium_sqlite()`, and `unique_temp_path()` helpers.
+- Schema: `(id INTEGER, label TEXT, amount REAL)`, rows `1..=n`, cleaned up via RAII temp guard.
+- Used by smoke tests and benchmark setup; no large binary files committed.
+
+#### 7F: Benchmark Additions
+- Add `sort_pushdown_sqlite_1k_rows` and `sort_no_pushdown_csv_1k_rows` benchmark groups to `qsql-workspace/qsql-daemon/benches/phase0_benchmarks.rs` using the existing `once_cell` singleton pattern.
+
+#### 7G: TypeScript Guard UX Tests
+- Add tests verifying `isScanGuardError()` helper, suggestion banner renders for code `-32100`, and banner is absent for code `-32603`.
+
+#### 7H: Explain Plan Revamp (evidence-driven attribution + provider icons)
+
+Lands the Phase 7 finalisation. Replaces structural pattern-matching of the logical-plan tree with capture-from-the-physical-plan and stamp-from-rewrite-info, so badges and SQL stay correct regardless of what subsequent optimiser passes do.
+
+- Capture the real pushed-down SQL by walking the physical plan: downcast `datafusion-federation::sql::VirtualExecutionPlan` for the federation path, and pattern-match `<Word>Exec sql=…` for the non-federation path (`SqlExec` from `datafusion-table-providers`, `MySQLSQLExec` and similar DB-specific execs). Attribute each captured SQL string back to its logical `TableScan` by searching the SQL's `FROM` clause for the table's quoted identifier across all dialect styles.
+- Add `provider_kind` + `remote_sql` to `PlanNode` and a typed `SourcePlanEntry { provider_kind, native_sql, native_explain, dialect }` to `ExplainQueryResult.source_plans` (additive, omitted via `skip_serializing_if = "Option::is_none"` so older clients stay compatible).
+- Run remote `EXPLAIN` against the captured pushed-down SQL instead of the placeholder `SELECT * FROM table` so the per-table Remote EXPLAIN reflects the actual query.
+- Replace the Source-tab "Native Source Plans" dump with per-table cards (Native SQL → Remote EXPLAIN → Logical fragment), a collapsible `DataFusion Physical Plan` section (collapsed by default), and a legend bar above the plan graph. Tree-tab `TableScan` clicks scroll to the matching card.
+- Centralise provider iconography in `qsql-vscode/src/providerIcons.ts` (single source of truth for tree-item `iconPath`, embedded SVG `<symbol>` set for the plan graph, and human-readable labels). Icon files live in `qsql-vscode/media/icons/`.
+- Drive the **sort** badge from captured `remote_sql` content (`ORDER BY` substring scan over every `TableScan` in the subtree) instead of the structural `subtree_is_fully_federated` heuristic — eliminates false positives on multi-source joins.
+- Drive the **broadcast** badge from `BroadcastRewriteInfo.applied` instead of structural `Filter+InList` matching. Stamps three surfaces with a `broadcast_role` discriminator (`remote_scan` → "Broadcast IN ↓ N keys"; `local_scan` → "Broadcast keys ↑ N keys"; `join` → "Broadcast ⇆ N keys"; legacy `filter` → "Broadcast: N keys") so the badge survives Filter folding by downstream optimisation.
+- Add a `QSQL_EXPLAIN_TRACE=1` daemon env-var that emits one stderr line per physical-plan node, kept as a developer diagnostic (no VS Code setting exposure).
+
+#### 7 Verification
+- `cargo test --locked --workspace` and `--features postgres,mysql` green.
+- `cargo test --locked -p qsql-connectors` and `-p qsql-daemon` green (sort parity + medium fixture smoke + 43 explain unit tests covering remote-SQL capture, provider classification, sort/broadcast attribution).
+- `cargo check --locked -p qsql-daemon --benches` benchmark compile smoke.
+- `npm run typecheck && npm run lint && npm run test` green (includes provider-icon registry coverage + Explain panel per-table-card rendering tests).
+- Acceptance: `sort: true` in golden JSON; parity tests confirm ORDER BY arrives at SQLite layer; scan guard returns code `-32100`; VS Code renders suggestion banner for guard errors.
+- Acceptance: Section 8 of `USER_GUIDE.md` walks end-to-end through the federated demo and confirms (a) provider icons in the Data Sources tree and on Tree-tab `TableScan` nodes, (b) per-table cards in the Source tab carrying the *actual* pushed-down SQL, (c) the broadcast badge surfaces on the remote scan + Join + local scan even when the post-rewrite optimiser folds the synthesised Filter, (d) the sort badge fires only when every leaf's captured SQL contains `ORDER BY`.
 
 ### Phase 8: Fixed-Width File Support
 - Add fixed-width file registration with required layout metadata.

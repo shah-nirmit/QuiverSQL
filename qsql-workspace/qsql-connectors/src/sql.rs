@@ -79,6 +79,7 @@ pub fn sql_capabilities(dialect: SqlDialectKind) -> qsql_core::models::Connector
         projection: true,
         filter: true,
         limit: true,
+        sort: true,
         aggregate: false,
         joins: false,
         dialect_name: dialect.name().to_string(),
@@ -120,23 +121,37 @@ pub fn sql_type_to_arrow(sql_type: &str) -> Result<DataType, String> {
 
         // ── Integers ─────────────────────────────────────────────────────────
         "TINYINT" | "INT1" => {
-            if unsigned { Ok(DataType::UInt8) } else { Ok(DataType::Int8) }
+            if unsigned {
+                Ok(DataType::UInt8)
+            } else {
+                Ok(DataType::Int8)
+            }
         }
         "SMALLINT" | "INT2" | "SMALLSERIAL" | "SERIAL2" => {
-            if unsigned { Ok(DataType::UInt16) } else { Ok(DataType::Int16) }
+            if unsigned {
+                Ok(DataType::UInt16)
+            } else {
+                Ok(DataType::Int16)
+            }
         }
         "MEDIUMINT" | "INT" | "INTEGER" | "INT4" | "SERIAL" | "SERIAL4" => {
-            if unsigned { Ok(DataType::UInt32) } else { Ok(DataType::Int32) }
+            if unsigned {
+                Ok(DataType::UInt32)
+            } else {
+                Ok(DataType::Int32)
+            }
         }
         "BIGINT" | "INT8" | "BIGSERIAL" | "SERIAL8" => {
-            if unsigned { Ok(DataType::UInt64) } else { Ok(DataType::Int64) }
+            if unsigned {
+                Ok(DataType::UInt64)
+            } else {
+                Ok(DataType::Int64)
+            }
         }
         "YEAR" => Ok(DataType::Int16),
 
         // ── OID / system types ───────────────────────────────────────────────
-        "OID" | "XID" | "XID8" | "CID" | "REGCLASS" | "REGTYPE" | "REGPROC" => {
-            Ok(DataType::UInt32)
-        }
+        "OID" | "XID" | "XID8" | "CID" | "REGCLASS" | "REGTYPE" | "REGPROC" => Ok(DataType::UInt32),
 
         // ── Floating point ───────────────────────────────────────────────────
         "REAL" | "FLOAT" | "FLOAT4" => Ok(DataType::Float32),
@@ -152,9 +167,10 @@ pub fn sql_type_to_arrow(sql_type: &str) -> Result<DataType, String> {
         "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" | "DATETIME" => {
             Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
         }
-        "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => {
-            Ok(DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())))
-        }
+        "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => Ok(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        )),
         "INTERVAL" => Ok(DataType::Duration(TimeUnit::Microsecond)),
 
         // ── Binary ───────────────────────────────────────────────────────────
@@ -164,15 +180,14 @@ pub fn sql_type_to_arrow(sql_type: &str) -> Result<DataType, String> {
         // ── Text / string ────────────────────────────────────────────────────
         "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "CHAR" | "VARCHAR"
         | "CHARACTER VARYING" | "CHARACTER" | "NCHAR" | "NVARCHAR" | "JSON" | "JSONB"
-        | "JSONPATH" | "UUID" | "INET" | "CIDR" | "MACADDR" | "MACADDR8" | "XML"
-        | "TSVECTOR" | "TSQUERY" | "ENUM" | "SET" | "PG_LSN" | "PG_SNAPSHOT" => {
-            Ok(DataType::Utf8)
-        }
+        | "JSONPATH" | "UUID" | "INET" | "CIDR" | "MACADDR" | "MACADDR8" | "XML" | "TSVECTOR"
+        | "TSQUERY" | "ENUM" | "SET" | "PG_LSN" | "PG_SNAPSHOT" => Ok(DataType::Utf8),
 
         // ── Geometry / spatial ───────────────────────────────────────────────
         "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
-        | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "LINE" | "LSEG" | "BOX" | "PATH"
-        | "CIRCLE" => Ok(DataType::Binary),
+        | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "LINE" | "LSEG" | "BOX" | "PATH" | "CIRCLE" => {
+            Ok(DataType::Binary)
+        }
 
         // ── SQLite typeless columns return an empty string ───────────────────
         "" => Ok(DataType::Utf8),
@@ -256,6 +271,7 @@ mod tests {
         assert!(caps.projection);
         assert!(caps.filter);
         assert!(caps.limit);
+        assert!(caps.sort);
         assert!(!caps.aggregate);
         assert!(!caps.joins);
         assert_eq!(caps.dialect_name, "postgres");
@@ -287,12 +303,27 @@ mod tests {
 
     #[test]
     fn unsigned_integer_types_map_to_uint() {
-        assert_eq!(sql_type_to_arrow("TINYINT UNSIGNED").unwrap(), DataType::UInt8);
-        assert_eq!(sql_type_to_arrow("SMALLINT UNSIGNED").unwrap(), DataType::UInt16);
+        assert_eq!(
+            sql_type_to_arrow("TINYINT UNSIGNED").unwrap(),
+            DataType::UInt8
+        );
+        assert_eq!(
+            sql_type_to_arrow("SMALLINT UNSIGNED").unwrap(),
+            DataType::UInt16
+        );
         assert_eq!(sql_type_to_arrow("INT UNSIGNED").unwrap(), DataType::UInt32);
-        assert_eq!(sql_type_to_arrow("INTEGER UNSIGNED").unwrap(), DataType::UInt32);
-        assert_eq!(sql_type_to_arrow("BIGINT UNSIGNED").unwrap(), DataType::UInt64);
-        assert_eq!(sql_type_to_arrow("TINYINT(1) UNSIGNED").unwrap(), DataType::UInt8);
+        assert_eq!(
+            sql_type_to_arrow("INTEGER UNSIGNED").unwrap(),
+            DataType::UInt32
+        );
+        assert_eq!(
+            sql_type_to_arrow("BIGINT UNSIGNED").unwrap(),
+            DataType::UInt64
+        );
+        assert_eq!(
+            sql_type_to_arrow("TINYINT(1) UNSIGNED").unwrap(),
+            DataType::UInt8
+        );
         assert_eq!(sql_type_to_arrow("INT SIGNED").unwrap(), DataType::Int32);
     }
 
@@ -302,11 +333,17 @@ mod tests {
         assert_eq!(sql_type_to_arrow("FLOAT").unwrap(), DataType::Float32);
         assert_eq!(sql_type_to_arrow("FLOAT4").unwrap(), DataType::Float32);
         assert_eq!(sql_type_to_arrow("DOUBLE").unwrap(), DataType::Float64);
-        assert_eq!(sql_type_to_arrow("DOUBLE PRECISION").unwrap(), DataType::Float64);
+        assert_eq!(
+            sql_type_to_arrow("DOUBLE PRECISION").unwrap(),
+            DataType::Float64
+        );
         assert_eq!(sql_type_to_arrow("FLOAT8").unwrap(), DataType::Float64);
         assert_eq!(sql_type_to_arrow("NUMERIC").unwrap(), DataType::Float64);
         assert_eq!(sql_type_to_arrow("DECIMAL").unwrap(), DataType::Float64);
-        assert_eq!(sql_type_to_arrow("DECIMAL(10,2)").unwrap(), DataType::Float64);
+        assert_eq!(
+            sql_type_to_arrow("DECIMAL(10,2)").unwrap(),
+            DataType::Float64
+        );
         assert_eq!(sql_type_to_arrow("MONEY").unwrap(), DataType::Float64);
     }
 
@@ -362,8 +399,16 @@ mod tests {
     #[test]
     fn binary_types_map_to_binary() {
         for t in &[
-            "BYTEA", "BINARY", "VARBINARY", "TINYBLOB", "BLOB", "MEDIUMBLOB", "LONGBLOB",
-            "BIT", "VARBIT", "BIT VARYING",
+            "BYTEA",
+            "BINARY",
+            "VARBINARY",
+            "TINYBLOB",
+            "BLOB",
+            "MEDIUMBLOB",
+            "LONGBLOB",
+            "BIT",
+            "VARBIT",
+            "BIT VARYING",
         ] {
             assert_eq!(
                 sql_type_to_arrow(t).unwrap(),
@@ -376,10 +421,27 @@ mod tests {
     #[test]
     fn text_safe_types_map_to_utf8() {
         for t in &[
-            "TEXT", "TINYTEXT", "MEDIUMTEXT", "LONGTEXT", "CHAR", "VARCHAR",
-            "CHARACTER VARYING", "CHARACTER", "NCHAR", "NVARCHAR",
-            "JSON", "JSONB", "UUID", "INET", "CIDR", "MACADDR", "XML",
-            "TSVECTOR", "TSQUERY", "ENUM", "SET",
+            "TEXT",
+            "TINYTEXT",
+            "MEDIUMTEXT",
+            "LONGTEXT",
+            "CHAR",
+            "VARCHAR",
+            "CHARACTER VARYING",
+            "CHARACTER",
+            "NCHAR",
+            "NVARCHAR",
+            "JSON",
+            "JSONB",
+            "UUID",
+            "INET",
+            "CIDR",
+            "MACADDR",
+            "XML",
+            "TSVECTOR",
+            "TSQUERY",
+            "ENUM",
+            "SET",
         ] {
             assert_eq!(
                 sql_type_to_arrow(t).unwrap(),
@@ -392,9 +454,19 @@ mod tests {
     #[test]
     fn geometry_types_map_to_binary() {
         for t in &[
-            "GEOMETRY", "POINT", "LINESTRING", "POLYGON", "MULTIPOINT",
-            "MULTILINESTRING", "MULTIPOLYGON", "GEOMETRYCOLLECTION",
-            "LINE", "LSEG", "BOX", "PATH", "CIRCLE",
+            "GEOMETRY",
+            "POINT",
+            "LINESTRING",
+            "POLYGON",
+            "MULTIPOINT",
+            "MULTILINESTRING",
+            "MULTIPOLYGON",
+            "GEOMETRYCOLLECTION",
+            "LINE",
+            "LSEG",
+            "BOX",
+            "PATH",
+            "CIRCLE",
         ] {
             assert_eq!(
                 sql_type_to_arrow(t).unwrap(),
@@ -406,7 +478,9 @@ mod tests {
 
     #[test]
     fn oid_types_map_to_uint32() {
-        for t in &["OID", "XID", "XID8", "CID", "REGCLASS", "REGTYPE", "REGPROC"] {
+        for t in &[
+            "OID", "XID", "XID8", "CID", "REGCLASS", "REGTYPE", "REGPROC",
+        ] {
             assert_eq!(
                 sql_type_to_arrow(t).unwrap(),
                 DataType::UInt32,
@@ -431,7 +505,10 @@ mod tests {
         assert_eq!(sql_type_to_arrow("int").unwrap(), DataType::Int32);
         assert_eq!(sql_type_to_arrow("Boolean").unwrap(), DataType::Boolean);
         assert_eq!(sql_type_to_arrow("text").unwrap(), DataType::Utf8);
-        assert_eq!(sql_type_to_arrow("timestamp").unwrap(), DataType::Timestamp(TimeUnit::Microsecond, None));
+        assert_eq!(
+            sql_type_to_arrow("timestamp").unwrap(),
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
     }
 
     #[test]

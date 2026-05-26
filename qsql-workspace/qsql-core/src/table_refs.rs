@@ -379,8 +379,7 @@ mod tests {
 
     #[test]
     fn three_part_name_produces_no_refs() {
-        let refs =
-            extract_database_table_refs("SELECT * FROM catalog.schema.table").unwrap();
+        let refs = extract_database_table_refs("SELECT * FROM catalog.schema.table").unwrap();
         assert!(refs.is_empty(), "3-part names are not tracked");
     }
 
@@ -391,10 +390,8 @@ mod tests {
 
     #[test]
     fn derived_subquery_in_from_is_extracted() {
-        let refs = extract_database_table_refs(
-            "SELECT * FROM (SELECT * FROM pg.orders) sub",
-        )
-        .unwrap();
+        let refs =
+            extract_database_table_refs("SELECT * FROM (SELECT * FROM pg.orders) sub").unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].table_name, "orders");
     }

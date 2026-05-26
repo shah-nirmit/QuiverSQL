@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { DaemonClient } from './daemonClient';
 import { CatalogSource } from './models';
 import { SourceManager } from './sourceManager';
+import { treeIconFor, labelFor } from './providerIcons';
 
 const TABLE_TREE_PAGE_SIZE = 250;
 
@@ -9,7 +10,8 @@ export class DataSourceItem extends vscode.TreeItem {
     constructor(
         public readonly source: CatalogSource,
         public readonly tableName?: string,
-        public readonly loadMore: boolean = false
+        public readonly loadMore: boolean = false,
+        extensionUri?: vscode.Uri,
     ) {
         super(
             loadMore ? 'Load more tables...' : (tableName ? tableName : source.name),
@@ -26,18 +28,6 @@ export class DataSourceItem extends vscode.TreeItem {
             postgres:    'Postgres DB',
             mysql:       'MySQL DB',
             mariadb:     'MariaDB DB',
-        };
-
-        const icon: Record<string, string> = {
-            csv:         'table',
-            parquet:     'file-binary',
-            json:        'json',
-            ndjson:      'json',
-            sqlite:      'database',
-            fixed_width: 'file-text',
-            postgres:    'database',
-            mysql:       'database',
-            mariadb:     'database',
         };
 
         const isError = source.status === 'error';
@@ -85,11 +75,19 @@ export class DataSourceItem extends vscode.TreeItem {
                 }
 
                 this.tooltip = new vscode.MarkdownString(
-                    `**${source.name}**\n\n` +
+                    `**${source.name}** (${labelFor(source.kind)})\n\n` +
                     `Type: ${typeStr}\n\n` +
                     `Location: \`${location}\``
                 );
-                this.iconPath = new vscode.ThemeIcon(icon[source.kind] || 'database');
+                // When `extensionUri` is provided, treeIconFor returns a
+                // brand-specific SVG URI from media/icons/. When not (e.g.
+                // unit tests that construct items without going through
+                // DataSourcesProvider), it falls back to the generic
+                // `database` codicon — preserves the pre-refactor look for
+                // older call sites.
+                this.iconPath = extensionUri
+                    ? treeIconFor(extensionUri, source.kind)
+                    : new vscode.ThemeIcon('database');
             }
 
             this.contextValue = 'qsqlDataSource';
@@ -106,13 +104,19 @@ export class DataSourcesProvider
 
     private daemonClient?: DaemonClient;
     private sourceManager?: SourceManager;
+    private extensionUri?: vscode.Uri;
     private sources: CatalogSource[] = [];
     private loadedTables = new Map<string, string[]>();
     private hasMoreTables = new Map<string, boolean>();
 
-    public setContext(daemonClient: DaemonClient, sourceManager: SourceManager) {
+    public setContext(
+        daemonClient: DaemonClient,
+        sourceManager: SourceManager,
+        extensionUri?: vscode.Uri,
+    ) {
         this.daemonClient = daemonClient;
         this.sourceManager = sourceManager;
+        this.extensionUri = extensionUri;
     }
 
     public refresh(): void {
@@ -164,9 +168,11 @@ export class DataSourcesProvider
             }
             if (element.source.tables && element.source.tables.length > 0) {
                 const tables = this.tablesForSource(element.source);
-                const children = tables.map(table => new DataSourceItem(element.source, table));
+                const children = tables.map(
+                    table => new DataSourceItem(element.source, table, false, this.extensionUri),
+                );
                 if (this.hasMoreTables.get(element.source.name)) {
-                    children.push(new DataSourceItem(element.source, undefined, true));
+                    children.push(new DataSourceItem(element.source, undefined, true, this.extensionUri));
                 }
                 return children;
             }
@@ -239,7 +245,9 @@ export class DataSourcesProvider
 
             this.sources = mergedSources;
             this.pruneTableState(mergedSources);
-            return mergedSources.map(s => new DataSourceItem(s));
+            return mergedSources.map(
+                s => new DataSourceItem(s, undefined, false, this.extensionUri),
+            );
         } catch (e: any) {
             this.sources = [];
             const errorItem = new vscode.TreeItem(

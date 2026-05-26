@@ -654,11 +654,8 @@ mod tests {
         let path = create_temp_sqlite("native_sql_special");
         {
             let conn = Connection::open(&path).unwrap();
-            conn.execute(
-                "CREATE TABLE \"my table\" (id INTEGER)",
-                [],
-            )
-            .unwrap();
+            conn.execute("CREATE TABLE \"my table\" (id INTEGER)", [])
+                .unwrap();
         }
         let provider = SqliteTableProvider::try_new(&path, "my table")
             .await
@@ -727,16 +724,46 @@ mod tests {
 
     #[test]
     fn scalar_value_to_sql_covers_numeric_and_text() {
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Int8(Some(1))), Some("1".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Int16(Some(-5))), Some("-5".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Int32(Some(100))), Some("100".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Int64(Some(999))), Some("999".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt8(Some(2))), Some("2".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt16(Some(3))), Some("3".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt32(Some(4))), Some("4".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt64(Some(5))), Some("5".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Float32(Some(1.5))), Some("1.5".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Float64(Some(2.5))), Some("2.5".into()));
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Int8(Some(1))),
+            Some("1".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Int16(Some(-5))),
+            Some("-5".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Int32(Some(100))),
+            Some("100".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Int64(Some(999))),
+            Some("999".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::UInt8(Some(2))),
+            Some("2".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::UInt16(Some(3))),
+            Some("3".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::UInt32(Some(4))),
+            Some("4".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::UInt64(Some(5))),
+            Some("5".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Float32(Some(1.5))),
+            Some("1.5".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Float64(Some(2.5))),
+            Some("2.5".into())
+        );
         assert_eq!(
             scalar_value_to_sql(&ScalarValue::Utf8(Some("it's".into()))),
             Some("'it''s'".into())
@@ -745,16 +772,31 @@ mod tests {
             scalar_value_to_sql(&ScalarValue::LargeUtf8(Some("big".into()))),
             Some("'big'".into())
         );
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(Some(true))), Some("TRUE".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(Some(false))), Some("FALSE".into()));
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Boolean(Some(true))),
+            Some("TRUE".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Boolean(Some(false))),
+            Some("FALSE".into())
+        );
     }
 
     #[test]
     fn scalar_value_to_sql_null_variants_return_null() {
         assert_eq!(scalar_value_to_sql(&ScalarValue::Null), Some("NULL".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Int64(None)), Some("NULL".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Utf8(None)), Some("NULL".into()));
-        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(None)), Some("NULL".into()));
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Int64(None)),
+            Some("NULL".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Utf8(None)),
+            Some("NULL".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Boolean(None)),
+            Some("NULL".into())
+        );
     }
 
     #[test]
@@ -773,30 +815,31 @@ mod tests {
 
     #[test]
     fn physical_expr_to_sql_literal() {
-        let expr: Arc<dyn PhysicalExpr> =
-            Arc::new(Literal::new(ScalarValue::Int64(Some(42))));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(42))));
         assert_eq!(physical_expr_to_sql(&expr), Some("42".into()));
     }
 
     #[test]
     fn physical_expr_to_sql_binary_expr() {
         let left: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
-        let right: Arc<dyn PhysicalExpr> =
-            Arc::new(Literal::new(ScalarValue::Int64(Some(5))));
-        let expr: Arc<dyn PhysicalExpr> =
-            Arc::new(PhysBinaryExpr::new(left, Operator::Gt, right));
+        let right: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(5))));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(PhysBinaryExpr::new(left, Operator::Gt, right));
         assert_eq!(physical_expr_to_sql(&expr), Some("(`id` > 5)".into()));
     }
 
     #[test]
     fn physical_expr_to_sql_is_null_and_is_not_null() {
         let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("name", 1));
-        let is_null: Arc<dyn PhysicalExpr> =
-            Arc::new(IsNullExpr::new(Arc::clone(&col)));
-        let is_not_null: Arc<dyn PhysicalExpr> =
-            Arc::new(IsNotNullExpr::new(col));
-        assert_eq!(physical_expr_to_sql(&is_null), Some("`name` IS NULL".into()));
-        assert_eq!(physical_expr_to_sql(&is_not_null), Some("`name` IS NOT NULL".into()));
+        let is_null: Arc<dyn PhysicalExpr> = Arc::new(IsNullExpr::new(Arc::clone(&col)));
+        let is_not_null: Arc<dyn PhysicalExpr> = Arc::new(IsNotNullExpr::new(col));
+        assert_eq!(
+            physical_expr_to_sql(&is_null),
+            Some("`name` IS NULL".into())
+        );
+        assert_eq!(
+            physical_expr_to_sql(&is_not_null),
+            Some("`name` IS NOT NULL".into())
+        );
     }
 
     #[test]
@@ -840,14 +883,8 @@ mod tests {
 
     #[test]
     fn insert_where_clause_existing_where_before_order_by() {
-        let sql = insert_where_clause(
-            "SELECT * FROM t WHERE a = 1 ORDER BY id",
-            "x > 1",
-        );
-        assert_eq!(
-            sql,
-            "SELECT * FROM t WHERE a = 1 AND (x > 1) ORDER BY id"
-        );
+        let sql = insert_where_clause("SELECT * FROM t WHERE a = 1 ORDER BY id", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE a = 1 AND (x > 1) ORDER BY id");
     }
 
     // --- apply_physical_filters ---
@@ -862,8 +899,7 @@ mod tests {
     fn apply_physical_filters_injects_condition() {
         let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
         let lit: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(3))));
-        let expr: Arc<dyn PhysicalExpr> =
-            Arc::new(PhysBinaryExpr::new(col, Operator::GtEq, lit));
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(PhysBinaryExpr::new(col, Operator::GtEq, lit));
         let result = apply_physical_filters("SELECT * FROM t", &[expr]).unwrap();
         assert_eq!(result, "SELECT * FROM t WHERE (`id` >= 3)");
     }

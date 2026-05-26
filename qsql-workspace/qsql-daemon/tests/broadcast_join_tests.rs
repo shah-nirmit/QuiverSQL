@@ -53,8 +53,7 @@ fn create_csv(rows: &[(i64, &str, &str)]) -> String {
 }
 
 async fn create_sqlite_compensation(rows: &[(i64, f64, i64)]) -> String {
-    let path = std::env::temp_dir()
-        .join(format!("test_qsql_broadcast_comp_{}.db", temp_suffix()));
+    let path = std::env::temp_dir().join(format!("test_qsql_broadcast_comp_{}.db", temp_suffix()));
     let _ = std::fs::remove_file(&path);
     let conn = Connection::open(&path).unwrap();
     conn.execute(
@@ -88,10 +87,8 @@ async fn build_engine(
     // Wrap in GuardedTableProvider so the broadcast rewrite classifies this
     // side as Federated. The daemon does the same wrap during JIT
     // registration; tests bypass that path so we wrap inline.
-    let guarded: Arc<dyn TableProvider> = Arc::new(GuardedTableProvider::new(
-        "compensation",
-        Arc::new(sqlite),
-    ));
+    let guarded: Arc<dyn TableProvider> =
+        Arc::new(GuardedTableProvider::new("compensation", Arc::new(sqlite)));
     engine
         .register_table("compensation", guarded)
         .expect("register compensation");
@@ -176,8 +173,7 @@ async fn large_local_side_exceeds_cap_falls_back_to_unrewritten_plan() {
     let owned: Vec<(i64, &str, &str)> = rows.iter().map(|r| (r.0, r.1, r.2)).collect();
     let csv = create_csv(&owned);
 
-    let sqlite =
-        create_sqlite_compensation(&[(0, 1.0, 100), (1, 2.0, 200), (49, 3.0, 300)]).await;
+    let sqlite = create_sqlite_compensation(&[(0, 1.0, 100), (1, 2.0, 200), (49, 3.0, 300)]).await;
 
     let config = BroadcastRewriteConfig {
         enabled: true,
@@ -213,8 +209,7 @@ async fn large_local_side_exceeds_cap_falls_back_to_unrewritten_plan() {
 #[tokio::test]
 async fn empty_local_side_returns_zero_rows_with_rewrite_marked_applied() {
     let csv = create_csv(&[]);
-    let sqlite =
-        create_sqlite_compensation(&[(1, 1.0, 100), (2, 2.0, 200)]).await;
+    let sqlite = create_sqlite_compensation(&[(1, 1.0, 100), (2, 2.0, 200)]).await;
 
     let engine_on = build_engine(&csv, &sqlite, BroadcastRewriteConfig::default()).await;
     let engine_off = build_engine(&csv, &sqlite, BroadcastRewriteConfig::disabled()).await;
@@ -239,8 +234,7 @@ async fn empty_local_side_returns_zero_rows_with_rewrite_marked_applied() {
 #[tokio::test]
 async fn left_join_is_not_eligible_for_rewrite() {
     let csv = create_csv(&[(1, "Alice", "E"), (2, "Bob", "M")]);
-    let sqlite =
-        create_sqlite_compensation(&[(1, 1.0, 10), (2, 2.0, 20), (3, 3.0, 30)]).await;
+    let sqlite = create_sqlite_compensation(&[(1, 1.0, 10), (2, 2.0, 20), (3, 3.0, 30)]).await;
     let engine = build_engine(&csv, &sqlite, BroadcastRewriteConfig::default()).await;
 
     let sql = "SELECT u.id, u.name, c.bonus

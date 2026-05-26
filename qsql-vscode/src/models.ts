@@ -24,6 +24,7 @@ export interface ConnectorCapabilities {
     projection: boolean;
     filter: boolean;
     limit: boolean;
+    sort: boolean;
     aggregate: boolean;
     joins: boolean;
     dialect_name: string;
@@ -58,6 +59,12 @@ export interface QueryError {
     code: number;
     message: string;
     details?: string;
+}
+
+export const SCAN_GUARD_ERROR_CODE = -32100;
+
+export function isScanGuardError(err: QueryError): boolean {
+    return err.code === SCAN_GUARD_ERROR_CODE;
 }
 
 export interface ExplainResult {
@@ -140,12 +147,22 @@ export interface ExplainQueryRequest {
     include_native?: boolean;
 }
 
+export type ProviderKind = SourceKind | 'unknown';
+
+export interface SourcePlanEntry {
+    provider_kind: string;
+    native_sql: string;
+    native_explain: any;
+    dialect: string;
+}
+
 export interface ExplainQueryResult {
     sql: string;
     federated_plan: PlanGraph;
-    source_plans: Record<string, any>;
+    source_plans: Record<string, SourcePlanEntry>;
     raw: string;
     warnings: string[];
+    physical_plan_text?: string;
 }
 
 export interface PlanGraph {
@@ -165,6 +182,8 @@ export interface PlanNode {
     metrics: PlanMetrics;
     source_ref?: string;
     native_plan_ref?: string;
+    provider_kind?: string;
+    remote_sql?: string;
 }
 
 export interface PlanMetrics {

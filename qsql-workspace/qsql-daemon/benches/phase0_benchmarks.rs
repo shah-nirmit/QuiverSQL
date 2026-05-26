@@ -239,10 +239,9 @@ fn benchmark_broadcast_rewrite_csv_join_sqlite(c: &mut Criterion) {
                 .register_file("employees", &sample_path("employees.csv"), "csv")
                 .await
                 .expect("register employees");
-            let provider =
-                SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
-                    .await
-                    .expect("sqlite provider");
+            let provider = SqliteTableProvider::try_new(sample_path("demo.sqlite"), "compensation")
+                .await
+                .expect("sqlite provider");
             engine
                 .register_table("compensation", Arc::new(provider))
                 .expect("register sqlite");
@@ -263,7 +262,10 @@ fn benchmark_broadcast_rewrite_csv_join_sqlite(c: &mut Criterion) {
     group.bench_function("rewrite_on", |b| {
         b.iter(|| {
             RT.block_on(async {
-                let result = engine_on.execute_sql_to_json(sql).await.expect("rewrite_on");
+                let result = engine_on
+                    .execute_sql_to_json(sql)
+                    .await
+                    .expect("rewrite_on");
                 black_box(result);
             });
         });
@@ -271,12 +273,117 @@ fn benchmark_broadcast_rewrite_csv_join_sqlite(c: &mut Criterion) {
     group.bench_function("rewrite_off", |b| {
         b.iter(|| {
             RT.block_on(async {
-                let result = engine_off.execute_sql_to_json(sql).await.expect("rewrite_off");
+                let result = engine_off
+                    .execute_sql_to_json(sql)
+                    .await
+                    .expect("rewrite_off");
                 black_box(result);
             });
         });
     });
     group.finish();
+}
+
+fn benchmark_sort_pushdown(c: &mut Criterion) {
+    // Sort pushdown via datafusion-federation: ORDER BY + LIMIT reaches SQLite.
+    // Compare against an in-memory CSV sort so regressions are visible.
+    use rusqlite::Connection;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let sqlite_path = std::env::temp_dir().join(format!(
+        "bench_sort_sqlite_{}_{}.db",
+        std::process::id(),
+        nanos
+    ));
+    let csv_path = std::env::temp_dir().join(format!(
+        "bench_sort_csv_{}_{}.csv",
+        std::process::id(),
+        nanos
+    ));
+
+    // Create a 1K-row SQLite table inserted in reverse order (ensures sort is non-trivial).
+    {
+        let _ = std::fs::remove_file(&sqlite_path);
+        let conn = Connection::open(&sqlite_path).expect("open bench sqlite");
+        conn.execute_batch("CREATE TABLE items (id INTEGER, label TEXT)")
+            .unwrap();
+        for i in (1usize..=1000).rev() {
+            conn.execute(
+                "INSERT INTO items VALUES (?1, ?2)",
+                rusqlite::params![i as i64, format!("item_{}", i)],
+            )
+            .unwrap();
+        }
+    }
+
+    // Create a 1K-row CSV file in the same reverse order.
+    {
+        let mut f = std::fs::File::create(&csv_path).expect("create bench csv");
+        writeln!(f, "id,label").unwrap();
+        for i in (1usize..=1000).rev() {
+            writeln!(f, "{},item_{}", i, i).unwrap();
+        }
+    }
+
+    let sqlite_engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        let provider = SqliteTableProvider::try_new(sqlite_path.to_str().unwrap(), "items")
+            .await
+            .expect("sqlite provider");
+        engine
+            .register_table("items", Arc::new(provider))
+            .expect("register sqlite");
+        engine
+    });
+
+    let csv_engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        engine
+            .register_file("items", csv_path.to_str().unwrap(), "csv")
+            .await
+            .expect("register csv");
+        engine
+    });
+
+    let sort_sql = "SELECT id FROM items ORDER BY id DESC LIMIT 100";
+
+    let mut group = c.benchmark_group("sort_pushdown_sqlite_1k_rows");
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("order_by_desc_limit_100", |b| {
+        b.iter(|| {
+            RT.block_on(async {
+                let result = sqlite_engine
+                    .execute_sql_to_json(sort_sql)
+                    .await
+                    .expect("sort sqlite");
+                black_box(result);
+            });
+        });
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("sort_no_pushdown_csv_1k_rows");
+    group.throughput(Throughput::Elements(1000));
+    group.bench_function("order_by_desc_limit_100", |b| {
+        b.iter(|| {
+            RT.block_on(async {
+                let result = csv_engine
+                    .execute_sql_to_json(sort_sql)
+                    .await
+                    .expect("sort csv");
+                black_box(result);
+            });
+        });
+    });
+    group.finish();
+
+    let _ = std::fs::remove_file(&sqlite_path);
+    let _ = std::fs::remove_file(&csv_path);
 }
 
 fn benchmark_idle_daemon_rss_baseline(c: &mut Criterion) {
@@ -309,6 +416,7 @@ criterion_group! {
         benchmark_first_page_latency,
         benchmark_federated_join,
         benchmark_broadcast_rewrite_csv_join_sqlite,
+        benchmark_sort_pushdown,
         benchmark_idle_daemon_rss_baseline
 }
 criterion_main!(phase0);

@@ -131,7 +131,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     daemonClient = new DaemonClient(context);
     const sourceManager = new SourceManager(context, daemonClient);
-    dataSourcesProvider.setContext(daemonClient, sourceManager);
+    dataSourcesProvider.setContext(daemonClient, sourceManager, context.extensionUri);
 
     const lineageProvider = new LineageProvider(daemonClient, dataSourcesProvider);
     vscode.window.registerTreeDataProvider('qsqlLineage', lineageProvider);
@@ -359,7 +359,10 @@ export async function activate(context: vscode.ExtensionContext) {
                     }
                 });
             }
-            const result = await daemonClient.startQuery(sql);
+            const config = vscode.workspace.getConfiguration('qsql');
+            const pageSize = config.get<number>('defaultPageSize', 1000);
+            const timeoutMs = config.get<number>('remoteQueryTimeout', 30) * 1000;
+            const result = await daemonClient.startQuery(sql, { pageSize, timeoutMs });
             const duration = Date.now() - start;
 
             if (ResultGridPanel.currentPanel) {
@@ -371,7 +374,11 @@ export async function activate(context: vscode.ExtensionContext) {
             const { ResultGridPanel } = await import('./webviewPanel');
             ResultGridPanel.createOrShow(context.extensionUri);
             if (ResultGridPanel.currentPanel) {
-                ResultGridPanel.currentPanel.updateError(e.message || JSON.stringify(e), duration);
+                if (typeof e?.code === 'number') {
+                    ResultGridPanel.currentPanel.updateQueryError(e, duration);
+                } else {
+                    ResultGridPanel.currentPanel.updateError(e.message || JSON.stringify(e), duration);
+                }
             }
         }
     });
@@ -703,7 +710,26 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(codeLensProvider);
     context.subscriptions.push(activeEditorSub);
     context.subscriptions.push(selectionSub);
+    const configChangeSub = vscode.workspace.onDidChangeConfiguration(async (event) => {
+        if (event.affectsConfiguration('qsql')) {
+            console.log('QuiverSQL configuration changed. Restarting daemon...');
+            if (daemonClient) {
+                daemonClient.stop();
+                try {
+                    await daemonClient.start();
+                    vscode.window.showInformationMessage('QuiverSQL Daemon restarted with new configurations.');
+                    // Replay persistent sources since daemon restarted
+                    await sourceManager.replaySources();
+                    dataSourcesProvider.refresh();
+                } catch (err: any) {
+                    vscode.window.showErrorMessage(`Failed to restart QuiverSQL Daemon: ${err.message || err}`);
+                }
+            }
+        }
+    });
+    context.subscriptions.push(configChangeSub);
     context.subscriptions.push(documentEditSub);
+
     context.subscriptions.push({ dispose: () => {
         if (debounceTimer) clearTimeout(debounceTimer);
         daemonClient?.stop();

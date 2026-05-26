@@ -679,7 +679,26 @@ fn sqlite_explain_uses_qualified_source_plan_keys() {
     );
 
     let result = &explain["result"];
-    assert!(result["source_plans"]["my_sqlite.items"].is_string());
+    // After the explain-plan revamp, source_plans values are typed
+    // SourcePlanEntry objects ({provider_kind, native_sql, native_explain,
+    // dialect}) rather than bare strings. The key is still the qualified
+    // table name; the underlying remote EXPLAIN ends up in `native_explain`.
+    let entry = &result["source_plans"]["my_sqlite.items"];
+    assert!(
+        entry.is_object(),
+        "expected SourcePlanEntry object, got {entry}"
+    );
+    assert_eq!(entry["provider_kind"], "sqlite");
+    assert!(
+        entry["native_explain"].is_string() || entry["native_explain"].is_object(),
+        "expected native_explain populated, got {}",
+        entry["native_explain"]
+    );
+    assert!(
+        entry["native_sql"].is_string() && entry["native_sql"].as_str().unwrap().contains("items"),
+        "expected native_sql to mention the items table, got {}",
+        entry["native_sql"]
+    );
     assert!(result["source_plans"]["items"].is_null());
 
     let nodes = result["federated_plan"]["nodes"].as_object().unwrap();
@@ -714,7 +733,10 @@ fn execute_syntax_error_returns_error_response() {
     assert_eq!(response["jsonrpc"], "2.0");
     assert_eq!(response["id"], 300);
     assert!(response.get("result").is_none() || response["result"].is_null());
-    assert!(response["error"]["code"].as_i64().is_some(), "expected an error code");
+    assert!(
+        response["error"]["code"].as_i64().is_some(),
+        "expected an error code"
+    );
 }
 
 #[test]

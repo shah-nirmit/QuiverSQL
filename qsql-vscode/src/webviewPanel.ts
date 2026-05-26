@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { QueryPage } from './models';
+import { QueryPage, QueryError, isScanGuardError } from './models';
 
 export class ResultGridPanel {
     public static currentPanel: ResultGridPanel | undefined;
@@ -98,6 +98,10 @@ export class ResultGridPanel {
         this._panel.webview.html = this._getErrorHtml(errorMsg, durationMs);
     }
 
+    public updateQueryError(error: QueryError, durationMs: number) {
+        this._panel.webview.html = this._getErrorHtml(error.message, durationMs, error);
+    }
+
     public dispose() {
         ResultGridPanel.currentPanel = undefined;
         this._panel.dispose();
@@ -129,7 +133,17 @@ export class ResultGridPanel {
         </html>`;
     }
 
-    private _getErrorHtml(errorMsg: string, durationMs: number) {
+    private _getErrorHtml(errorMsg: string, durationMs: number, error?: QueryError) {
+        const scanGuardHint = error && isScanGuardError(error)
+            ? `<div class="scan-guard-hint">
+                <strong>&#9888; Scan budget exceeded</strong> &mdash; to resolve:
+                <ul>
+                    <li>Add a <code>LIMIT</code> clause to your query</li>
+                    <li>Add a <code>WHERE</code> filter to narrow the result set</li>
+                    <li>Raise the source scan budget in QuiverSQL settings</li>
+                </ul>
+            </div>`
+            : '';
         return `<!DOCTYPE html>
         <html lang="en">
         <head>
@@ -137,11 +151,11 @@ export class ResultGridPanel {
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <title>Results</title>
             <style>
-                body { 
-                    margin: 0; 
-                    padding: 0; 
-                    height: 100vh; 
-                    display: flex; 
+                body {
+                    margin: 0;
+                    padding: 0;
+                    height: 100vh;
+                    display: flex;
                     flex-direction: column;
                     background-color: var(--vscode-editor-background);
                     color: var(--vscode-editor-foreground);
@@ -185,6 +199,24 @@ export class ResultGridPanel {
                 .duration-text {
                     color: var(--vscode-editor-foreground);
                 }
+                .scan-guard-hint {
+                    background-color: var(--vscode-inputValidation-warningBackground, rgba(255,204,0,0.15));
+                    border: 1px solid var(--vscode-inputValidation-warningBorder, #b89500);
+                    border-radius: 3px;
+                    padding: 8px 12px;
+                    margin-bottom: 10px;
+                    font-family: var(--vscode-editor-font-family, 'Segoe UI', sans-serif);
+                }
+                .scan-guard-hint ul {
+                    margin: 4px 0 0 0;
+                    padding-left: 20px;
+                }
+                .scan-guard-hint code {
+                    font-family: var(--vscode-editor-font-family, 'Consolas', monospace);
+                    background: var(--vscode-textCodeBlock-background, rgba(0,0,0,0.1));
+                    padding: 1px 4px;
+                    border-radius: 2px;
+                }
             </style>
         </head>
         <body>
@@ -196,9 +228,10 @@ export class ResultGridPanel {
             <div id="results" class="tab-content">
                 <div style="padding: 10px; color: var(--vscode-descriptionForeground);">No results due to error.</div>
             </div>
-            
+
             <div id="messages" class="tab-content active">
                 <div class="messages-view">
+                    ${scanGuardHint}
                     <span class="error-text">Msg 1, Level 16, State 1, Line 1<br/>${formatErrorMessage(errorMsg)}</span><br/><br/>
                     <span class="duration-text">Total execution time: 00:00:00.${durationMs.toString().padStart(3, '0')}</span>
                 </div>
@@ -432,6 +465,14 @@ export function renderQueryPageHtml(page: QueryPage, durationMs: number): string
 
 export function formatErrorMessage(errorMsg: string): string {
     return escapeHtml(errorMsg).replace(/\n/g, '<br/>');
+}
+
+/** Exported for unit testing: renders the error HTML for a given error message and optional QueryError. */
+export function renderErrorHtml(errorMsg: string, durationMs: number, error?: QueryError): string {
+    const scanGuardHint = error && isScanGuardError(error)
+        ? `<div class="scan-guard-hint">Scan budget exceeded`
+        : '';
+    return `${scanGuardHint}${formatErrorMessage(errorMsg)}`;
 }
 
 export function escapeHtml(value: string): string {
