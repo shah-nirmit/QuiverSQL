@@ -20,8 +20,6 @@ async-trait = "0.1"
 
 [features]
 default = []
-postgres = ["qsql-connectors/postgres", "qsql-core/postgres"]
-mysql = ["qsql-connectors/mysql", "qsql-core/mysql"]
 
 [dev-dependencies]
 criterion = "0.5"

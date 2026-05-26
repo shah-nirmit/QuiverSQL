@@ -65,8 +65,6 @@ Completed verification:
 
 Completed verification:
 - `cargo test --locked --workspace`
-- `cargo test --locked -p qsql-connectors`
-- `cargo test --locked --workspace --features postgres,mysql`
 - `npm run typecheck`
 - `npm run lint`
 - `npm run test`
@@ -106,7 +104,6 @@ Phase 5 defaults and constraints:
 
 Completed verification:
 - `cargo test --locked --workspace`
-- `cargo test --locked --workspace --features postgres,mysql`
 - `npm run typecheck`
 - `npm run test`
 
@@ -149,7 +146,7 @@ Phase 6.2 absorbs the principal architecture review before Phase 7. The order is
 - Credential safety: malformed DSNs and source errors never leak password literals in JSON-RPC responses.
 - Federation safety: scan guards block estimated over-budget remote scans. Broadcast-join rewrite parity is enforced by `qsql-workspace/qsql-daemon/tests/broadcast_join_tests.rs`, which asserts byte-for-byte sorted row equality between rewrite-on and rewrite-off runs across CSV ⋈ SQLite, plus cap-overflow fallback, empty-local-side EmptyRelation substitution, and LEFT-JOIN ineligibility cases. Explain visibility flows through `ExplainQueryResult.broadcast_rewrites`, plan-graph node attributes, and the VS Code badge in `planVisualizationPanel.ts`.
 - Plan safety: a synthetic 10K-node plan returns `truncated: true` and the webview shows a clear warning.
-- Compatibility: `cargo test --locked --workspace`, `cargo test --locked --workspace --features postgres,mysql`, `npm run typecheck`, `npm run test`, and benchmark compile smoke remain green with no material regression.
+- Compatibility: `cargo test --locked --workspace`, `npm run typecheck`, `npm run test`, and benchmark compile smoke remain green with no material regression.
 
 ### Phase 7: Sort/Top-K Pushdown And Guard UX
 - Verify whether upstream providers already push simple `ORDER BY` plus optional `LIMIT`; if so, focus on parity tests, explain visibility, and user-facing metrics.

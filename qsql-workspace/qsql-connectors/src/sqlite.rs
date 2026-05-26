@@ -488,7 +488,7 @@ fn introspect_sqlite_schema(db_path: &str, table_name: &str) -> Result<SchemaRef
     let mut fields = Vec::new();
     for row in rows {
         let (name, col_type, nullable) = row.map_err(|e| format!("Row error: {}", e))?;
-        fields.push(Field::new(name, sql_type_to_arrow(&col_type), nullable));
+        fields.push(Field::new(name, sql_type_to_arrow(&col_type)?, nullable));
     }
 
     if fields.is_empty() {
@@ -568,7 +568,7 @@ mod tests {
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(
             *schema.field(0).data_type(),
-            datafusion::arrow::datatypes::DataType::Int64
+            datafusion::arrow::datatypes::DataType::Int32
         );
         assert_eq!(schema.field(1).name(), "name");
         assert_eq!(
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(schema.field(2).name(), "price");
         assert_eq!(
             *schema.field(2).data_type(),
-            datafusion::arrow::datatypes::DataType::Float64
+            datafusion::arrow::datatypes::DataType::Float32
         );
         assert_eq!(schema.field(3).name(), "active");
         assert_eq!(

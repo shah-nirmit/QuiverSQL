@@ -685,9 +685,7 @@ mod tests {
 
     #[test]
     fn build_plan_graph_with_broadcast_stamps_filter_node() {
-        use datafusion::common::Column;
-        use datafusion::logical_expr::expr::InList;
-        use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+        use datafusion::logical_expr::LogicalPlanBuilder;
         use qsql_core::broadcast::{BroadcastApplication, BroadcastRewriteInfo};
 
         // Build a plan: EmptyRelation → Filter(user_id IN (1))

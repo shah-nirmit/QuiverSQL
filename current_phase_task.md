@@ -86,7 +86,7 @@ All items below — including the items that were previously struck for deferral
 - [x] Plan-truncation test: synthetic 10K-node plan returns `truncated: true` and webview warning text.
 - [x] Large-schema test: table-list truncation is surfaced and lazy tree pagination retrieves additional tables.
 - [x] Transport tests: JSON-RPC `Content-Length` framing handles large responses and embedded newlines.
-- [x] Existing suites: `cargo test --locked --workspace`, `cargo test --locked --workspace --features postgres,mysql`, `npm run typecheck`, `npm run test`, and Criterion benchmark compile smoke.
+- [x] Existing suites: `cargo test --locked --workspace`, `npm run typecheck`, `npm run test`, and Criterion benchmark compile smoke.
   Acceptance: all four suites pass. `cargo bench --no-run -p qsql-daemon --bench phase0_benchmarks` now compiles end-to-end (warm rebuild ~1.5 min, cold first build ~49 min) — gated by `[profile.bench]` overrides in `qsql-workspace/Cargo.toml` (opt-level=1, codegen-units=256, lto=false, incremental=true) and added as a CI step in `.github/workflows/ci.yml`. The bench file itself was refactored for engine/Runtime reuse with `Throughput` annotations and now includes two new benches: `broadcast_rewrite_csv_join_sqlite` (rewrite_on vs rewrite_off) and `idle_process_rss_baseline`.
 
 ## Defaults

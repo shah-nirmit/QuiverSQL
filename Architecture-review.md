@@ -555,7 +555,7 @@ End-to-end gates the new work should pass, in order:
 
 7. **Phase 5 truncation contract.** Generate a synthetic 10K-node plan, verify the explain response includes `truncated: true` and the webview displays the warning (P1-6).
 
-8. **Existing test suites stay green.** `cargo test --locked --workspace`, `cargo test --locked --workspace --features postgres,mysql`, `npm run test`, `npm run typecheck`.
+8. **Existing test suites stay green.** `cargo test --locked --workspace`, `npm run test`, `npm run typecheck`.
 
 9. **Benchmarks regress no more than 5%** on the existing Phase 0 suite. Track via the CI artifact already planned in Phase 11.
 

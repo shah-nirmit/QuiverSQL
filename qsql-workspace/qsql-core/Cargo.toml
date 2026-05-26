@@ -16,5 +16,3 @@ sqlparser = { version = "0.62.0", features = ["visitor"] }
 
 [features]
 default = []
-postgres = []
-mysql = []

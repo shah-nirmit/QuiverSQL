@@ -111,26 +111,22 @@ Important: PowerShell's `set QSQL_POSTGRES_URL=...` does not set an environment
 variable that Cargo can inherit. It creates a PowerShell variable instead, so
 the Rust tests will behave as if the database URL is missing.
 
-## Cargo Commands
-
-Run these from `qsql-workspace`.
-
-Feature-enabled connector tests:
+Connector tests:
 
 ```powershell
-cargo test --locked -p qsql-connectors --features postgres,mysql
+cargo test --locked -p qsql-connectors
 ```
 
-Feature-enabled daemon tests:
+Daemon tests:
 
 ```powershell
-cargo test --locked -p qsql-daemon --features postgres,mysql
+cargo test --locked -p qsql-daemon
 ```
 
-Full feature-enabled workspace test run:
+Full workspace test run:
 
 ```powershell
-cargo test --locked --workspace --features postgres,mysql
+cargo test --locked --workspace
 ```
 
 When the environment variables are missing, these commands report the live tests
@@ -165,7 +161,7 @@ If you intentionally want to run tests that are currently ignored, use Rust's
 standard ignored-test flag:
 
 ```powershell
-cargo test --locked -p qsql-connectors --features postgres,mysql -- --ignored
+cargo test --locked -p qsql-connectors -- --ignored
 ```
 
 If you force ignored live tests without setting the environment variables, they
@@ -225,12 +221,6 @@ If tests say the URLs are not set, check that you used the syntax for your shell
 - PowerShell: `$env:QSQL_POSTGRES_URL="..."`
 - `cmd.exe`: `set QSQL_POSTGRES_URL=...`
 - Bash: `export QSQL_POSTGRES_URL="..."`
-
-If Cargo says a feature is unknown, make sure the feature name is exactly:
-
-```text
-postgres,mysql
-```
 
 If a test hangs or cannot connect, confirm Docker is publishing ports:
 
