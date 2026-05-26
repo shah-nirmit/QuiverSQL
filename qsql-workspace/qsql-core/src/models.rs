@@ -226,6 +226,153 @@ pub fn build_query_page(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn make_result(rows: usize) -> QueryExecutionResult {
+        QueryExecutionResult {
+            schema: Schema {
+                fields: vec![SchemaField {
+                    name: "x".to_string(),
+                    data_type: "Int64".to_string(),
+                    nullable: false,
+                }],
+            },
+            data: (0..rows).map(|i| json!(i)).collect(),
+            metrics: PerformanceMetrics {
+                planning_time_ms: 1,
+                execution_time_ms: 2,
+                first_page_time_ms: 3,
+                rows_produced: rows as u64,
+                rows_returned: rows as u64,
+            },
+        }
+    }
+
+    #[test]
+    fn normalize_page_size_defaults_to_default_page_size() {
+        let (size, warn) = normalize_page_size(None).unwrap();
+        assert_eq!(size, DEFAULT_PAGE_SIZE);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn normalize_page_size_zero_is_error() {
+        assert!(normalize_page_size(Some(0)).is_err());
+    }
+
+    #[test]
+    fn normalize_page_size_clamps_over_max() {
+        let (size, warn) = normalize_page_size(Some(MAX_PAGE_SIZE + 1)).unwrap();
+        assert_eq!(size, MAX_PAGE_SIZE);
+        assert!(warn.is_some());
+        assert!(warn.unwrap().contains(&(MAX_PAGE_SIZE + 1).to_string()));
+    }
+
+    #[test]
+    fn normalize_page_size_exact_max_is_accepted() {
+        let (size, warn) = normalize_page_size(Some(MAX_PAGE_SIZE)).unwrap();
+        assert_eq!(size, MAX_PAGE_SIZE);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn normalize_page_size_normal_value_passes_through() {
+        let (size, warn) = normalize_page_size(Some(500)).unwrap();
+        assert_eq!(size, 500);
+        assert!(warn.is_none());
+    }
+
+    #[test]
+    fn build_query_page_first_page() {
+        let result = make_result(10);
+        let page = build_query_page("q1", &result, 0, 3, None);
+        assert_eq!(page.data.len(), 3);
+        assert_eq!(page.page_index, 0);
+        assert!(!page.is_last);
+        assert_eq!(page.metrics.rows_returned, 3);
+    }
+
+    #[test]
+    fn build_query_page_last_partial_page() {
+        let result = make_result(10);
+        let page = build_query_page("q1", &result, 3, 3, None);
+        // page 3: rows 9..10 → 1 row
+        assert_eq!(page.data.len(), 1);
+        assert!(page.is_last);
+    }
+
+    #[test]
+    fn build_query_page_beyond_end_is_empty_and_last() {
+        let result = make_result(5);
+        let page = build_query_page("q1", &result, 10, 3, None);
+        assert!(page.data.is_empty());
+        assert!(page.is_last);
+    }
+
+    #[test]
+    fn build_query_page_warning_is_propagated() {
+        let result = make_result(1);
+        let page = build_query_page("q1", &result, 0, 100, Some("capped".to_string()));
+        assert_eq!(page.warning.as_deref(), Some("capped"));
+    }
+
+    #[test]
+    fn serde_round_trip_catalog_source() {
+        let src = CatalogSource {
+            name: "db1".to_string(),
+            kind: SourceKind::Postgres,
+            connection_details: json!({"host": "localhost"}),
+            schema: None,
+            capabilities: None,
+            status: "ok".to_string(),
+            error: None,
+            tables: Some(vec!["t1".to_string()]),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let back: CatalogSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.name, src.name);
+        assert_eq!(back.tables, src.tables);
+    }
+
+    #[test]
+    fn serde_round_trip_remove_source() {
+        let req = RemoveSourceRequest { name: "s1".to_string() };
+        let res = RemoveSourceResult { name: "s1".to_string(), removed: true };
+        let req2: RemoveSourceRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let res2: RemoveSourceResult = serde_json::from_str(&serde_json::to_string(&res).unwrap()).unwrap();
+        assert_eq!(req2.name, "s1");
+        assert!(res2.removed);
+    }
+
+    #[test]
+    fn serde_round_trip_list_source_tables() {
+        let req = ListSourceTablesRequest { name: "db".to_string(), offset: Some(5), limit: Some(10) };
+        let result = ListSourceTablesResult {
+            name: "db".to_string(),
+            tables: vec!["a".to_string(), "b".to_string()],
+            offset: 5,
+            limit: 10,
+            total_known: Some(20),
+            truncated: false,
+        };
+        let req2: ListSourceTablesRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        let res2: ListSourceTablesResult = serde_json::from_str(&serde_json::to_string(&result).unwrap()).unwrap();
+        assert_eq!(req2.offset, Some(5));
+        assert_eq!(res2.tables.len(), 2);
+        assert_eq!(res2.total_known, Some(20));
+    }
+
+    #[test]
+    fn serde_round_trip_get_source_metadata_request() {
+        let req = GetSourceMetadataRequest { name: "src".to_string() };
+        let req2: GetSourceMetadataRequest = serde_json::from_str(&serde_json::to_string(&req).unwrap()).unwrap();
+        assert_eq!(req2.name, "src");
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogSource {
     pub name: String,

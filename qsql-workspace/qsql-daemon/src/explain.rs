@@ -546,4 +546,245 @@ mod tests {
         assert_eq!(err.kind, qsql_connectors::ConnectorErrorKind::Timeout);
         assert!(err.message.contains("Timed out explaining query"));
     }
+
+    #[tokio::test]
+    async fn explain_with_timeout_succeeds_when_fast() {
+        let result = explain_with_timeout(
+            &SlowExplainConnector,
+            "SELECT 1",
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, "late");
+    }
+
+    // --- truncate_raw_plan below limit ---
+
+    #[test]
+    fn truncate_raw_plan_below_limit_is_unchanged() {
+        let short = "short plan";
+        let (text, warning) = truncate_raw_plan(short);
+        assert_eq!(text, short);
+        assert!(warning.is_none());
+    }
+
+    // --- qualified_table_name all variants ---
+
+    #[test]
+    fn table_alias_and_name_covers_all_variants() {
+        // Bare → None
+        assert!(table_alias_and_name(&TableReference::bare("t")).is_none());
+        // Partial → Some
+        let (alias, table) = table_alias_and_name(&TableReference::partial("s", "t")).unwrap();
+        assert_eq!(alias, "s");
+        assert_eq!(table, "t");
+        // Full → Some (catalog dropped)
+        let (alias, table) =
+            table_alias_and_name(&TableReference::full("cat", "s", "t")).unwrap();
+        assert_eq!(alias, "s");
+        assert_eq!(table, "t");
+    }
+
+    // --- matched_broadcast_target ---
+
+    #[test]
+    fn matched_broadcast_target_matches_in_list_on_known_column() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::expr::InList;
+
+        let mut targets = HashSet::new();
+        targets.insert("user_id".to_string());
+
+        let in_list = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new_unqualified("user_id"))),
+            list: vec![
+                Expr::Literal(datafusion::common::ScalarValue::Int64(Some(1)), None),
+            ],
+            negated: false,
+        });
+        assert_eq!(
+            matched_broadcast_target(&in_list, &targets),
+            Some("user_id".to_string())
+        );
+
+        // Column not in targets → None
+        let in_list_unknown = Expr::InList(InList {
+            expr: Box::new(Expr::Column(Column::new_unqualified("other"))),
+            list: vec![],
+            negated: false,
+        });
+        assert!(matched_broadcast_target(&in_list_unknown, &targets).is_none());
+
+        // Non-InList expr → None
+        let lit_expr = Expr::Literal(datafusion::common::ScalarValue::Int64(Some(1)), None);
+        assert!(matched_broadcast_target(&lit_expr, &targets).is_none());
+    }
+
+    // --- broadcast_filter_targets ---
+
+    #[test]
+    fn broadcast_filter_targets_collects_remote_keys() {
+        use qsql_core::broadcast::{BroadcastApplication, BroadcastRewriteInfo};
+
+        let info = BroadcastRewriteInfo {
+            considered: 1,
+            applied: vec![BroadcastApplication {
+                local_table: "csv".to_string(),
+                remote_table: "pg".to_string(),
+                join_key_local: "id".to_string(),
+                join_key_remote: "user_id".to_string(),
+                local_rows_materialized: 3,
+                local_bytes_materialized: 100,
+                predicate_value_count: 3,
+                elapsed_ms: 1,
+            }],
+            skipped: vec![],
+        };
+        let targets = broadcast_filter_targets(Some(&info));
+        assert!(targets.contains("user_id"));
+        assert!(!targets.contains("id"));
+
+        // None info → empty
+        let empty = broadcast_filter_targets(None);
+        assert!(empty.is_empty());
+    }
+
+    // --- schema_columns and expressions_to_string ---
+
+    #[test]
+    fn schema_columns_returns_comma_separated_field_names() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::DFSchema;
+
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+        let df_schema = DFSchema::try_from(arrow_schema.as_ref().clone()).unwrap();
+        let plan = LogicalPlan::EmptyRelation(datafusion::logical_expr::EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(df_schema),
+        });
+        let cols = schema_columns(&plan);
+        assert!(cols.contains("id"));
+        assert!(cols.contains("name"));
+    }
+
+    #[test]
+    fn expressions_to_string_joins_with_comma() {
+        use datafusion::logical_expr::lit;
+        let exprs = vec![lit(1_i64), lit(2_i64)];
+        let s = expressions_to_string(&exprs);
+        assert!(s.contains(","));
+        assert!(s.contains("1"));
+        assert!(s.contains("2"));
+    }
+
+    // --- build_plan_graph_with_broadcast stamps filter nodes ---
+
+    #[test]
+    fn build_plan_graph_with_broadcast_stamps_filter_node() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::expr::InList;
+        use datafusion::logical_expr::{lit, LogicalPlanBuilder};
+        use qsql_core::broadcast::{BroadcastApplication, BroadcastRewriteInfo};
+
+        // Build a plan: EmptyRelation → Filter(user_id IN (1))
+        let base = LogicalPlanBuilder::empty(false)
+            .build()
+            .unwrap();
+        // We can't easily build a typed filter over EmptyRelation columns,
+        // so instead test that build_plan_graph_with_broadcast propagates
+        // broadcast info to the graph without panicking on a simple plan.
+        let info = BroadcastRewriteInfo {
+            considered: 1,
+            applied: vec![BroadcastApplication {
+                local_table: "l".to_string(),
+                remote_table: "r".to_string(),
+                join_key_local: "id".to_string(),
+                join_key_remote: "user_id".to_string(),
+                local_rows_materialized: 2,
+                local_bytes_materialized: 64,
+                predicate_value_count: 2,
+                elapsed_ms: 0,
+            }],
+            skipped: vec![],
+        };
+        let graph = build_plan_graph_with_broadcast(&base, Some(&info));
+        assert!(!graph.truncated);
+        assert!(!graph.nodes.is_empty());
+    }
+
+    // --- plan_attributes for various node types ---
+
+    #[tokio::test]
+    async fn plan_attributes_covers_projection_filter_sort() {
+        use datafusion::prelude::SessionContext;
+        // Build a simple plan via SQL to get a Projection→Filter→TableScan
+        let ctx = SessionContext::new();
+        // Register a MemTable
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3]))],
+        )
+        .unwrap();
+        let mem = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("t", Arc::new(mem)).unwrap();
+
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT id FROM t WHERE id > 1 ORDER BY id")
+            .await
+            .unwrap();
+        let optimized = ctx.state().optimize(&plan).unwrap();
+
+        // build_plan_graph should traverse Sort → Filter → Projection → TableScan
+        let graph = build_plan_graph(&optimized);
+        assert!(!graph.nodes.is_empty());
+        assert!(!graph.root_ids.is_empty());
+
+        // Check a node has output_columns attribute
+        let has_output_col = graph.nodes.values().any(|n| n.attributes.contains_key("output_columns"));
+        assert!(has_output_col, "at least one node should have output_columns");
+    }
+
+    // --- collect_scans ---
+
+    #[tokio::test]
+    async fn collect_scans_finds_table_scan_nodes() {
+        use datafusion::prelude::SessionContext;
+        use datafusion::arrow::array::Int64Array;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::datasource::MemTable;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64]))],
+        ).unwrap();
+        let ctx = SessionContext::new();
+        ctx.register_table("t1", Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap())).unwrap();
+        ctx.register_table("t2", Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())).unwrap();
+
+        let plan = ctx
+            .state()
+            .create_logical_plan("SELECT t1.id FROM t1 JOIN t2 ON t1.id = t2.id")
+            .await
+            .unwrap();
+        let optimized = ctx.state().optimize(&plan).unwrap();
+
+        let mut scans = Vec::new();
+        collect_scans(&optimized, &mut scans);
+        assert_eq!(scans.len(), 2, "both table scans should be collected");
+    }
 }

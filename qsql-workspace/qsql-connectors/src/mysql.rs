@@ -447,4 +447,48 @@ mod tests {
             .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
+
+    #[test]
+    fn mysql_connector_type_for_mysql_dialect() {
+        let connector = MySqlConnector::mysql("mysql://root:pw@localhost/mydb");
+        assert_eq!(connector.connector_type(), "mysql");
+    }
+
+    #[test]
+    fn mariadb_connector_type_is_mariadb() {
+        let connector = MySqlConnector::mariadb("mysql://root:pw@localhost/mydb");
+        assert_eq!(connector.connector_type(), "mariadb");
+    }
+
+    #[test]
+    fn mariadb_constructor_sets_mariadb_dialect() {
+        let connector = MySqlConnector::mariadb("mysql://root:pw@localhost/mydb");
+        assert_eq!(connector.dialect(), SqlDialectKind::Mariadb);
+    }
+
+    #[test]
+    fn mysql_constructor_sets_mysql_dialect() {
+        let connector = MySqlConnector::mysql("mysql://root:pw@localhost/mydb");
+        assert_eq!(connector.dialect(), SqlDialectKind::Mysql);
+    }
+
+    #[test]
+    fn mysql_capabilities_reports_mysql_dialect() {
+        let connector = MySqlConnector::mysql("mysql://localhost/mydb");
+        let caps = connector.capabilities();
+        assert!(caps.filter, "MySQL should support filter pushdown");
+        assert_eq!(caps.dialect_name, "mysql");
+    }
+
+    #[test]
+    fn mysql_pool_params_sslmode_not_duplicated_when_present() {
+        let params = mysql_pool_params("mysql://root:pw@localhost/mydb?sslmode=required");
+        assert!(!params.contains_key("sslmode"), "sslmode already in URL, should not be inserted separately");
+    }
+
+    #[test]
+    fn mysql_pool_with_malformed_url_returns_error() {
+        let connector = MySqlConnector::mysql("not a valid url !!!");
+        assert!(connector.pool().is_err(), "malformed URL should fail");
+    }
 }

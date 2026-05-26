@@ -165,4 +165,86 @@ mod tests {
             "SELECT * FROM `products`"
         );
     }
+
+    #[test]
+    fn dialect_name_covers_all_variants() {
+        assert_eq!(SqlDialectKind::Sqlite.name(), "sqlite");
+        assert_eq!(SqlDialectKind::Postgres.name(), "postgres");
+        assert_eq!(SqlDialectKind::Mysql.name(), "mysql");
+        assert_eq!(SqlDialectKind::Mariadb.name(), "mariadb");
+    }
+
+    #[test]
+    fn dialect_quote_char_covers_all_variants() {
+        assert_eq!(SqlDialectKind::Sqlite.quote_char(), '`');
+        assert_eq!(SqlDialectKind::Postgres.quote_char(), '"');
+        assert_eq!(SqlDialectKind::Mysql.quote_char(), '`');
+        assert_eq!(SqlDialectKind::Mariadb.quote_char(), '`');
+    }
+
+    #[test]
+    fn sql_table_ref_to_sql_whitespace_schema_falls_back_to_bare() {
+        let r = SqlTableRef {
+            schema: Some("  ".to_string()),
+            table: "orders".to_string(),
+        };
+        assert_eq!(r.to_sql(SqlDialectKind::Sqlite), "`orders`");
+    }
+
+    #[test]
+    fn sql_capabilities_reflects_dialect_name() {
+        let caps = sql_capabilities(SqlDialectKind::Postgres);
+        assert!(caps.projection);
+        assert!(caps.filter);
+        assert!(caps.limit);
+        assert!(!caps.aggregate);
+        assert!(!caps.joins);
+        assert_eq!(caps.dialect_name, "postgres");
+    }
+
+    #[test]
+    fn sql_literal_escapes_single_quotes() {
+        assert_eq!(sql_literal("it's"), "'it''s'");
+        assert_eq!(sql_literal("plain"), "'plain'");
+        assert_eq!(sql_literal(""), "''");
+    }
+
+    #[test]
+    fn sql_type_to_arrow_covers_all_branches() {
+        assert_eq!(sql_type_to_arrow("BOOL"), DataType::Boolean);
+        assert_eq!(sql_type_to_arrow("boolean"), DataType::Boolean);
+        assert_eq!(sql_type_to_arrow("BIGINT"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("INT8"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("INTEGER"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("INT"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("INT4"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("INT2"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("SMALLINT"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("TINYINT"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("MEDIUMINT"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("SERIAL"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("BIGSERIAL"), DataType::Int64);
+        assert_eq!(sql_type_to_arrow("REAL"), DataType::Float64);
+        assert_eq!(sql_type_to_arrow("FLOAT4"), DataType::Float64);
+        assert_eq!(sql_type_to_arrow("DOUBLE"), DataType::Float64);
+        assert_eq!(sql_type_to_arrow("NUMERIC"), DataType::Float64);
+        assert_eq!(sql_type_to_arrow("DECIMAL"), DataType::Float64);
+        assert_eq!(sql_type_to_arrow("TEXT"), DataType::Utf8);
+        assert_eq!(sql_type_to_arrow("VARCHAR(255)"), DataType::Utf8);
+    }
+
+    #[test]
+    fn schema_from_fields_builds_arrow_schema() {
+        let schema = schema_from_fields(vec![
+            ("id".to_string(), "INT".to_string(), false),
+            ("name".to_string(), "TEXT".to_string(), true),
+        ]);
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+        assert!(!schema.field(0).is_nullable());
+        assert_eq!(schema.field(1).name(), "name");
+        assert_eq!(schema.field(1).data_type(), &DataType::Utf8);
+        assert!(schema.field(1).is_nullable());
+    }
 }

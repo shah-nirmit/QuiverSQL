@@ -702,3 +702,110 @@ fn sqlite_explain_uses_qualified_source_plan_keys() {
     drop(harness);
     std::fs::remove_file(db_path).unwrap();
 }
+
+#[test]
+fn execute_syntax_error_returns_error_response() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"execute","params":{"sql":"SELECT FROM WHERE !!!"},"id":300}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 300);
+    assert!(response.get("result").is_none() || response["result"].is_null());
+    assert!(response["error"]["code"].as_i64().is_some(), "expected an error code");
+}
+
+#[test]
+fn query_cancel_unknown_id_returns_cancelled_false() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"query_cancel","params":{"query_id":"q_never_existed"},"id":301}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 301);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert_eq!(response["result"]["query_id"], "q_never_existed");
+    assert_eq!(response["result"]["cancelled"], false);
+}
+
+#[test]
+fn diagnostics_returns_counters_object() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(r#"{"jsonrpc":"2.0","method":"diagnostics","id":302}"#);
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 302);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert!(
+        response["result"]["counters"].is_object(),
+        "expected counters object in: {response}"
+    );
+    assert!(
+        response["result"]["counters"]["broadcast_rewrites_applied_total"].is_number(),
+        "expected numeric counter"
+    );
+}
+
+#[test]
+fn get_lineage_with_registered_sqlite_returns_table_refs() {
+    let mut rpc = RpcHarness::spawn();
+
+    let db_path = create_temp_sqlite();
+    let register_req = format!(
+        r#"{{"jsonrpc":"2.0","method":"register_sqlite","params":{{"db_path":{:?},"alias":"lineage_db"}},"id":303}}"#,
+        db_path
+    );
+    let reg_res = rpc.request(&register_req);
+    assert!(reg_res["error"].is_null(), "register failed: {reg_res:?}");
+
+    let response = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"get_lineage","params":{"sql":"SELECT name FROM lineage_db.items"},"id":304}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 304);
+    assert!(
+        response.get("error").is_none() || response["error"].is_null(),
+        "get_lineage failed: {response:?}"
+    );
+    let result_str = response["result"].to_string();
+    assert!(
+        result_str.contains("items") || result_str.contains("lineage_db"),
+        "lineage result should reference the scanned table, got: {result_str}"
+    );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
+fn list_source_tables_unknown_source_returns_not_found_error() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"list_source_tables","params":{"name":"ghost_source"},"id":305}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 305);
+    assert_eq!(response["error"]["code"], -32004);
+}
+
+#[test]
+fn remove_source_non_existent_returns_removed_false() {
+    let mut rpc = RpcHarness::spawn();
+
+    let response = rpc.request(
+        r#"{"jsonrpc":"2.0","method":"remove_source","params":{"name":"does_not_exist"},"id":306}"#,
+    );
+
+    assert_eq!(response["jsonrpc"], "2.0");
+    assert_eq!(response["id"], 306);
+    assert!(response.get("error").is_none() || response["error"].is_null());
+    assert_eq!(response["result"]["name"], "does_not_exist");
+    assert_eq!(response["result"]["removed"], false);
+}

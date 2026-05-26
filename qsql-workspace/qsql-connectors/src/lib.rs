@@ -72,6 +72,113 @@ impl From<&str> for ConnectorError {
 
 pub type ConnectorResult<T> = Result<T, ConnectorError>;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::SchemaRef;
+    use datafusion::datasource::TableProvider;
+    use std::sync::Arc;
+
+    #[test]
+    fn connector_error_constructors_set_kind() {
+        let e = ConnectorError::connect("host unreachable");
+        assert_eq!(e.kind, ConnectorErrorKind::Connect);
+        assert_eq!(e.message, "host unreachable");
+
+        let e = ConnectorError::sql("syntax error");
+        assert_eq!(e.kind, ConnectorErrorKind::Sql);
+
+        let e = ConnectorError::other("unknown");
+        assert_eq!(e.kind, ConnectorErrorKind::Other);
+
+        let e = ConnectorError::new(ConnectorErrorKind::Auth, "bad creds");
+        assert_eq!(e.kind, ConnectorErrorKind::Auth);
+
+        let e = ConnectorError::new(ConnectorErrorKind::Timeout, "timed out");
+        assert_eq!(e.kind, ConnectorErrorKind::Timeout);
+
+        let e = ConnectorError::new(ConnectorErrorKind::Network, "reset");
+        assert_eq!(e.kind, ConnectorErrorKind::Network);
+    }
+
+    #[test]
+    fn connector_error_display_matches_message() {
+        let e = ConnectorError::sql("bad query");
+        assert_eq!(format!("{e}"), "bad query");
+    }
+
+    #[test]
+    fn connector_error_from_string_and_str_is_other() {
+        let e: ConnectorError = "oops".into();
+        assert_eq!(e.kind, ConnectorErrorKind::Other);
+        assert_eq!(e.message, "oops");
+
+        let e: ConnectorError = String::from("oops2").into();
+        assert_eq!(e.kind, ConnectorErrorKind::Other);
+        assert_eq!(e.message, "oops2");
+    }
+
+    struct StubConnector(Vec<String>);
+
+    #[async_trait]
+    impl RemoteConnector for StubConnector {
+        fn connector_type(&self) -> &'static str {
+            "stub"
+        }
+
+        async fn table_provider(
+            &self,
+            _schema: Option<&str>,
+            _table: &str,
+            _cached_schema: Option<SchemaRef>,
+        ) -> ConnectorResult<Arc<dyn TableProvider>> {
+            unimplemented!()
+        }
+
+        fn capabilities(&self) -> qsql_core::models::ConnectorCapabilities {
+            qsql_core::models::ConnectorCapabilities {
+                projection: false,
+                filter: false,
+                limit: false,
+                aggregate: false,
+                joins: false,
+                dialect_name: "stub".to_string(),
+            }
+        }
+
+        async fn explain_query(&self, _sql: &str) -> ConnectorResult<String> {
+            unimplemented!()
+        }
+
+        async fn list_tables(
+            &self,
+            _schema: Option<&str>,
+            _limit: usize,
+        ) -> ConnectorResult<Vec<String>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tables_page_slices_correctly() {
+        let names: Vec<String> = (0..10).map(|i| format!("t{i}")).collect();
+        let connector = StubConnector(names);
+
+        // page 1: offset=3, limit=4
+        let page = connector.list_tables_page(None, 3, 4).await.unwrap();
+        assert_eq!(page, vec!["t3", "t4", "t5", "t6"]);
+
+        // offset beyond end returns empty
+        let page = connector.list_tables_page(None, 20, 4).await.unwrap();
+        assert!(page.is_empty());
+
+        // limit=0 is clamped to 1 by saturating max
+        let page = connector.list_tables_page(None, 0, 0).await.unwrap();
+        assert!(page.is_empty());
+    }
+}
+
 /// A trait implemented by every remote data-source connector.
 /// Connectors expose upstream DataFusion table providers plus QuiverSQL-owned
 /// catalog and source-native explain surfaces.

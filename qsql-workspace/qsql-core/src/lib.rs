@@ -18,3 +18,18 @@ pub const QSQL_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub fn init_core() {
     eprintln!("QuiverSQL Core initialized (version {QSQL_CORE_VERSION})");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn init_core_does_not_panic() {
+        init_core();
+    }
+
+    #[test]
+    fn version_constant_is_non_empty() {
+        assert!(!QSQL_CORE_VERSION.is_empty());
+    }
+}

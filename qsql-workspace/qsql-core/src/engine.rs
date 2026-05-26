@@ -1662,6 +1662,249 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn guarded_provider_accessors() {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+
+        // new() constructor
+        let g = GuardedTableProvider::new("mysource", Arc::clone(&mem));
+        assert_eq!(g.source_ref(), "mysource");
+        // budget() returns default
+        assert_eq!(g.budget().max_rows, DEFAULT_REMOTE_SCAN_MAX_ROWS);
+        // inner() returns same provider
+        let _ = g.inner();
+
+        // with_budget constructor
+        let g2 = GuardedTableProvider::with_budget("s2", Arc::clone(&mem), ScanBudget { max_rows: 5, max_bytes: 100 });
+        assert_eq!(g2.budget().max_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn guarded_provider_scan_within_budget_passes() {
+        // No statistics → budget check is a no-op
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+        let g = GuardedTableProvider::new("s", mem);
+        let engine = QsqlEngine::new();
+        let ctx = engine.execution_context().unwrap();
+        // MemTable has no statistics, so budget check is skipped — scan returns Ok
+        let result = g.scan(&ctx.state(), None, &[], None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn engine_catalog_operations() {
+        use crate::models::{CatalogSource, SourceKind};
+        let engine = QsqlEngine::new();
+
+        // get_catalog is empty initially
+        assert!(engine.get_catalog().is_empty());
+        assert!(engine.get_source_metadata("missing").is_none());
+
+        // catalog_source and get_source_metadata
+        let src = CatalogSource {
+            name: "db1".to_string(),
+            kind: SourceKind::Sqlite,
+            connection_details: serde_json::json!({}),
+            schema: None,
+            capabilities: None,
+            status: "ready".to_string(),
+            error: None,
+            tables: Some(vec!["t1".to_string()]),
+        };
+        engine.catalog_source(src.clone());
+        assert_eq!(engine.get_catalog().len(), 1);
+        assert!(engine.get_source_metadata("db1").is_some());
+
+        // remove_source removes it
+        let removed = engine.remove_source("db1").unwrap();
+        assert!(removed);
+        assert!(engine.get_catalog().is_empty());
+
+        // remove non-existent returns false
+        let not_removed = engine.remove_source("not_here").unwrap();
+        assert!(!not_removed);
+    }
+
+    #[tokio::test]
+    async fn engine_register_schema_table_and_table_registered() {
+        let engine = QsqlEngine::new();
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1i64]))]).unwrap();
+        let mem = Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()) as Arc<dyn TableProvider>;
+
+        assert!(!engine.table_registered_in_schema("myschema", "mytable"));
+        engine.register_schema_table("myschema", "mytable", mem).unwrap();
+        assert!(engine.table_registered_in_schema("myschema", "mytable"));
+
+        // Registering again returns "already registered" message
+        let schema2 = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("id", datafusion::arrow::datatypes::DataType::Int64, false),
+        ]));
+        let batch2 = RecordBatch::try_new(schema2.clone(), vec![Arc::new(Int64Array::from(vec![2i64]))]).unwrap();
+        let mem2 = Arc::new(MemTable::try_new(schema2, vec![vec![batch2]]).unwrap()) as Arc<dyn TableProvider>;
+        let msg = engine.register_schema_table("myschema", "mytable", mem2).unwrap();
+        assert!(msg.contains("already registered"));
+    }
+
+    #[tokio::test]
+    async fn engine_with_broadcast_config() {
+        let cfg = BroadcastRewriteConfig::disabled();
+        let engine = QsqlEngine::new().with_broadcast_config(cfg);
+        assert!(!engine.broadcast_config().enabled);
+    }
+
+    #[tokio::test]
+    async fn engine_default_is_same_as_new() {
+        let _engine: QsqlEngine = QsqlEngine::default();
+        // Just verifies Default impl compiles and doesn't panic
+    }
+
+    #[tokio::test]
+    async fn engine_execute_sql_to_string_success() {
+        let engine = QsqlEngine::new();
+        let result = engine.execute_sql_to_string("SELECT 42 AS answer").await.unwrap();
+        assert!(result.contains("42"));
+    }
+
+    #[tokio::test]
+    async fn engine_execute_sql_collect_success() {
+        let engine = QsqlEngine::new();
+        let result = engine
+            .execute_sql_collect("SELECT 1 AS v", CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0]["v"], 1);
+    }
+
+    #[tokio::test]
+    async fn start_query_stream_immediate_timeout_returns_error() {
+        let engine = QsqlEngine::new();
+        let result = engine
+            .start_query_stream("SELECT 1", CancellationToken::new(), Some(0))
+            .await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert_eq!(err.code, -32003);
+    }
+
+    #[tokio::test]
+    async fn handle_is_terminal_after_collecting_all() {
+        let engine = QsqlEngine::new();
+        let mut handle = engine
+            .start_query_stream("SELECT 1 AS v", CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(!handle.is_terminal());
+        let _ = handle
+            .page("q", 0, 100, None, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(handle.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn handle_collect_batches_returns_record_batches() {
+        let engine = QsqlEngine::new();
+        let handle = engine
+            .start_query_stream("SELECT 1 AS v", CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let batches = handle
+            .collect_batches(CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(!batches.is_empty());
+        assert_eq!(batches[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn get_logical_plan_with_broadcast_returns_info() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine.register_file("emp", &csv_path, "csv").await.unwrap();
+        let (plan, info) = engine
+            .get_logical_plan_with_broadcast("SELECT id FROM emp")
+            .await
+            .unwrap();
+        let _ = plan;
+        // No join, so considered=0
+        assert_eq!(info.considered, 0);
+        let _ = std::fs::remove_file(csv_path);
+    }
+
+    #[tokio::test]
+    async fn register_file_unsupported_format_returns_error() {
+        let engine = QsqlEngine::new();
+        let err = engine.register_file("t", "/tmp/f.xyz", "xml").await.unwrap_err();
+        assert!(err.contains("Unsupported format"));
+    }
+
+    #[tokio::test]
+    async fn file_extension_filter_with_and_without_extension() {
+        // Has extension
+        assert_eq!(file_extension_filter("data.json", ".ndjson"), ".json");
+        // No extension fallback
+        assert_eq!(file_extension_filter("data", ".csv"), ".csv");
+    }
+
+    #[test]
+    fn arrow_schema_to_qsql_schema_roundtrip() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+        ]);
+        let qsql = arrow_schema_to_qsql_schema(&schema);
+        assert_eq!(qsql.fields.len(), 2);
+        assert_eq!(qsql.fields[0].name, "id");
+        assert!(!qsql.fields[0].nullable);
+        assert_eq!(qsql.fields[1].name, "name");
+        assert!(qsql.fields[1].nullable);
+    }
+
+    #[test]
+    fn estimate_effective_bytes_branches() {
+        use datafusion::common::stats::Precision;
+        use datafusion::common::Statistics;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        // No byte stats → None
+        let stats_no_bytes = Statistics::new_unknown(&schema);
+        assert!(estimate_effective_bytes(&stats_no_bytes, None).is_none());
+
+        // Both rows and bytes known, no limit
+        let stats = Statistics::new_unknown(&schema)
+            .with_num_rows(Precision::Exact(100))
+            .with_total_byte_size(Precision::Exact(1_000));
+        assert_eq!(estimate_effective_bytes(&stats, None), Some(1_000));
+
+        // rows=0 (div by zero guard)
+        let stats_zero = Statistics::new_unknown(&schema)
+            .with_num_rows(Precision::Exact(0))
+            .with_total_byte_size(Precision::Exact(1_000));
+        assert_eq!(estimate_effective_bytes(&stats_zero, Some(10)), Some(1_000));
+
+        // limit <= rows → proportional
+        let limited = estimate_effective_bytes(&stats, Some(10));
+        assert_eq!(limited, Some(100)); // 1000 * 10 / 100
+
+        // limit >= rows → full bytes
+        let full = estimate_effective_bytes(&stats, Some(200));
+        assert_eq!(full, Some(1_000));
+    }
+
+    #[tokio::test]
     async fn guarded_table_provider_rejects_over_budget_byte_estimates() {
         let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
             datafusion::arrow::datatypes::Field::new(

@@ -311,4 +311,102 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn union_walks_both_sides() {
+        let refs = extract_database_table_refs(
+            "SELECT * FROM pg_local.customers \
+             UNION ALL \
+             SELECT * FROM mysql_local.customers",
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 2);
+        assert!(refs.iter().any(|r| r.alias == "pg_local"));
+        assert!(refs.iter().any(|r| r.alias == "mysql_local"));
+    }
+
+    #[test]
+    fn intersect_and_except_walk_both_sides() {
+        let refs_intersect = extract_database_table_refs(
+            "SELECT id FROM pg_local.a INTERSECT SELECT id FROM pg_local.b",
+        )
+        .unwrap();
+        assert_eq!(refs_intersect.len(), 2);
+
+        let refs_except = extract_database_table_refs(
+            "SELECT id FROM pg_local.a EXCEPT SELECT id FROM pg_local.b",
+        )
+        .unwrap();
+        assert_eq!(refs_except.len(), 2);
+    }
+
+    #[test]
+    fn subquery_in_select_list_is_extracted() {
+        let refs = extract_database_table_refs(
+            "SELECT (SELECT MAX(rev) FROM db.revenue) AS max_rev FROM db.customers",
+        )
+        .unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.table_name.as_str()).collect();
+        assert!(names.contains(&"customers"));
+        assert!(names.contains(&"revenue"));
+    }
+
+    #[test]
+    fn in_subquery_is_extracted() {
+        let refs = extract_database_table_refs(
+            "SELECT * FROM pg.orders WHERE customer_id IN (SELECT id FROM pg.customers)",
+        )
+        .unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.table_name.as_str()).collect();
+        assert!(names.contains(&"orders"));
+        assert!(names.contains(&"customers"));
+    }
+
+    #[test]
+    fn same_table_referenced_twice_is_deduplicated() {
+        let refs = extract_database_table_refs(
+            "SELECT a.id, b.id FROM pg.orders a JOIN pg.orders b ON a.id = b.parent_id",
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 1, "same schema.table should appear only once");
+    }
+
+    #[test]
+    fn bare_table_name_produces_no_refs() {
+        let refs = extract_database_table_refs("SELECT * FROM customers").unwrap();
+        assert!(refs.is_empty(), "bare table names are not tracked");
+    }
+
+    #[test]
+    fn three_part_name_produces_no_refs() {
+        let refs =
+            extract_database_table_refs("SELECT * FROM catalog.schema.table").unwrap();
+        assert!(refs.is_empty(), "3-part names are not tracked");
+    }
+
+    #[test]
+    fn invalid_sql_returns_error() {
+        assert!(extract_database_table_refs("NOT VALID SQL !!!").is_err());
+    }
+
+    #[test]
+    fn derived_subquery_in_from_is_extracted() {
+        let refs = extract_database_table_refs(
+            "SELECT * FROM (SELECT * FROM pg.orders) sub",
+        )
+        .unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].table_name, "orders");
+    }
+
+    #[test]
+    fn exists_subquery_is_extracted() {
+        let refs = extract_database_table_refs(
+            "SELECT * FROM db.a WHERE EXISTS (SELECT 1 FROM db.b WHERE db.b.id = db.a.id)",
+        )
+        .unwrap();
+        let names: Vec<&str> = refs.iter().map(|r| r.table_name.as_str()).collect();
+        assert!(names.contains(&"a"));
+        assert!(names.contains(&"b"));
+    }
 }

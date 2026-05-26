@@ -3,6 +3,10 @@ name = "qsql-daemon"
 version = "0.3.0-alpha.0"
 edition = "2021"
 
+[lib]
+name = "qsql_daemon"
+path = "src/lib.rs"
+
 [dependencies]
 qsql-core = { path = "../qsql-core" }
 qsql-connectors = { path = "../qsql-connectors" }

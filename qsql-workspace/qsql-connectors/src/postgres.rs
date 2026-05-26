@@ -432,4 +432,51 @@ mod tests {
             .unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 2);
     }
+
+    #[test]
+    fn postgres_connector_type_is_postgres() {
+        let connector = PostgresConnector::new("postgres://localhost/mydb");
+        assert_eq!(connector.connector_type(), "postgres");
+    }
+
+    #[test]
+    fn postgres_capabilities_reports_postgres_dialect() {
+        let connector = PostgresConnector::new("postgres://localhost/mydb");
+        let caps = connector.capabilities();
+        assert!(caps.filter, "Postgres should support filter pushdown");
+        assert_eq!(caps.dialect_name, "postgres");
+    }
+
+    #[test]
+    fn postgres_pool_params_postgresql_scheme_is_handled() {
+        let params =
+            postgres_pool_params("postgresql://alice:pw@db.example.com:5433/myapp").unwrap();
+        assert_eq!(params["host"].expose_secret(), "db.example.com");
+        assert_eq!(params["port"].expose_secret(), "5433");
+        assert_eq!(params["user"].expose_secret(), "alice");
+        assert_eq!(params["pass"].expose_secret(), "pw");
+        assert_eq!(params["db"].expose_secret(), "myapp");
+    }
+
+    #[test]
+    fn postgres_pool_params_url_without_password() {
+        let params = postgres_pool_params("postgres://alice@localhost/mydb").unwrap();
+        assert_eq!(params["user"].expose_secret(), "alice");
+        assert!(!params.contains_key("pass"), "no password should be set");
+        assert_eq!(params["sslmode"].expose_secret(), "disable");
+    }
+
+    #[test]
+    fn postgres_pool_params_key_value_string_is_passed_through() {
+        let conn = "host=localhost port=5432 user=alice dbname=mydb";
+        let params = postgres_pool_params(conn).unwrap();
+        assert_eq!(params["connection_string"].expose_secret(), conn);
+        assert_eq!(params["sslmode"].expose_secret(), "disable");
+    }
+
+    #[test]
+    fn postgres_pool_params_malformed_url_returns_error() {
+        let result = postgres_pool_params("postgres://not a valid[url");
+        assert!(result.is_err(), "malformed URL should return an error");
+    }
 }

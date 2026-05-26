@@ -504,6 +504,9 @@ fn introspect_sqlite_schema(db_path: &str, table_name: &str) -> Result<SchemaRef
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::physical_expr::expressions::{
+        BinaryExpr as PhysBinaryExpr, Column, IsNotNullExpr, IsNullExpr, Literal, NotExpr,
+    };
     use qsql_core::QsqlEngine;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -605,6 +608,284 @@ mod tests {
             .unwrap();
         assert_eq!(rows[0]["name"], "Apple");
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- explain_query ---
+
+    #[tokio::test]
+    async fn explain_query_returns_plan_for_valid_sql() {
+        let path = create_temp_sqlite("explain");
+        let connector = SqliteConnector::new(&path);
+        let result = connector
+            .explain_query("SELECT * FROM products")
+            .await
+            .unwrap();
+        assert!(!result.is_empty(), "explain should return output");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn explain_query_errors_on_invalid_sql() {
+        let path = create_temp_sqlite("explain_err");
+        let connector = SqliteConnector::new(&path);
+        let err = connector
+            .explain_query("NOT VALID SQL !!!!")
+            .await
+            .unwrap_err();
+        assert!(!err.message.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- native_select_sql ---
+
+    #[tokio::test]
+    async fn native_select_sql_is_quoted_select_star() {
+        let path = create_temp_sqlite("native_sql");
+        let provider = SqliteTableProvider::try_new(&path, "products")
+            .await
+            .unwrap();
+        assert_eq!(provider.native_select_sql(), "SELECT * FROM `products`");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn native_select_sql_quotes_special_chars() {
+        let path = create_temp_sqlite("native_sql_special");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE \"my table\" (id INTEGER)",
+                [],
+            )
+            .unwrap();
+        }
+        let provider = SqliteTableProvider::try_new(&path, "my table")
+            .await
+            .unwrap();
+        assert_eq!(provider.native_select_sql(), "SELECT * FROM `my table`");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- connector accessors ---
+
+    #[tokio::test]
+    async fn connector_type_and_db_path() {
+        let path = create_temp_sqlite("accessors");
+        let connector = SqliteConnector::new(&path);
+        assert_eq!(connector.connector_type(), "sqlite");
+        assert_eq!(connector.db_path(), path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn table_provider_connector_accessor() {
+        let path = create_temp_sqlite("connector_acc");
+        let provider = SqliteTableProvider::try_new(&path, "products")
+            .await
+            .unwrap();
+        assert_eq!(provider.connector().db_path(), path);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- introspect_sqlite_schema ---
+
+    #[test]
+    fn introspect_sqlite_schema_returns_correct_fields() {
+        let path = create_temp_sqlite("introspect");
+        let schema = introspect_sqlite_schema(&path, "products").unwrap();
+        assert_eq!(schema.fields().len(), 4);
+        assert_eq!(schema.field(0).name(), "id");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn introspect_sqlite_schema_errors_on_missing_table() {
+        let path = create_temp_sqlite("introspect_missing");
+        let err = introspect_sqlite_schema(&path, "no_such_table").unwrap_err();
+        assert!(err.contains("no_such_table"), "error should name the table");
+        let _ = std::fs::remove_file(path);
+    }
+
+    // --- operator_to_sql ---
+
+    #[test]
+    fn operator_to_sql_covers_all_supported() {
+        assert_eq!(operator_to_sql(&Operator::Eq), Some("="));
+        assert_eq!(operator_to_sql(&Operator::NotEq), Some("<>"));
+        assert_eq!(operator_to_sql(&Operator::Lt), Some("<"));
+        assert_eq!(operator_to_sql(&Operator::LtEq), Some("<="));
+        assert_eq!(operator_to_sql(&Operator::Gt), Some(">"));
+        assert_eq!(operator_to_sql(&Operator::GtEq), Some(">="));
+        assert_eq!(operator_to_sql(&Operator::And), Some("AND"));
+        assert_eq!(operator_to_sql(&Operator::Or), Some("OR"));
+        assert_eq!(operator_to_sql(&Operator::Plus), None);
+        assert_eq!(operator_to_sql(&Operator::Minus), None);
+    }
+
+    // --- scalar_value_to_sql ---
+
+    #[test]
+    fn scalar_value_to_sql_covers_numeric_and_text() {
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Int8(Some(1))), Some("1".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Int16(Some(-5))), Some("-5".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Int32(Some(100))), Some("100".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Int64(Some(999))), Some("999".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt8(Some(2))), Some("2".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt16(Some(3))), Some("3".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt32(Some(4))), Some("4".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::UInt64(Some(5))), Some("5".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Float32(Some(1.5))), Some("1.5".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Float64(Some(2.5))), Some("2.5".into()));
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::Utf8(Some("it's".into()))),
+            Some("'it''s'".into())
+        );
+        assert_eq!(
+            scalar_value_to_sql(&ScalarValue::LargeUtf8(Some("big".into()))),
+            Some("'big'".into())
+        );
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(Some(true))), Some("TRUE".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(Some(false))), Some("FALSE".into()));
+    }
+
+    #[test]
+    fn scalar_value_to_sql_null_variants_return_null() {
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Null), Some("NULL".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Int64(None)), Some("NULL".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Utf8(None)), Some("NULL".into()));
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Boolean(None)), Some("NULL".into()));
+    }
+
+    #[test]
+    fn scalar_value_to_sql_unsupported_returns_none() {
+        // Date32 is not in the match arms
+        assert_eq!(scalar_value_to_sql(&ScalarValue::Date32(Some(1))), None);
+    }
+
+    // --- physical_expr_to_sql ---
+
+    #[test]
+    fn physical_expr_to_sql_column() {
+        let expr: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        assert_eq!(physical_expr_to_sql(&expr), Some("`id`".into()));
+    }
+
+    #[test]
+    fn physical_expr_to_sql_literal() {
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Int64(Some(42))));
+        assert_eq!(physical_expr_to_sql(&expr), Some("42".into()));
+    }
+
+    #[test]
+    fn physical_expr_to_sql_binary_expr() {
+        let left: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let right: Arc<dyn PhysicalExpr> =
+            Arc::new(Literal::new(ScalarValue::Int64(Some(5))));
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(PhysBinaryExpr::new(left, Operator::Gt, right));
+        assert_eq!(physical_expr_to_sql(&expr), Some("(`id` > 5)".into()));
+    }
+
+    #[test]
+    fn physical_expr_to_sql_is_null_and_is_not_null() {
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("name", 1));
+        let is_null: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNullExpr::new(Arc::clone(&col)));
+        let is_not_null: Arc<dyn PhysicalExpr> =
+            Arc::new(IsNotNullExpr::new(col));
+        assert_eq!(physical_expr_to_sql(&is_null), Some("`name` IS NULL".into()));
+        assert_eq!(physical_expr_to_sql(&is_not_null), Some("`name` IS NOT NULL".into()));
+    }
+
+    #[test]
+    fn physical_expr_to_sql_not_expr() {
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let not_expr: Arc<dyn PhysicalExpr> = Arc::new(NotExpr::new(col));
+        assert_eq!(physical_expr_to_sql(&not_expr), Some("NOT (`id`)".into()));
+    }
+
+    // --- insert_where_clause ---
+
+    #[test]
+    fn insert_where_clause_bare_select() {
+        let sql = insert_where_clause("SELECT * FROM t", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE x > 1");
+    }
+
+    #[test]
+    fn insert_where_clause_appends_to_existing_where() {
+        let sql = insert_where_clause("SELECT * FROM t WHERE a = 1", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE a = 1 AND (x > 1)");
+    }
+
+    #[test]
+    fn insert_where_clause_before_order_by() {
+        let sql = insert_where_clause("SELECT * FROM t ORDER BY id", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE x > 1 ORDER BY id");
+    }
+
+    #[test]
+    fn insert_where_clause_before_limit() {
+        let sql = insert_where_clause("SELECT * FROM t LIMIT 10", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE x > 1 LIMIT 10");
+    }
+
+    #[test]
+    fn insert_where_clause_before_group_by() {
+        let sql = insert_where_clause("SELECT * FROM t GROUP BY x", "x > 1");
+        assert_eq!(sql, "SELECT * FROM t WHERE x > 1 GROUP BY x");
+    }
+
+    #[test]
+    fn insert_where_clause_existing_where_before_order_by() {
+        let sql = insert_where_clause(
+            "SELECT * FROM t WHERE a = 1 ORDER BY id",
+            "x > 1",
+        );
+        assert_eq!(
+            sql,
+            "SELECT * FROM t WHERE a = 1 AND (x > 1) ORDER BY id"
+        );
+    }
+
+    // --- apply_physical_filters ---
+
+    #[test]
+    fn apply_physical_filters_empty_is_identity() {
+        let result = apply_physical_filters("SELECT * FROM t", &[]).unwrap();
+        assert_eq!(result, "SELECT * FROM t");
+    }
+
+    #[test]
+    fn apply_physical_filters_injects_condition() {
+        let col: Arc<dyn PhysicalExpr> = Arc::new(Column::new("id", 0));
+        let lit: Arc<dyn PhysicalExpr> = Arc::new(Literal::new(ScalarValue::Int64(Some(3))));
+        let expr: Arc<dyn PhysicalExpr> =
+            Arc::new(PhysBinaryExpr::new(col, Operator::GtEq, lit));
+        let result = apply_physical_filters("SELECT * FROM t", &[expr]).unwrap();
+        assert_eq!(result, "SELECT * FROM t WHERE (`id` >= 3)");
+    }
+
+    // --- list_tables_page pagination ---
+
+    #[tokio::test]
+    async fn list_tables_page_offset_and_limit() {
+        let path = create_temp_sqlite("page");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE aaa (id INTEGER)", []).unwrap();
+            conn.execute("CREATE TABLE bbb (id INTEGER)", []).unwrap();
+            conn.execute("CREATE TABLE ccc (id INTEGER)", []).unwrap();
+        }
+        let connector = SqliteConnector::new(&path);
+        let page = connector.list_tables_page(None, 1, 2).await.unwrap();
+        // Alphabetical: aaa, bbb, ccc. offset=1, limit=2 → bbb, ccc
+        // products is also there from create_temp_sqlite... actually wait,
+        // create_temp_sqlite creates a separate db for "page" suffix.
+        // The "page" db has aaa, bbb, ccc, products
+        assert_eq!(page.len(), 2);
         let _ = std::fs::remove_file(path);
     }
 }

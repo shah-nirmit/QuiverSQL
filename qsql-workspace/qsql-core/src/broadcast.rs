@@ -16,7 +16,6 @@
 //! physical planning. The engine re-runs `optimize` when [`BroadcastRewriteInfo::applied`]
 //! is non-empty so the injected filter participates in another pushdown round.
 
-use std::any::Any;
 use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -25,12 +24,12 @@ use std::time::Instant;
 use datafusion::arrow::array::Array;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::common::{Column, DFSchema, ScalarValue};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{
-    Expr, Extension, Filter, Join, JoinType, LogicalPlan, LogicalPlanBuilder, TableScan,
+    Expr, Extension, Join, JoinType, LogicalPlan, LogicalPlanBuilder, TableScan,
 };
 use datafusion::prelude::SessionContext;
 use tokio_util::sync::CancellationToken;
@@ -641,25 +640,6 @@ fn collect_table_names(plan: &LogicalPlan, out: &mut Vec<String>) {
     }
 }
 
-#[allow(dead_code)]
-fn debug_schema(schema: &DFSchema) -> String {
-    schema
-        .fields()
-        .iter()
-        .map(|f| format!("{}:{}", f.name(), f.data_type()))
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-#[allow(dead_code)]
-fn debug_filter(f: &Filter) -> String {
-    format!("Filter({})", f.predicate)
-}
-
-#[allow(dead_code)]
-fn provider_type_id(p: &dyn TableProvider) -> std::any::TypeId {
-    Any::type_id(p.as_any())
-}
 
 #[cfg(test)]
 mod tests {
@@ -920,5 +900,124 @@ mod tests {
             .skipped
             .iter()
             .any(|s| s.reason == SkipReason::NotInnerEquiJoin));
+    }
+
+    #[tokio::test]
+    async fn both_sides_federated_is_skipped() {
+        let ctx = SessionContext::new();
+        ctx.register_table("remote_a", small_remote_table()).unwrap();
+        ctx.register_table("remote_b", small_remote_table()).unwrap();
+        let logical = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT a.user_id FROM remote_a a JOIN remote_b b ON a.user_id = b.user_id",
+            )
+            .await
+            .unwrap();
+        let optimized = ctx.state().optimize(&logical).unwrap();
+        let (_out, info) = apply_broadcast_rewrites(
+            &ctx,
+            optimized,
+            &BroadcastRewriteConfig::default(),
+            cancel_token(),
+        )
+        .await
+        .unwrap();
+        assert!(info
+            .skipped
+            .iter()
+            .any(|s| s.reason == SkipReason::BothSidesFederated));
+    }
+
+    #[tokio::test]
+    async fn federated_local_swap_also_rewrites() {
+        // Remote on left, local on right — should still rewrite.
+        let ctx = build_ctx().await;
+        let logical = ctx
+            .state()
+            .create_logical_plan(
+                "SELECT r.bonus FROM remotes r JOIN locals l ON r.user_id = l.id",
+            )
+            .await
+            .unwrap();
+        let optimized = ctx.state().optimize(&logical).unwrap();
+        let (_, info) = apply_broadcast_rewrites(
+            &ctx,
+            optimized,
+            &BroadcastRewriteConfig::default(),
+            cancel_token(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.applied.len(), 1);
+    }
+
+    #[test]
+    fn is_supported_key_type_accepts_common_types() {
+        for ty in [
+            DataType::Boolean,
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+            DataType::Float32,
+            DataType::Float64,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Date32,
+            DataType::Date64,
+        ] {
+            assert!(
+                is_supported_key_type(&ty),
+                "{ty:?} should be supported"
+            );
+        }
+        assert!(!is_supported_key_type(&DataType::Binary));
+        assert!(!is_supported_key_type(&DataType::Null));
+    }
+
+    #[test]
+    fn broadcast_rewrite_config_default_and_disabled() {
+        let cfg = BroadcastRewriteConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.max_local_rows, DEFAULT_MAX_LOCAL_ROWS);
+        assert_eq!(cfg.max_local_bytes, DEFAULT_MAX_LOCAL_BYTES);
+
+        let dis = BroadcastRewriteConfig::disabled();
+        assert!(!dis.enabled);
+    }
+
+    #[test]
+    fn broadcast_rewrite_info_default_is_empty() {
+        let info = BroadcastRewriteInfo::default();
+        assert_eq!(info.considered, 0);
+        assert!(info.applied.is_empty());
+        assert!(info.skipped.is_empty());
+    }
+
+    #[test]
+    fn column_of_extracts_from_cast_and_alias() {
+        use datafusion::common::Column;
+        use datafusion::logical_expr::{Cast, Expr};
+        use datafusion::arrow::datatypes::DataType;
+
+        let col_expr = Expr::Column(Column::new_unqualified("id"));
+        // Direct column
+        assert!(column_of(&col_expr).is_some());
+
+        // Cast wrapping column
+        let cast_expr = Expr::Cast(Cast {
+            expr: Box::new(col_expr.clone()),
+            data_type: DataType::Int64,
+        });
+        assert!(column_of(&cast_expr).is_some());
+
+        // Non-column literal
+        let lit = Expr::Literal(datafusion::common::ScalarValue::Int64(Some(1)), None);
+        assert!(column_of(&lit).is_none());
     }
 }

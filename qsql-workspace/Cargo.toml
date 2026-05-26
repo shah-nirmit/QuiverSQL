@@ -11,6 +11,14 @@ resolver = "2"
 debug = 0
 # Minimal optimization to speed up proc-macro execution
 opt-level = 1
+lto = false
+
+[profile.bench]
+# Disable debug info generation to massively speed up linking for large crates like DataFusion
+debug = 0
+# Minimal optimization to speed up proc-macro execution
+opt-level = 1
+lto=false
 
 [profile.release]
 opt-level = "z"     
