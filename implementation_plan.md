@@ -372,11 +372,90 @@ Phase 9 extends the paged result-delivery path so callers can opt into base64-en
 - Acceptance: Default-setting smoke run shows existing JSON grid behaviour byte-identical (no regression for current users).
 - Acceptance: An unknown `result_format` returns `-32602 Invalid params`.
 
-### Phase 10: Rich Explain, Lineage, And Performance Visibility
-- Upgrade lineage to include source columns, output columns, aliases, joins, aggregates, and CTEs.
-- Expand visual explain output with runtime metrics, full-scan warnings, pushdown reasoning, and optional `EXPLAIN ANALYZE` data.
-- Surface metrics in VS Code result messages.
-- Tests: lineage golden tests, explain snapshots, metrics rendering, full-scan warnings.
+### Phase 10: Rich Explain, Lineage, And Performance Visibility - Complete
+
+Phase 10 upgrades lineage from "which tables and columns were touched" to a richer per-query story (output columns with source attribution, alias map, join conditions, aggregate inputs) and surfaces real DataFusion runtime metrics + full-scan warnings + pushdown reasoning when the user opts into EXPLAIN ANALYZE.
+
+**Key technical facts**:
+- DataFusion 53.1.0 already exposes `ExecutionPlan::metrics() -> Option<MetricsSet>` (rows produced, elapsed_compute, memory) — Phase 10 just calls it.
+- `Expr::column_refs` (DataFusion built-in) gives us per-expression column attribution for free.
+- ANALYZE in QuiverSQL is not a SQL keyword; it's an additive `analyze: Option<bool>` flag on the existing `explain_query` JSON-RPC method. The daemon executes the plan through the same scan-guard envelope used by `query_start`, so over-budget queries surface the standard `-32100 Scan Budget Exceeded` error.
+
+#### 10A: QueryLineage Model + Serde Golden
+- Extend `QueryLineage` in `qsql-core/src/engine.rs` with `output_columns: Vec<OutputColumn>`, `joins: Vec<JoinLineage>`, `aggregates: Vec<AggregateLineage>`, `aliases: HashMap<String, String>` (all `skip_serializing_if = empty / none`).
+- New nested types: `OutputColumn { name, sources: Vec<ColumnRef>, expression_summary }`, `JoinLineage { kind, left_table, right_table, on: Vec<JoinKey> }`, `AggregateLineage { function, alias, inputs: Vec<ColumnRef> }`, `ColumnRef { table, column }`, `JoinKey { left_col, right_col }`.
+- Mirror in `qsql-vscode/src/lineageProvider.ts`. Update `qsql-core/tests/serde_golden_tests.rs` (existing test stays byte-identical via skip-if-empty; new test asserts the populated shape).
+
+#### 10B: Engine-Side Lineage Walk
+- Refactor `extract_lineage` ([engine.rs:1073-1101](qsql-workspace/qsql-core/src/engine.rs)) from "match-TableScan-only-and-recurse" into a typed visitor that walks `Projection` / `Join` / `Aggregate` / `SubqueryAlias` in addition to `TableScan`. Uses `Expr::column_refs` for per-expression attribution.
+- New `expression_summary(&Expr) -> String` helper (~50 LOC) for the common shapes (bare column, literal, `BinaryOp`, `ScalarFunction`, `Aggregate`); falls back to `format!("{expr}")` truncated to 120 chars.
+
+#### 10C: Lineage Tests
+- 5 Rust unit tests in `engine.rs` (simple projection, aliased column, inner join, aggregate with SUM/GROUP BY, CTE/SubqueryAlias).
+- 1 daemon integration test (`qsql-daemon/tests/lineage_tests.rs` — new) over JSON-RPC for a multi-source JOIN.
+
+#### 10D: PlanMetrics Runtime Fields + Serde Golden
+- Add `actual_rows: Option<u64>`, `elapsed_compute_ms: Option<u64>`, `mem_used_bytes: Option<u64>` to `PlanMetrics` ([models.rs:175-180](qsql-workspace/qsql-core/src/models.rs)), all skip-if-none.
+- Existing `serde_golden_tests::test_explain_query_models_golden` stays byte-identical; new `test_plan_metrics_golden_with_runtime_fields`.
+
+#### 10E: Daemon ANALYZE Dispatch
+- Add `analyze: Option<bool>` to `ExplainQueryRequest` (skip-if-none).
+- New `engine.execute_physical_plan_collect_metrics(plan, token, timeout)` drains the physical plan through `execute_stream()`, discards batches, records `ExecutionPlan::metrics()` keyed by traversal-order node id. Reuses the existing scan-guard so over-budget runs surface `-32100`.
+- Daemon `explain_query` handler ([lib.rs:680-820](qsql-workspace/qsql-daemon/src/lib.rs)) dispatches on `req.analyze == Some(true)`; passes the metrics map into the plan-graph builder so per-node `PlanMetrics` gets stamped.
+
+#### 10F: Full-Scan + Pushdown_Reason Attributes
+- In `qsql-daemon/src/explain.rs::plan_attributes` (`TableScan` branch): stamp `is_full_scan = "true"` when `filters.is_empty() && fetch.is_none()` AND the captured `remote_sql` (if any) lacks WHERE/LIMIT.
+- New `classify_pushdown_reason(scan, remote_sqls)` returning `multi_source_join` / `unsupported_expression` / `local_file_scan`. Stamped on `TableScan` and the `Filter` directly above it.
+- Webview renders `is_full_scan` as orange warning badge; `pushdown_reason` as muted info line.
+
+#### 10G: Lineage Tree View Rewrite
+- `qsql-vscode/src/lineageProvider.ts::buildTree` rewritten with root sections `Output Columns (N)`, `Sources (N)`, `Joins (N)`, `Aggregates (N)`. Each expands to typed children. Forward-compat fall-back when the daemon response lacks the new fields.
+
+#### 10H: VS Code Metrics Overlay
+- New `Metrics` toggle in the `planVisualizationPanel.ts` legend bar. When on AND any node has `actual_rows.is_some()`, render an extra muted line per node (`actual: 1.2M rows · 3.4ms`). Disabled with tooltip when planner-only.
+
+#### 10I: CodeLens + Setting
+- New `qsql.explainAnalyzeEnabled: boolean` setting (default `false`).
+- When on, `extension.ts` CodeLens provider adds a third lens per query block: `🔍 Explain (ANALYZE)` → new `qsql.explainAnalyze` command. `daemonClient.explainQuery` accepts `{ analyze?: boolean }`.
+
+#### 10J: Tests
+- 3 Rust unit tests for `execute_physical_plan_collect_metrics` (happy path, scan-guard refusal, cancellation).
+- 3 daemon integration tests in `qsql-daemon/tests/explain_analyze_tests.rs` (parity vs plain explain, scan-guard refusal, full-scan attribute).
+- 4 TypeScript tests (lineage fall-back, lineage new sections, metrics overlay rendering, CodeLens visibility follows setting).
+
+#### 10K: Pre-Phase-10 Doc Updates
+- Reset `current_phase_task.md` to a Phase 10 tracker with 10A-10M checkboxes.
+- Expand this Phase 10 skeleton into the 10A-10M breakdown.
+
+#### 10L: Documentation
+- `USER_GUIDE.md` — new "Explain (ANALYZE) & Lineage" section.
+- `README.md` — capability matrix gains `EXPLAIN ANALYZE`, `Column-level lineage`, `Full-scan warnings` rows; roadmap Phase 10 → Complete; intro paragraph updated.
+- `CHANGELOG.md` — Phase 10 bullet under the running `0.3.1-alpha.0 - Unreleased` block.
+- `docs/JSON_RPC_FRAMING.md` — short "EXPLAIN ANALYZE Result Shape" section.
+- `implementation_plan.md` — this section status flipped Current → Complete on landing.
+
+#### 10M: Final Clippy + Verification + Commit
+- `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace` clean.
+- `cargo check --locked -p qsql-daemon --benches` clean.
+- `npm run typecheck && npm run lint && npm run test` clean.
+- Stage everything except `.claude/settings.local.json`; commit `feat(phase 10): rich explain, lineage, and performance visibility`.
+
+#### 10 Parallelization Plan
+| Wave | Sub-phases (parallel) | Depends on |
+|------|------------------------|------------|
+| Wave 1 | 10K · 10A · 10D | none — all independent |
+| Wave 2 | 10B · 10E · 10F | Wave 1 (10B needs 10A model; 10E needs 10D fields; 10F is pure explain.rs) |
+| Wave 3 | 10C · 10G · 10H · 10I | Wave 2 |
+| Wave 4 | 10J | Everything else wired |
+| Wave 5 | 10L docs + 10M final verify + commit | All above |
+
+#### 10 Verification
+- All clippy / fmt / cargo test / cargo check / npm typecheck/lint/test green.
+- Acceptance: `get_lineage` over a multi-source JOIN returns the new fields populated.
+- Acceptance: `explain_query` with `analyze: true` returns plan-graph nodes with populated `metrics.actual_rows` + `metrics.elapsed_compute_ms`.
+- Acceptance: `qsql.remoteScanMaxRows = 2` + ANALYZE on a 6-row query → `-32100 Scan Budget Exceeded` error.
+- Acceptance: `SELECT * FROM employees` shows `Full scan ⚠` badge in the plan graph.
+- Acceptance: Lineage tree shows the four new root sections.
 
 ### Phase 11: Packaging And Gates
 - Package platform daemon binaries with the VSIX.

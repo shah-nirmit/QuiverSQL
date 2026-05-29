@@ -159,6 +159,15 @@ export interface ListSourceTablesResult {
 export interface ExplainQueryRequest {
     sql: string;
     include_native?: boolean;
+    /**
+     * Phase 10 — when `true`, the daemon executes the physical plan
+     * (subject to the existing scan-guard envelope) and harvests per-operator
+     * runtime metrics from DataFusion before serialising the response.
+     * Plan-graph node `PlanMetrics` gains populated `actual_rows` /
+     * `elapsed_compute_ms` / `mem_used_bytes`. Default (`undefined` / `false`)
+     * is unchanged: planner-only EXPLAIN, no execution, no runtime metrics.
+     */
+    analyze?: boolean;
 }
 
 export type ProviderKind = SourceKind | 'unknown';

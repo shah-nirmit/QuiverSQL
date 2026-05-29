@@ -736,7 +736,7 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 .as_ref()
                 .map(explain::format_physical_plan)
                 .map(|raw| explain::truncate_raw_plan(&raw).0);
-            let federated_plan = explain::build_plan_graph_with_broadcast(
+            let mut federated_plan = explain::build_plan_graph_with_broadcast(
                 &logical_plan,
                 Some(&broadcast_info),
                 Some(&remote_sqls),
@@ -753,6 +753,46 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                     "Plan graph exceeded {} nodes and was truncated.",
                     explain::get_max_plan_nodes()
                 ));
+            }
+
+            // Phase 10 — EXPLAIN ANALYZE: when the client opted into
+            // `analyze: true`, drive the physical plan to completion under
+            // the existing scan-guard envelope and stamp per-operator runtime
+            // metrics onto the plan-graph nodes via `apply_runtime_metrics`.
+            // Scan-guard failures surface the standard `-32100 Scan Budget
+            // Exceeded` error verbatim — including the suggestion banner —
+            // so the UX is consistent with `query_start` over-budget runs.
+            // Other errors (e.g. a remote DB going offline mid-stream) are
+            // logged as warnings on the explain result rather than failing
+            // the request, so users at least see the planner output.
+            if req.analyze == Some(true) {
+                if let Some(pp) = physical_plan.as_ref() {
+                    let token = CancellationToken::new();
+                    match state
+                        .engine
+                        .execute_physical_plan_collect_metrics(pp.clone(), token, None)
+                        .await
+                    {
+                        Ok(metrics) => {
+                            explain::apply_runtime_metrics(&mut federated_plan, &metrics);
+                        }
+                        Err(e) => {
+                            if e.code == qsql_core::models::SCAN_GUARD_ERROR_CODE {
+                                return make_query_error(e);
+                            }
+                            warnings.push(format!(
+                                "EXPLAIN ANALYZE could not collect runtime metrics: {}",
+                                e.message
+                            ));
+                        }
+                    }
+                } else {
+                    warnings.push(
+                        "EXPLAIN ANALYZE requested but physical plan unavailable; \
+                         runtime metrics omitted."
+                            .to_string(),
+                    );
+                }
             }
             if let Some(raw_warning) = raw_warning {
                 warnings.push(raw_warning);

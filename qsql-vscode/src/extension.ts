@@ -174,12 +174,14 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.workspace.registerTextDocumentContentProvider('qsql-plan', planProvider)
     );
 
-    const visualizePlanCommand = vscode.commands.registerCommand('qsql.visualizePlan', async (sqlArg?: any) => {
+    // Shared launcher used by both `qsql.visualizePlan` (planner-only) and
+    // `qsql.explainAnalyze` (Phase 10 — drives the physical plan to
+    // completion and overlays runtime metrics on the plan tree).
+    async function launchPlanVisualization(sqlArg: any, analyze: boolean) {
         if (!daemonClient) {
             vscode.window.showErrorMessage('Daemon is not running.');
             return;
         }
-
         let sql = typeof sqlArg === 'string' ? sqlArg : '';
         if (!sql) {
             const editor = vscode.window.activeTextEditor;
@@ -203,17 +205,14 @@ export async function activate(context: vscode.ExtensionContext) {
                 }
             }
         }
-
         if (!sql.trim()) {
             vscode.window.showErrorMessage('No SQL query found to visualize.');
             return;
         }
-
         try {
             const { PlanVisualizationPanel } = await import('./planVisualizationPanel');
             PlanVisualizationPanel.createOrShow(context.extensionUri);
-            
-            const result = await daemonClient.explainQuery(sql);
+            const result = await daemonClient.explainQuery(sql, { analyze });
             if (PlanVisualizationPanel.currentPanel) {
                 PlanVisualizationPanel.currentPanel.updatePlan(result);
             }
@@ -224,6 +223,14 @@ export async function activate(context: vscode.ExtensionContext) {
                 PlanVisualizationPanel.currentPanel.updateError(e.message || JSON.stringify(e));
             }
         }
+    }
+
+    const visualizePlanCommand = vscode.commands.registerCommand('qsql.visualizePlan', async (sqlArg?: any) => {
+        await launchPlanVisualization(sqlArg, false);
+    });
+
+    const explainAnalyzeCommand = vscode.commands.registerCommand('qsql.explainAnalyze', async (sqlArg?: any) => {
+        await launchPlanVisualization(sqlArg, true);
     });
 
     // Dynamic Lineage Event Listeners
@@ -699,6 +706,21 @@ export async function activate(context: vscode.ExtensionContext) {
                     command: "qsql.visualizePlan",
                     arguments: [q.sql]
                 }));
+                // Phase 10 — third CodeLens for EXPLAIN ANALYZE. Hidden by
+                // default and only surfaces when the user has opted in via
+                // `qsql.explainAnalyzeEnabled`. Keeps the UX from accidentally
+                // running expensive queries.
+                const analyzeOn = vscode.workspace
+                    .getConfiguration('qsql')
+                    .get<boolean>('explainAnalyzeEnabled', false);
+                if (analyzeOn) {
+                    lenses.push(new vscode.CodeLens(range, {
+                        title: "$(beaker) Explain (ANALYZE)",
+                        tooltip: `Run the query under the scan guard and overlay runtime metrics: ${q.sql.substring(0, 60)}${q.sql.length > 60 ? '...' : ''}`,
+                        command: "qsql.explainAnalyze",
+                        arguments: [q.sql]
+                    }));
+                }
             });
             return lenses;
         }
@@ -759,6 +781,7 @@ export async function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(showVersionCommand);
     context.subscriptions.push(executeCommandUI);
     context.subscriptions.push(visualizePlanCommand);
+    context.subscriptions.push(explainAnalyzeCommand);
     context.subscriptions.push(attachFileCommand);
     context.subscriptions.push(attachSQLiteCommand);
     context.subscriptions.push(connectWizardCommand);

@@ -63,7 +63,9 @@ export function decodeResultPage(page: QueryPage): RenderablePage {
         try {
             table = arrow.tableFromIPC(bytes);
         } catch (e: any) {
-            throw new Error(`Failed to decode Arrow IPC page: ${e?.message ?? String(e)}`);
+            throw new Error(`Failed to decode Arrow IPC page: ${e?.message ?? String(e)}`, {
+                cause: e,
+            });
         }
         return { ...base, kind: 'arrow', table };
     }

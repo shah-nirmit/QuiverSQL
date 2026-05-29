@@ -71,3 +71,57 @@ The response shape (eliding metadata):
 - **Arrow IPC** wins when results are large (>10K rows), contain `int64` outside the JS Number-safe range, contain decimals or timestamps where lossy ISO/float coercion would lose information, or the client has an Arrow consumer ready (a typed grid, a Polars/DuckDB ingest path, a notebook kernel).
 
 The VS Code extension exposes this as a single setting — `qsql.resultFormat: "json" | "arrow_ipc"` (default `"json"`) — and threads it through `query_start` automatically.
+
+## EXPLAIN ANALYZE Result Shape (Phase 10)
+
+The `explain_query` RPC method accepts an opt-in `analyze: Option<bool>` flag. When `analyze: true`, the daemon executes the physical plan through the same scan-guard envelope as `query_start`, harvests per-operator metrics from `ExecutionPlan::metrics()`, and stamps each plan-graph node's `PlanMetrics` with the runtime fields.
+
+### Request
+
+```
+Content-Length: 90
+
+{"jsonrpc":"2.0","id":7,"method":"explain_query","params":{"sql":"SELECT id FROM employees","analyze":true}}
+```
+
+`analyze` is `#[serde(skip_serializing_if = "Option::is_none")]`, so omitting it (or setting it to `false`) gives the existing planner-only behaviour — the response is byte-identical to Phase 9 callers.
+
+### Response shape additions
+
+Every `PlanNode.metrics` slot in the returned `PlanGraph` may carry three additive fields when ANALYZE ran:
+
+| Field | Type | Source |
+| --- | --- | --- |
+| `actual_rows` | `u64` | `MetricsSet::output_rows()` — actual row count produced by this operator. |
+| `elapsed_compute_ms` | `u64` | `MetricsSet::elapsed_compute()` converted from nanoseconds. |
+| `mem_used_bytes` | `u64` | Reserved for future memory accounting; currently `None` for every operator. |
+
+All three skip from the wire when `None`, so planner-only EXPLAINs continue to look exactly like Phase 9.
+
+In addition, `TableScan` nodes may carry these attribute strings (visible in `PlanNode.attributes`):
+
+- `is_full_scan = "true"` — the captured remote SQL (when present) has no `WHERE` / `LIMIT` / `FETCH FIRST`, **or** the local logical scan has empty `filters` and no `fetch` limit. The webview renders this as an orange `Full scan ⚠` badge.
+- `pushdown_reason = "multi_source_join" | "unsupported_expression" | "local_file_scan"` — coarse classification of why a filter pushdown didn't happen. Surfaced as a muted `Why: …` info line on the node.
+
+### Scan-guard semantics
+
+ANALYZE drains the physical plan under the same `remoteScanMaxRows` / `remoteScanMaxBytes` envelope as ordinary execution. Over-budget runs return the standard structured error:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 7,
+  "error": {
+    "code": -32100,
+    "message": "Scan Budget Exceeded …",
+    "data": { "details": "scan_guard" }
+  }
+}
+```
+
+— so ANALYZE never gives you a backdoor around the scan guard.
+
+### Lineage rich-shape additions
+
+`get_lineage` returns an additive shape: alongside the existing `tables` and `relations`, the response may carry `output_columns`, `joins`, `aggregates`, and `aliases` — all `#[serde(skip_serializing_if = "Vec::is_empty" | "HashMap::is_empty")]`. Each entry uses the same `(table, column)` `ColumnRef` shape documented in `qsql-core/src/engine.rs`. Clients that don't know about the new fields ignore them.
+

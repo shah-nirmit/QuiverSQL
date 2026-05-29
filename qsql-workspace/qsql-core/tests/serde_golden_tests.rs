@@ -1,3 +1,6 @@
+use qsql_core::engine::{
+    AggregateLineage, ColumnRef, JoinKey, JoinLineage, LineageInfo, OutputColumn, QueryLineage,
+};
 use qsql_core::models::*;
 use serde_json::json;
 
@@ -410,6 +413,9 @@ fn test_explain_query_models_golden() {
     let request = ExplainQueryRequest {
         sql: "SELECT 1".to_string(),
         include_native: Some(true),
+        // Phase 10 — `analyze` is `skip_serializing_if = "Option::is_none"`
+        // so the existing golden JSON below stays byte-identical.
+        analyze: None,
     };
     let req_expected = json!({
         "sql": "SELECT 1",
@@ -422,6 +428,11 @@ fn test_explain_query_models_golden() {
         estimated_bytes: None,
         startup_cost: Some(0.0),
         total_cost: Some(5.5),
+        // Phase 10 — runtime fields skip when None, so the metrics_expected
+        // JSON below stays byte-identical with Phase 9 clients.
+        actual_rows: None,
+        elapsed_compute_ms: None,
+        mem_used_bytes: None,
     };
     let metrics_expected = json!({
         "estimated_rows": 10.0,
@@ -496,4 +507,186 @@ fn test_explain_query_models_golden() {
         "warnings": ["warn1"]
     });
     assert_eq!(serde_json::to_value(&result).unwrap(), result_expected);
+}
+
+#[test]
+fn test_plan_metrics_golden_with_runtime_fields() {
+    // Phase 10 — when EXPLAIN ANALYZE populates runtime metrics, the new
+    // fields appear on the wire alongside the existing estimates.
+    // `skip_serializing_if = "Option::is_none"` keeps the planner-only
+    // shape byte-identical (covered by `test_explain_query_models_golden`).
+    let metrics = PlanMetrics {
+        estimated_rows: Some(10.0),
+        estimated_bytes: Some(160.0),
+        startup_cost: Some(0.0),
+        total_cost: Some(5.5),
+        actual_rows: Some(7),
+        elapsed_compute_ms: Some(42),
+        mem_used_bytes: Some(2048),
+    };
+    let expected = json!({
+        "estimated_rows": 10.0,
+        "estimated_bytes": 160.0,
+        "startup_cost": 0.0,
+        "total_cost": 5.5,
+        "actual_rows": 7,
+        "elapsed_compute_ms": 42,
+        "mem_used_bytes": 2048
+    });
+    assert_eq!(serde_json::to_value(&metrics).unwrap(), expected);
+    let deserialized: PlanMetrics = serde_json::from_value(expected).unwrap();
+    assert_eq!(deserialized, metrics);
+}
+
+#[test]
+fn test_explain_query_request_golden_with_analyze_flag() {
+    // Phase 10 — `analyze: Some(true)` makes it onto the wire; `None`
+    // continues to be omitted (covered by `test_explain_query_models_golden`).
+    let request = ExplainQueryRequest {
+        sql: "SELECT 1".to_string(),
+        include_native: None,
+        analyze: Some(true),
+    };
+    let expected = json!({
+        "sql": "SELECT 1",
+        "include_native": null,
+        "analyze": true
+    });
+    assert_eq!(serde_json::to_value(&request).unwrap(), expected);
+    let deserialized: ExplainQueryRequest = serde_json::from_value(expected).unwrap();
+    assert_eq!(deserialized, request);
+}
+
+#[test]
+fn test_query_lineage_legacy_shape_stays_byte_identical() {
+    // Phase 10 regression guard — when the daemon resolved only the
+    // legacy `tables` / `relations` fields (e.g. for a CREATE TABLE
+    // statement), the new fields are empty / default and must be
+    // skipped from the serialised payload so existing clients see
+    // exactly the Phase 9 shape.
+    let lineage = QueryLineage {
+        tables: vec!["employees".to_string()],
+        relations: vec![LineageInfo {
+            table_name: "employees".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+        }],
+        output_columns: Vec::new(),
+        joins: Vec::new(),
+        aggregates: Vec::new(),
+        aliases: std::collections::HashMap::new(),
+    };
+    let expected = json!({
+        "tables": ["employees"],
+        "relations": [{
+            "table_name": "employees",
+            "columns": ["id", "name"]
+        }]
+    });
+    assert_eq!(serde_json::to_value(&lineage).unwrap(), expected);
+}
+
+#[test]
+fn test_query_lineage_golden_with_outputs_and_joins() {
+    // Phase 10 — the rich-shape lineage payload returned by the new
+    // walker for a JOIN with a SUM aggregate and an aliased CTE. All
+    // four new fields are populated; the wire format records every
+    // entry as documented in `docs/JSON_RPC_FRAMING.md`.
+    let mut aliases = std::collections::HashMap::new();
+    aliases.insert("high_earners".to_string(), "employees".to_string());
+    let lineage = QueryLineage {
+        tables: vec!["departments".to_string(), "employees".to_string()],
+        relations: vec![
+            LineageInfo {
+                table_name: "departments".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+            },
+            LineageInfo {
+                table_name: "employees".to_string(),
+                columns: vec![
+                    "department_id".to_string(),
+                    "name".to_string(),
+                    "salary".to_string(),
+                ],
+            },
+        ],
+        output_columns: vec![
+            OutputColumn {
+                name: "department".to_string(),
+                sources: vec![ColumnRef {
+                    table: "departments".to_string(),
+                    column: "name".to_string(),
+                }],
+                expression_summary: "departments.name".to_string(),
+            },
+            OutputColumn {
+                name: "total".to_string(),
+                sources: vec![ColumnRef {
+                    table: "employees".to_string(),
+                    column: "salary".to_string(),
+                }],
+                expression_summary: "SUM(employees.salary)".to_string(),
+            },
+        ],
+        joins: vec![JoinLineage {
+            kind: "Inner".to_string(),
+            left_table: "departments".to_string(),
+            right_table: "employees".to_string(),
+            on: vec![JoinKey {
+                left_col: ColumnRef {
+                    table: "departments".to_string(),
+                    column: "id".to_string(),
+                },
+                right_col: ColumnRef {
+                    table: "employees".to_string(),
+                    column: "department_id".to_string(),
+                },
+            }],
+        }],
+        aggregates: vec![AggregateLineage {
+            function: "SUM".to_string(),
+            alias: Some("total".to_string()),
+            inputs: vec![ColumnRef {
+                table: "employees".to_string(),
+                column: "salary".to_string(),
+            }],
+        }],
+        aliases,
+    };
+    let expected = json!({
+        "tables": ["departments", "employees"],
+        "relations": [
+            { "table_name": "departments", "columns": ["id", "name"] },
+            { "table_name": "employees", "columns": ["department_id", "name", "salary"] }
+        ],
+        "output_columns": [
+            {
+                "name": "department",
+                "sources": [{ "table": "departments", "column": "name" }],
+                "expression_summary": "departments.name"
+            },
+            {
+                "name": "total",
+                "sources": [{ "table": "employees", "column": "salary" }],
+                "expression_summary": "SUM(employees.salary)"
+            }
+        ],
+        "joins": [{
+            "kind": "Inner",
+            "left_table": "departments",
+            "right_table": "employees",
+            "on": [{
+                "left_col": { "table": "departments", "column": "id" },
+                "right_col": { "table": "employees", "column": "department_id" }
+            }]
+        }],
+        "aggregates": [{
+            "function": "SUM",
+            "alias": "total",
+            "inputs": [{ "table": "employees", "column": "salary" }]
+        }],
+        "aliases": { "high_earners": "employees" }
+    });
+    assert_eq!(serde_json::to_value(&lineage).unwrap(), expected);
+    let deserialized: QueryLineage = serde_json::from_value(expected).unwrap();
+    assert_eq!(deserialized, lineage);
 }

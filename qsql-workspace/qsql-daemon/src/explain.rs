@@ -604,7 +604,8 @@ fn traverse_plan(
 
         // Real pushed-down SQL captured from datafusion-federation's
         // VirtualExecutionPlan. None for local file scans.
-        if let Some(info) = ctx.remote_sqls.and_then(|m| m.get(&tname)) {
+        let captured_sql = ctx.remote_sqls.and_then(|m| m.get(&tname));
+        if let Some(info) = captured_sql {
             remote_sql = Some(info.sql.clone());
             // Stamp sort_pushed_down=true on the TableScan itself when the
             // remote SQL contains an ORDER BY — closes the UX gap where the
@@ -613,6 +614,43 @@ fn traverse_plan(
             if sql_contains_order_by(&info.sql) {
                 attributes.insert("sort_pushed_down".to_string(), "true".to_string());
             }
+        }
+
+        // Phase 10 — full-scan detection + pushdown reasoning.
+        //
+        // `is_full_scan` is "true" when the captured remote SQL contains no
+        // WHERE / LIMIT (the federation layer couldn't push a predicate),
+        // OR — for local file scans without a captured SQL — when the
+        // logical scan has no filters and no `fetch` limit. This catches
+        // the common "select *" footgun and the multi-source-join shape
+        // where DataFusion has to read everything because the predicate
+        // references columns from multiple sources.
+        //
+        // `pushdown_reason` is a coarse, human-readable hint that the UI
+        // surfaces as a muted info line. See `classify_pushdown_reason` for
+        // the enum cases.
+        let is_guarded_provider = scan
+            .source
+            .as_any()
+            .downcast_ref::<DefaultTableSource>()
+            .and_then(|src| {
+                src.table_provider
+                    .as_any()
+                    .downcast_ref::<GuardedTableProvider>()
+            })
+            .is_some();
+        let is_full_scan = if let Some(info) = captured_sql {
+            !sql_has_where_or_limit(&info.sql)
+        } else {
+            scan.filters.is_empty() && scan.fetch.is_none()
+        };
+        if is_full_scan {
+            attributes.insert("is_full_scan".to_string(), "true".to_string());
+        }
+        if let Some(reason) =
+            classify_pushdown_reason(scan, ctx.remote_sqls, is_guarded_provider, is_full_scan)
+        {
+            attributes.insert("pushdown_reason".to_string(), reason.to_string());
         }
     }
 
@@ -630,6 +668,11 @@ fn traverse_plan(
                 estimated_bytes: None,
                 startup_cost: None,
                 total_cost: None,
+                // Phase 10 — runtime metrics are stamped in a post-pass by
+                // `apply_runtime_metrics` when the request opted into ANALYZE.
+                actual_rows: None,
+                elapsed_compute_ms: None,
+                mem_used_bytes: None,
             },
             source_ref,
             native_plan_ref,
@@ -696,6 +739,105 @@ fn source_kind_to_provider_kind(kind: SourceKind) -> String {
 fn sql_contains_order_by(sql: &str) -> bool {
     let upper = sql.to_uppercase();
     upper.contains("ORDER BY")
+}
+
+/// Phase 10 — companion of `sql_contains_order_by` for full-scan detection.
+/// Returns true when the captured federation SQL contains either a `WHERE`
+/// or a `LIMIT`/`FETCH FIRST` clause (any restriction at all). Used to
+/// decide whether a `TableScan` should be flagged as a full-table read.
+fn sql_has_where_or_limit(sql: &str) -> bool {
+    let upper = sql.to_uppercase();
+    upper.contains(" WHERE ") || upper.contains(" LIMIT ") || upper.contains(" FETCH FIRST ")
+}
+
+/// Phase 10 — classify *why* a pushdown didn't happen for this scan, so the
+/// UI can render a muted info line on the TableScan. Returns `None` when
+/// pushdown actually happened (captured SQL has WHERE / LIMIT), when the
+/// table scan isn't full, or when no useful classification applies.
+///
+/// The classification is deliberately coarse — it tells the user the broad
+/// shape of the limitation, not the precise expression that blocked it:
+///
+/// - `"local_file_scan"` — the scan is over a local file (CSV / Parquet /
+///   NDJSON / fixed-width). No pushdown surface exists.
+/// - `"multi_source_join"` — the scan is from a remote source AND multiple
+///   sources participate in this query (the captured `remote_sqls` map
+///   carries more than one entry). Federation can't push predicates that
+///   reference columns from other sources.
+/// - `"unsupported_expression"` — the scan is from a remote source AND
+///   pushdown failed for some other reason (single-source query where the
+///   filter still didn't make it into the remote SQL). This is the catch-all
+///   for "the connector's Unparser whitelist didn't cover the expression."
+fn classify_pushdown_reason(
+    scan: &TableScan,
+    remote_sqls: Option<&RemoteSqlMap>,
+    is_guarded_provider: bool,
+    is_full_scan: bool,
+) -> Option<&'static str> {
+    if !is_full_scan {
+        return None;
+    }
+    let qualified = qualified_table_name(&scan.table_name);
+    let captured = remote_sqls.and_then(|m| m.get(&qualified));
+    match captured {
+        // No captured SQL for this scan → it's a local file source. Only
+        // emit the reason when the scan is guarded (i.e. budget-tracked); a
+        // raw `MemTable` literal in test fixtures doesn't warrant the badge.
+        None if is_guarded_provider => Some("local_file_scan"),
+        None => None,
+        Some(_) => {
+            // Remote scan but no pushdown. Distinguish multi-source joins
+            // (the most common reason) from single-source connector
+            // limitations.
+            let multi_source = remote_sqls.map(|m| m.len() > 1).unwrap_or(false);
+            if multi_source {
+                Some("multi_source_join")
+            } else {
+                Some("unsupported_expression")
+            }
+        }
+    }
+}
+
+/// Phase 10 — post-pass applied to a `PlanGraph` after EXPLAIN ANALYZE
+/// completes. Walks the graph in the same pre-order that `traverse_plan`
+/// used to assign ids and stamps `actual_rows` / `elapsed_compute_ms` /
+/// `mem_used_bytes` on each `PlanMetrics` slot from the corresponding
+/// physical-plan operator metrics.
+///
+/// The pairing is by pre-order index. This is approximate when the
+/// physical planner inserts infrastructure operators
+/// (`CoalesceBatchesExec`, `RepartitionExec`) that don't have a logical
+/// counterpart — those entries simply land on whatever logical node
+/// happens to share their index. A future phase can do structural
+/// matching by operator type for tighter correlation; the current shape
+/// is good enough for the "did ANALYZE run, what did it produce" signal.
+pub fn apply_runtime_metrics(
+    graph: &mut PlanGraph,
+    metrics: &[qsql_core::engine::PhysicalNodeMetrics],
+) {
+    fn pre_order_walk(graph: &PlanGraph, node_id: &str, out: &mut Vec<String>) {
+        out.push(node_id.to_string());
+        if let Some(node) = graph.nodes.get(node_id) {
+            for child in &node.children {
+                pre_order_walk(graph, child, out);
+            }
+        }
+    }
+    let mut pre_order: Vec<String> = Vec::new();
+    for root in &graph.root_ids {
+        pre_order_walk(graph, root, &mut pre_order);
+    }
+    for (idx, node_id) in pre_order.iter().enumerate() {
+        let Some(physical) = metrics.get(idx) else {
+            break;
+        };
+        if let Some(node) = graph.nodes.get_mut(node_id) {
+            node.metrics.actual_rows = physical.actual_rows;
+            node.metrics.elapsed_compute_ms = physical.elapsed_compute_ms;
+            node.metrics.mem_used_bytes = physical.mem_used_bytes;
+        }
+    }
 }
 
 /// Evidence-based test: a Sort node is "pushed down" iff every TableScan in
@@ -1010,6 +1152,11 @@ fn plan_attributes(plan: &LogicalPlan) -> HashMap<String, String> {
                     );
                 }
             }
+            // NOTE: `is_full_scan` + `pushdown_reason` are stamped by
+            // `traverse_plan`, which has access to the captured `remote_sqls`
+            // map via the surrounding `TraverseContext`. Both attributes
+            // attach to this same `TableScan` node and supplement the
+            // baseline stamping above.
         }
         LogicalPlan::Sort(sort) => {
             attributes.insert("sort".to_string(), expressions_to_string(&sort.expr));

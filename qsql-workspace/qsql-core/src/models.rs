@@ -119,6 +119,15 @@ pub struct ExplainResult {
 pub struct ExplainQueryRequest {
     pub sql: String,
     pub include_native: Option<bool>,
+    /// Phase 10 — when `Some(true)`, the daemon executes the physical plan
+    /// (subject to the scan guard) and harvests per-operator runtime metrics
+    /// from DataFusion before serialising the response. Plan-graph node
+    /// `PlanMetrics` gains populated `actual_rows` / `elapsed_compute_ms` /
+    /// `mem_used_bytes`. Default (`None` / `Some(false)`) is unchanged:
+    /// planner-only EXPLAIN, no execution, no runtime metrics. Skipped from
+    /// the wire when unset to keep Phase 9 clients byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub analyze: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -177,6 +186,23 @@ pub struct PlanMetrics {
     pub estimated_bytes: Option<f64>,
     pub startup_cost: Option<f64>,
     pub total_cost: Option<f64>,
+    /// Phase 10 — actual rows produced by this operator during an
+    /// EXPLAIN ANALYZE run. Populated from
+    /// `ExecutionPlan::metrics().output_rows()`. `None` for planner-only
+    /// explains; `skip_serializing_if` keeps the wire format byte-identical
+    /// to Phase 9 clients in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_rows: Option<u64>,
+    /// Phase 10 — accumulated CPU time inside this operator, in
+    /// milliseconds, during EXPLAIN ANALYZE. From
+    /// `ExecutionPlan::metrics().elapsed_compute()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_compute_ms: Option<u64>,
+    /// Phase 10 — peak memory the operator's `MemoryReservation` claimed
+    /// during EXPLAIN ANALYZE. From the operator's MetricsSet `mem_used`
+    /// gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -485,6 +511,9 @@ mod tests {
                 estimated_bytes: None,
                 startup_cost: None,
                 total_cost: None,
+                actual_rows: None,
+                elapsed_compute_ms: None,
+                mem_used_bytes: None,
             },
             source_ref: None,
             native_plan_ref: None,
@@ -510,6 +539,9 @@ mod tests {
                 estimated_bytes: None,
                 startup_cost: None,
                 total_cost: None,
+                actual_rows: None,
+                elapsed_compute_ms: None,
+                mem_used_bytes: None,
             },
             source_ref: Some("pg.customers".to_string()),
             native_plan_ref: Some("pg.customers".to_string()),

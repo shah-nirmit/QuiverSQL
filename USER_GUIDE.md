@@ -148,13 +148,30 @@ ORDER BY o.order_total DESC;
 ## 5. Visualizing Query Lineage & Explain Plans
 
 ### Query Lineage
-While your cursor is inside the federated query above, look at the **Query Lineage** tree view in the QuiverSQL sidebar. You will see a visual representation of all the exact database tables being referenced (`pg.customers`, `pg.customer_profiles`, `mysql.orders`, `mysql.products`).
+While your cursor is inside the federated query above, look at the **Query Lineage** tree view in the QuiverSQL sidebar. The tree is organised into four collapsible sections (Phase 10):
+
+- **Output Columns (N)** — one entry per SELECT-list expression with its display name, the underlying `(table, column)` sources it depends on, and a short expression summary (e.g. `SUM(employees.salary)`).
+- **Sources (N)** — the legacy per-table view: each source table expands to the columns the query actually references (column-pruned via the optimiser).
+- **Joins (N)** — every JOIN traversed during planning, labelled with the join kind (Inner / Left / …) and expandable to the on-clause keys (`employees.department_id = departments.id`).
+- **Aggregates (N)** — every aggregate function with its input columns and (when the user supplied one) its alias.
+
+When the daemon is an older binary that doesn't ship the rich lineage payload, only the **Sources** section appears, so the tree gracefully degrades.
 
 ### Explain Plan & Sort Pushdowns
 1. Above the federated query, click the **📊 Explain Query** CodeLens.
-2. A beautiful SVG Plan Graph will open. The top of the **Tree** tab has a legend bar explaining badge colours (`Broadcast pushdown`, `Sort pushdown`, `TableScan`).
+2. A beautiful SVG Plan Graph will open. The top of the **Tree** tab has a legend bar explaining badge colours (`Broadcast pushdown`, `Sort pushdown`, `Full scan`, `TableScan`).
 3. Locate the `Sort` nodes. You will notice that QuiverSQL recognized the `ORDER BY` clause and pushed it down to the native databases where applicable! Look for the **`Sort ↓ pushed`** badge on **both** the `Sort` node *and* the `TableScan` it feeds — the badge on the scan tells you which scan returns pre-sorted rows.
 4. Click any `TableScan` to jump to its per-table card in the **Source** tab (see Section 8 below).
+
+### B. Rich Explain: ANALYZE, Full-Scan Warnings, And The Metrics Overlay
+
+Phase 10 added three diagnostic surfaces on top of the regular Explain panel:
+
+- **Full-scan badge.** Run `SELECT * FROM employees` (no `WHERE`, no `LIMIT`) and click **📊 Explain Query**. The `TableScan` node gets an orange **`Full scan ⚠`** badge — the daemon noticed neither the captured remote SQL nor the local logical scan carried a restricting predicate. Underneath, a muted `Why: local_file_scan` (or `multi_source_join` / `unsupported_expression`) line tells you *why* a filter pushdown didn't happen.
+- **EXPLAIN ANALYZE.** Open VS Code **Settings** (`Cmd+,`) and turn on **`qsql.explainAnalyzeEnabled`**. Each query block gains a third CodeLens: **🔍 Explain (ANALYZE)**. Clicking it drives the physical plan to completion under the **same scan guard** as `Run Query` (over-budget runs still surface the `-32100 Scan Budget Exceeded` banner) and harvests per-operator metrics from DataFusion.
+- **Metrics overlay.** Once an ANALYZE plan loads, the legend bar's **Metrics** button becomes enabled. Toggle it on to render a muted `actual: 1.2M rows · 3.4ms` line per node showing the real row count and elapsed compute. The button stays disabled on planner-only EXPLAINs with a tooltip explaining how to enable it.
+
+Because ANALYZE actually executes the query, it's gated behind a setting — the default keeps the third CodeLens hidden so users don't accidentally pull a billion-row remote source.
 
 ---
 

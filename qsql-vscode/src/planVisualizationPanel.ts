@@ -376,6 +376,30 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         .swatch-broadcast { background: var(--vscode-charts-orange); }
         .swatch-sort      { background: var(--vscode-charts-blue, #4fc1ff); }
         .swatch-scan      { background: transparent; border: 1.5px solid var(--vscode-focusBorder); }
+        .swatch-warn      { background: var(--vscode-editorWarning-foreground, #e0a000); }
+        /* Phase 10 — legend toggle button for the runtime-metrics overlay. */
+        .legend-toggle {
+            margin-left: auto;
+            padding: 2px 8px;
+            font-size: 11px;
+            border: 1px solid var(--vscode-button-border, transparent);
+            background: var(--vscode-button-secondaryBackground);
+            color: var(--vscode-button-secondaryForeground);
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        .legend-toggle[aria-pressed="true"] {
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+        }
+        .legend-toggle:disabled {
+            opacity: 0.55;
+            cursor: not-allowed;
+        }
+        /* Per-node text classes for the new Phase 10 badges. */
+        .node-warn    { fill: var(--vscode-editorWarning-foreground, #e0a000); font-weight: 700; }
+        .node-info    { fill: var(--vscode-descriptionForeground); font-style: italic; }
+        .node-runtime { fill: var(--vscode-charts-green, #4caf50); font-style: italic; }
         /* TableScan node icon is rendered in the SVG at (8, 8); shift the
            node-type label right so it doesn't overlap. */
         .node-type-with-icon { transform: translate(20px, 0); }
@@ -480,7 +504,10 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         <div class="legend-bar" role="note" aria-label="Plan badge legend">
             <span class="legend-item"><span class="legend-swatch swatch-broadcast"></span>Broadcast pushdown</span>
             <span class="legend-item"><span class="legend-swatch swatch-sort"></span>Sort pushdown</span>
+            <span class="legend-item"><span class="legend-swatch swatch-warn"></span>Full scan</span>
             <span class="legend-item"><span class="legend-swatch swatch-scan"></span>TableScan</span>
+            <button id="metrics-toggle" class="legend-toggle" aria-pressed="false"
+                    title="Show actual rows + elapsed compute from EXPLAIN ANALYZE">Metrics</button>
         </div>
         <div id="tree-container">
             <svg id="plan-svg" role="img" aria-label="Federated query plan tree">
@@ -537,6 +564,10 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         const copyPayloads = ${copyPayloadsJson};
         const treeState = { rendered: false, scale: 1, x: 24, y: 24, width: 1, height: 1 };
         let panState = null;
+        // Phase 10 — metrics overlay state. When true, nodeLines appends
+        // a muted "actual: N rows · Xms" line per node from runtime
+        // metrics. Toggled via the legend-bar button below.
+        let metricsOverlayOn = false;
 
         document.querySelectorAll('.tab').forEach(function(tab) {
             tab.addEventListener('click', function() {
@@ -626,6 +657,26 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
                 .replace(/'/g, '&#039;');
         }
 
+        // Phase 10 — formats a runtime-row count using K/M/B suffixes so a
+        // 1,234,567-row scan renders as "1.2M" instead of overflowing the
+        // node box.
+        function formatRowCount(n) {
+            if (!hasNumber(n)) return '';
+            if (n >= 1_000_000_000) return (n / 1_000_000_000).toFixed(1) + 'B';
+            if (n >= 1_000_000)     return (n / 1_000_000).toFixed(1) + 'M';
+            if (n >= 1_000)         return (n / 1_000).toFixed(1) + 'K';
+            return String(n);
+        }
+
+        // Phase 10 — formats elapsed-compute milliseconds compactly:
+        // sub-millisecond renders as "<1ms", anything above 1s uses "s".
+        function formatElapsedMs(ms) {
+            if (!hasNumber(ms)) return '';
+            if (ms < 1) return '<1ms';
+            if (ms < 1000) return ms + 'ms';
+            return (ms / 1000).toFixed(2) + 's';
+        }
+
         function nodeLines(node) {
             const isTableScan = node.node_type === 'TableScan';
             const lines = [{
@@ -643,6 +694,40 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
             if (metrics) lines.push({ text: metrics, cls: 'node-muted' });
             if (node.native_plan_ref && sourcePlans[node.native_plan_ref]) {
                 lines.push({ text: 'Click for Native SQL ↦', cls: 'node-native' });
+            }
+            // Phase 10 — full-scan warning. Surfaced as orange "Full scan ⚠"
+            // whenever the daemon stamped is_full_scan="true" on a
+            // TableScan that had neither a captured WHERE/LIMIT nor a local
+            // filter+fetch pair. Always rendered (not gated by the metrics
+            // toggle) because it is a planner-time finding, not runtime.
+            if (node.attributes && node.attributes.is_full_scan === 'true') {
+                lines.push({ text: 'Full scan ⚠', cls: 'node-warn' });
+            }
+            // Phase 10 — pushdown reasoning info line. The daemon classifies
+            // why a filter wasn't pushed down (multi_source_join /
+            // unsupported_expression / local_file_scan); the UI renders it
+            // as a muted hint so the user can understand the plan shape
+            // without re-reading the docs.
+            if (node.attributes && node.attributes.pushdown_reason) {
+                lines.push({
+                    text: 'Why: ' + String(node.attributes.pushdown_reason).replace(/_/g, ' '),
+                    cls: 'node-info',
+                });
+            }
+            // Phase 10 — runtime metrics overlay (EXPLAIN ANALYZE). Renders
+            // a single "actual: <rows> · <ms>" line per node when the
+            // overlay toggle is on and runtime metrics survived the
+            // ANALYZE drain. Mem is only shown when present.
+            if (metricsOverlayOn && node.metrics && hasNumber(node.metrics.actual_rows)) {
+                const m = node.metrics;
+                const segments = ['actual: ' + formatRowCount(m.actual_rows) + ' rows'];
+                if (hasNumber(m.elapsed_compute_ms)) {
+                    segments.push(formatElapsedMs(m.elapsed_compute_ms));
+                }
+                if (hasNumber(m.mem_used_bytes)) {
+                    segments.push(formatRowCount(m.mem_used_bytes) + 'B');
+                }
+                lines.push({ text: segments.join(' · '), cls: 'node-runtime' });
             }
             // Broadcast-rewrite badge. The daemon stamps the rewrite metadata
             // on up to three surfaces per BroadcastApplication — the remote
@@ -849,6 +934,32 @@ export function renderPlanVisualizationHtml(result: ExplainQueryResult, nonce: s
         document.getElementById('tree-zoom-out').addEventListener('click', function() { zoomTree(1 / 1.2); });
         document.getElementById('tree-fit').addEventListener('click', fitTree);
         document.getElementById('tree-reset').addEventListener('click', resetTree);
+
+        // Phase 10 — metrics overlay toggle. We disable the button entirely
+        // when no plan node carries an actual_rows field (the response
+        // came from a planner-only EXPLAIN, not from an ANALYZE run). The
+        // tooltip explains how to enable it.
+        (function setupMetricsToggle() {
+            const btn = document.getElementById('metrics-toggle');
+            if (!btn) return;
+            const anyRuntime = Object.keys(graph.nodes || {}).some(function(id) {
+                const m = graph.nodes[id] && graph.nodes[id].metrics;
+                return m && hasNumber(m.actual_rows);
+            });
+            if (!anyRuntime) {
+                btn.disabled = true;
+                btn.title = 'Re-run with Explain (ANALYZE) to see runtime metrics';
+                return;
+            }
+            btn.addEventListener('click', function() {
+                metricsOverlayOn = !metricsOverlayOn;
+                btn.setAttribute('aria-pressed', metricsOverlayOn ? 'true' : 'false');
+                // Force a fresh render — treeState.rendered is the latch
+                // renderTree uses to skip repeated layout computation.
+                treeState.rendered = false;
+                renderTree();
+            });
+        })();
 
         const treeContainer = document.getElementById('tree-container');
         treeContainer.addEventListener('mousedown', function(event) {

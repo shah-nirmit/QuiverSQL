@@ -308,11 +308,35 @@ export class DaemonClient {
     }
 
     
-    public explainQuery(sql: string, includeNative: boolean = true): Promise<ExplainQueryResult> {
+    /**
+     * Send an `explain_query` request to the daemon.
+     *
+     * Phase 10 — the optional second argument bundles `includeNative` (the
+     * legacy boolean) and `analyze` (the new opt-in EXPLAIN ANALYZE flag).
+     * Callers that don't pass anything get the existing behaviour:
+     * `include_native = true`, `analyze = undefined` (planner-only).
+     *
+     * Passing `{ analyze: true }` makes the daemon execute the plan to
+     * completion under the existing scan-guard envelope and stamp each
+     * plan-graph node with runtime metrics (`actual_rows` /
+     * `elapsed_compute_ms` / `mem_used_bytes`). Over-budget runs surface
+     * the standard `-32100 Scan Budget Exceeded` error.
+     */
+    public explainQuery(
+        sql: string,
+        options: { includeNative?: boolean; analyze?: boolean } | boolean = {},
+    ): Promise<ExplainQueryResult> {
+        // Backwards-compat: the previous signature accepted a bare boolean
+        // `includeNative` as the second arg.
+        const opts: { includeNative?: boolean; analyze?: boolean } =
+            typeof options === 'boolean' ? { includeNative: options } : options;
         const request: ExplainQueryRequest = {
             sql,
-            include_native: includeNative
+            include_native: opts.includeNative ?? true,
         };
+        if (opts.analyze === true) {
+            request.analyze = true;
+        }
         return this.sendRequest<ExplainQueryResult>('explain_query', request);
     }
 

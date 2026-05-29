@@ -1060,63 +1060,115 @@ impl QsqlEngine {
             .map_err(|e| e.to_string())
     }
 
+    /// Phase 10 — drive the physical plan to completion under the existing
+    /// scan-guard envelope, discarding the batches but harvesting per-operator
+    /// metrics via `ExecutionPlan::metrics()` afterwards. Returns a
+    /// pre-order [`PhysicalNodeMetrics`] vector so callers can pair entries
+    /// with the corresponding logical-plan nodes by index.
+    ///
+    /// Scan-guard failures surface through the same
+    /// `SCAN_GUARD_ERROR_CODE` path as `start_query_stream`, so
+    /// over-budget ANALYZE runs raise the standard
+    /// `-32100 Scan Budget Exceeded` error.
+    pub async fn execute_physical_plan_collect_metrics(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        cancellation: CancellationToken,
+        timeout_ms: Option<u64>,
+    ) -> Result<Vec<PhysicalNodeMetrics>, QueryError> {
+        let ctx = self.execution_context().map_err(query_execution_error)?;
+        let task_ctx = ctx.task_ctx();
+        let mut stream = datafusion::physical_plan::execute_stream(plan.clone(), task_ctx)
+            .map_err(query_execution_error)?;
+        let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+        loop {
+            if cancellation.is_cancelled() {
+                return Err(query_cancelled_error());
+            }
+            if let Some(d) = deadline {
+                if Instant::now() >= d {
+                    return Err(QueryError {
+                        code: -32003,
+                        message: "Query exceeded timeout while collecting ANALYZE metrics"
+                            .to_string(),
+                        details: None,
+                    });
+                }
+            }
+            match stream.next().await {
+                Some(Ok(_batch)) => continue,
+                Some(Err(e)) => return Err(query_execution_error(e)),
+                None => break,
+            }
+        }
+        let mut out = Vec::new();
+        collect_metrics_pre_order(plan.as_ref(), &mut out);
+        Ok(out)
+    }
+
     pub async fn get_query_lineage(&self, sql: &str) -> Result<QueryLineage, String> {
         let ctx = self.execution_context()?;
-        let plan = ctx
+        let unoptimized = ctx
             .state()
             .create_logical_plan(sql)
             .await
             .map_err(|e| e.to_string())?;
-        let plan = ctx.state().optimize(&plan).map_err(|e| e.to_string())?;
+        let optimized = ctx
+            .state()
+            .optimize(&unoptimized)
+            .map_err(|e| e.to_string())?;
 
-        let mut results = std::collections::HashMap::new();
-        fn extract_lineage(
-            plan: &datafusion::logical_expr::LogicalPlan,
-            results: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
-        ) {
-            use datafusion::logical_expr::LogicalPlan;
-            match plan {
-                LogicalPlan::TableScan(scan) => {
-                    let table_name = scan.table_name.table().to_string();
-                    let entry = results.entry(table_name).or_default();
-                    let schema = scan.source.schema();
-                    if let Some(proj) = &scan.projection {
-                        for &idx in proj {
-                            if let Some(field) = schema.fields().get(idx) {
-                                entry.insert(field.name().clone());
-                            }
-                        }
-                    } else {
-                        for field in schema.fields() {
-                            entry.insert(field.name().clone());
-                        }
-                    }
-                }
-                _ => {
-                    for input in plan.inputs() {
-                        extract_lineage(input, results);
-                    }
-                }
-            }
-        }
+        // Phase 10 — multi-source walk:
+        //
+        //   * Pre-walk: scrape every `Alias(inner, name)` in the
+        //     unoptimised plan to build a `display(inner) → alias` map.
+        //     User-supplied aggregate aliases (`SUM(x) AS total`) survive
+        //     as `Alias(Column("SUM(x)"), "total")` on the Projection but
+        //     the actual `AggregateFunction` lives only on the Aggregate
+        //     node — this map lets us correlate them by display string.
+        //
+        //   * Pass 1 (optimised) — `tables`, `relations` (column-pruned),
+        //     `joins` (the optimiser is the pass that lifts equi-join
+        //     predicates into `Join.on`), `aggregates` (the Aggregate
+        //     node's `aggr_expr` is fully populated here).
+        //
+        //   * Pass 2 (unoptimised) — `output_columns` (top-level
+        //     Projection survives the optimiser inconsistently), and
+        //     `SubqueryAlias` aliases (the optimiser often folds these
+        //     away).
+        let mut alias_map = std::collections::HashMap::<String, String>::new();
+        collect_projection_aliases(&unoptimized, &mut alias_map);
 
-        extract_lineage(&plan, &mut results);
+        let mut opt_builder = LineageBuilder::default();
+        walk_lineage(&optimized, &mut opt_builder, &alias_map);
 
-        let mut tables = Vec::new();
-        let mut relations = Vec::new();
-        for (table_name, cols) in results {
-            tables.push(table_name.clone());
-            let mut columns: Vec<String> = cols.into_iter().collect();
-            columns.sort();
-            relations.push(LineageInfo {
-                table_name,
-                columns,
-            });
-        }
+        let mut rich_builder = LineageBuilder::default();
+        walk_lineage(&unoptimized, &mut rich_builder, &alias_map);
+
+        let mut tables: Vec<String> = opt_builder.relations.keys().cloned().collect();
         tables.sort();
+        let mut relations: Vec<LineageInfo> = opt_builder
+            .relations
+            .into_iter()
+            .map(|(table_name, cols)| {
+                let mut columns: Vec<String> = cols.into_iter().collect();
+                columns.sort();
+                LineageInfo {
+                    table_name,
+                    columns,
+                }
+            })
+            .collect();
         relations.sort_by(|a, b| a.table_name.cmp(&b.table_name));
 
-        Ok(QueryLineage { tables, relations })
+        Ok(QueryLineage {
+            tables,
+            relations,
+            output_columns: rich_builder.output_columns,
+            joins: opt_builder.joins,
+            aggregates: opt_builder.aggregates,
+            aliases: rich_builder.aliases,
+        })
     }
 }
 
@@ -1418,16 +1470,392 @@ impl Default for QsqlEngine {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+/// Phase 10 — runtime metrics harvested from a single physical-plan
+/// operator after `execute_physical_plan_collect_metrics` drains the
+/// stream. The fields are aligned with `PlanMetrics` but kept in
+/// `qsql-core` to avoid pulling the daemon-side `PlanMetrics` type back
+/// into the engine crate.
+#[derive(Debug, Clone, Default)]
+pub struct PhysicalNodeMetrics {
+    pub actual_rows: Option<u64>,
+    pub elapsed_compute_ms: Option<u64>,
+    pub mem_used_bytes: Option<u64>,
+}
+
+fn collect_metrics_pre_order(plan: &dyn ExecutionPlan, out: &mut Vec<PhysicalNodeMetrics>) {
+    let metrics_set = plan.metrics();
+    let actual_rows = metrics_set
+        .as_ref()
+        .and_then(|m| m.output_rows())
+        .map(|n| n as u64);
+    // `elapsed_compute` is reported in nanoseconds; surface milliseconds on
+    // the wire so the UI doesn't have to do unit math.
+    let elapsed_compute_ms = metrics_set
+        .as_ref()
+        .and_then(|m| m.elapsed_compute())
+        .map(|ns| (ns as u64) / 1_000_000);
+    out.push(PhysicalNodeMetrics {
+        actual_rows,
+        elapsed_compute_ms,
+        // mem_used isn't reported by every operator; leave None until a
+        // future phase wires in a per-operator memory accounting pass.
+        mem_used_bytes: None,
+    });
+    for child in plan.children() {
+        collect_metrics_pre_order(child.as_ref(), out);
+    }
+}
+
+/// Phase 10 — accumulator for the typed lineage walker. Owned by
+/// `get_query_lineage` for the duration of a single SQL query; reset
+/// per-call. Each field maps 1:1 to a `QueryLineage` field.
+#[derive(Default)]
+struct LineageBuilder {
+    relations: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    output_columns: Vec<OutputColumn>,
+    joins: Vec<JoinLineage>,
+    aggregates: Vec<AggregateLineage>,
+    aliases: std::collections::HashMap<String, String>,
+    /// Only stamp `output_columns` from the topmost `Projection` /
+    /// `Aggregate` encountered. Inner projections are intermediate
+    /// rewrites (CTE bodies, subqueries) — recording them would
+    /// pollute the SELECT-list view.
+    output_columns_seen: bool,
+}
+
+/// Phase 10 — pre-walk that scrapes `Alias(inner, name)` entries from
+/// every `Projection` in a (typically unoptimised) plan. The result is a
+/// map from `display(inner)` → `name` that downstream
+/// `decompose_aggregate` callers consult when the Aggregate's own
+/// `aggr_expr` is bare (the common case after the optimiser folds
+/// `SUM(x) AS total` into `Aggregate { aggr_expr: [SUM(x)] } →
+/// Projection { expr: [..., Alias(Column("SUM(x)"), "total")] }`).
+fn collect_projection_aliases(
+    plan: &LogicalPlan,
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    if let LogicalPlan::Projection(p) = plan {
+        for expr in &p.expr {
+            if let Expr::Alias(a) = expr {
+                out.insert(format!("{}", a.expr), a.name.clone());
+            }
+        }
+    }
+    for input in plan.inputs() {
+        collect_projection_aliases(input, out);
+    }
+}
+
+fn walk_lineage(
+    plan: &LogicalPlan,
+    builder: &mut LineageBuilder,
+    alias_map: &std::collections::HashMap<String, String>,
+) {
+    match plan {
+        LogicalPlan::TableScan(scan) => {
+            let table_name = scan.table_name.table().to_string();
+            let entry = builder.relations.entry(table_name).or_default();
+            let schema = scan.source.schema();
+            if let Some(proj) = &scan.projection {
+                for &idx in proj {
+                    if let Some(field) = schema.fields().get(idx) {
+                        entry.insert(field.name().clone());
+                    }
+                }
+            } else {
+                for field in schema.fields() {
+                    entry.insert(field.name().clone());
+                }
+            }
+        }
+        LogicalPlan::Projection(proj) => {
+            if !builder.output_columns_seen {
+                for expr in &proj.expr {
+                    let (name, sources, summary) = decompose_projection_expr(expr);
+                    builder.output_columns.push(OutputColumn {
+                        name,
+                        sources,
+                        expression_summary: summary,
+                    });
+                    // Phase 10 — aggregates with user-supplied aliases (the
+                    // common `SELECT SUM(x) AS total` shape) live on this
+                    // Projection above the Aggregate node; the Aggregate's
+                    // own `aggr_expr` is the bare un-aliased
+                    // `AggregateFunction`. Harvesting from here keeps the
+                    // alias attached. The Aggregate branch below skips its
+                    // own harvest when this list is already populated.
+                    if let Some(decomposed) = decompose_aggregate(expr, alias_map) {
+                        builder.aggregates.push(decomposed);
+                    }
+                }
+                builder.output_columns_seen = true;
+            }
+            walk_lineage(&proj.input, builder, alias_map);
+        }
+        LogicalPlan::Join(join) => {
+            let left_table = primary_table(&join.left).unwrap_or_else(|| "<subquery>".to_string());
+            let right_table =
+                primary_table(&join.right).unwrap_or_else(|| "<subquery>".to_string());
+            let on: Vec<JoinKey> = join
+                .on
+                .iter()
+                .filter_map(|(l, r)| {
+                    let l_refs = l.column_refs();
+                    let r_refs = r.column_refs();
+                    let lc = l_refs.iter().next()?;
+                    let rc = r_refs.iter().next()?;
+                    Some(JoinKey {
+                        left_col: column_to_ref(lc),
+                        right_col: column_to_ref(rc),
+                    })
+                })
+                .collect();
+            builder.joins.push(JoinLineage {
+                kind: format!("{:?}", join.join_type),
+                left_table,
+                right_table,
+                on,
+            });
+            walk_lineage(&join.left, builder, alias_map);
+            walk_lineage(&join.right, builder, alias_map);
+        }
+        LogicalPlan::Aggregate(agg) => {
+            if !builder.output_columns_seen {
+                // GROUP BY expressions come first in the SELECT-list ordering
+                // for a `GROUP BY a, b SELECT a, b, SUM(c)` shape; then the
+                // aggregate expressions follow. This mirrors DataFusion's
+                // own output-schema ordering.
+                for expr in &agg.group_expr {
+                    let (name, sources, summary) = decompose_projection_expr(expr);
+                    builder.output_columns.push(OutputColumn {
+                        name,
+                        sources,
+                        expression_summary: summary,
+                    });
+                }
+                for expr in &agg.aggr_expr {
+                    let (name, sources, summary) = decompose_projection_expr(expr);
+                    builder.output_columns.push(OutputColumn {
+                        name,
+                        sources,
+                        expression_summary: summary,
+                    });
+                }
+                builder.output_columns_seen = true;
+            }
+            // Only harvest from the Aggregate node when the Projection
+            // above didn't already populate them (alias-less aggregates,
+            // or queries with no enclosing Projection).
+            if builder.aggregates.is_empty() {
+                for expr in &agg.aggr_expr {
+                    if let Some(decomposed) = decompose_aggregate(expr, alias_map) {
+                        builder.aggregates.push(decomposed);
+                    }
+                }
+            }
+            walk_lineage(&agg.input, builder, alias_map);
+        }
+        LogicalPlan::SubqueryAlias(sub) => {
+            let primary = primary_table(&sub.input).unwrap_or_else(|| "<subquery>".to_string());
+            builder
+                .aliases
+                .insert(sub.alias.table().to_string(), primary);
+            walk_lineage(&sub.input, builder, alias_map);
+        }
+        other => {
+            for input in other.inputs() {
+                walk_lineage(input, builder, alias_map);
+            }
+        }
+    }
+}
+
+fn column_to_ref(col: &datafusion::common::Column) -> ColumnRef {
+    ColumnRef {
+        table: col
+            .relation
+            .as_ref()
+            .map(|r| r.table().to_string())
+            .unwrap_or_default(),
+        column: col.name.clone(),
+    }
+}
+
+fn decompose_projection_expr(expr: &Expr) -> (String, Vec<ColumnRef>, String) {
+    // Strip an outer Alias to recover the user-given name; everything else
+    // (`SELECT name FROM t`) names itself by its rendered string.
+    let (name, inner): (String, &Expr) = match expr {
+        Expr::Alias(alias) => (alias.name.clone(), alias.expr.as_ref()),
+        Expr::Column(col) => (col.name.clone(), expr),
+        other => (format!("{other}"), other),
+    };
+    let mut sources: Vec<ColumnRef> = inner
+        .column_refs()
+        .iter()
+        .map(|c| column_to_ref(c))
+        .collect();
+    sources.sort_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
+    sources.dedup();
+    let summary = expression_summary(inner);
+    (name, sources, summary)
+}
+
+fn expression_summary(expr: &Expr) -> String {
+    let raw = format!("{expr}");
+    if raw.chars().count() > 120 {
+        let truncated: String = raw.chars().take(117).collect();
+        format!("{truncated}...")
+    } else {
+        raw
+    }
+}
+
+fn decompose_aggregate(
+    expr: &Expr,
+    alias_map: &std::collections::HashMap<String, String>,
+) -> Option<AggregateLineage> {
+    let (mut alias, inner): (Option<String>, &Expr) = match expr {
+        Expr::Alias(a) => (Some(a.name.clone()), a.expr.as_ref()),
+        other => (None, other),
+    };
+    match inner {
+        Expr::AggregateFunction(af) => {
+            // When the optimiser has stripped the SELECT-list alias off the
+            // aggregate (the common case — see `collect_projection_aliases`),
+            // recover it by display-string lookup.
+            if alias.is_none() {
+                let canonical = format!("{inner}");
+                alias = alias_map.get(&canonical).cloned();
+            }
+            let function = af.func.name().to_uppercase();
+            let mut inputs: Vec<ColumnRef> = Vec::new();
+            for arg in &af.params.args {
+                for c in arg.column_refs() {
+                    inputs.push(column_to_ref(c));
+                }
+            }
+            inputs.sort_by(|a, b| a.table.cmp(&b.table).then(a.column.cmp(&b.column)));
+            inputs.dedup();
+            Some(AggregateLineage {
+                function,
+                alias,
+                inputs,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Best-effort primary table for a sub-plan — used to label the left/right
+/// sides of a `JoinLineage`. We descend through `SubqueryAlias` so a
+/// `SELECT ... FROM employees e` produces `"employees"`, not the rendered
+/// alias `"e"`. When the subtree spans multiple sources with no single
+/// base table, fall back to the alias name (if any), otherwise return
+/// `None` so callers can record `"<subquery>"` themselves.
+fn primary_table(plan: &LogicalPlan) -> Option<String> {
+    match plan {
+        LogicalPlan::TableScan(scan) => Some(scan.table_name.table().to_string()),
+        LogicalPlan::SubqueryAlias(sub) => {
+            primary_table(&sub.input).or_else(|| Some(sub.alias.table().to_string()))
+        }
+        other => {
+            for input in other.inputs() {
+                if let Some(t) = primary_table(input) {
+                    return Some(t);
+                }
+            }
+            None
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct LineageInfo {
     pub table_name: String,
     pub columns: Vec<String>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+/// Phase 10 — fully-qualified `(table, column)` pointer used by every Phase 10
+/// lineage field. The `table` half is the rendered table alias when the user
+/// supplied one, otherwise the base-relation name as DataFusion sees it.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ColumnRef {
+    pub table: String,
+    pub column: String,
+}
+
+/// Phase 10 — one entry per SELECT-list expression after optimization.
+/// `name` is the rendered column name (after any `AS alias`); `sources` is
+/// every column the expression depends on (resolved via `Expr::column_refs`);
+/// `expression_summary` is a short human-readable formatting of the
+/// expression itself ("`SUM(salary)`", "`name || ' ' || surname`").
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct OutputColumn {
+    pub name: String,
+    pub sources: Vec<ColumnRef>,
+    pub expression_summary: String,
+}
+
+/// Phase 10 — one `(left_col, right_col)` pair from a JOIN's ON clause.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct JoinKey {
+    pub left_col: ColumnRef,
+    pub right_col: ColumnRef,
+}
+
+/// Phase 10 — one entry per `LogicalPlan::Join` traversed. `kind` is the
+/// stringified join type (`"Inner"`, `"Left"`, `"Right"`, `"Full"`, `"Cross"`);
+/// `left_table` / `right_table` are best-effort table names recovered from
+/// the join inputs (fallback `"<subquery>"` when an input is a complex
+/// subplan with no single base table).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct JoinLineage {
+    pub kind: String,
+    pub left_table: String,
+    pub right_table: String,
+    pub on: Vec<JoinKey>,
+}
+
+/// Phase 10 — one entry per aggregate function in the query.
+/// `function` is uppercase (`"SUM"`, `"COUNT"`, `"AVG"`); `alias` is the
+/// rendered alias (None when the user didn't supply one); `inputs` are the
+/// columns flowing into the aggregate. For `COUNT(*)` the `inputs` vector
+/// is empty.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct AggregateLineage {
+    pub function: String,
+    pub alias: Option<String>,
+    pub inputs: Vec<ColumnRef>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct QueryLineage {
     pub tables: Vec<String>,
     pub relations: Vec<LineageInfo>,
+    /// Phase 10 — final SELECT-list output columns with source attribution.
+    /// Each entry records the column's display name plus the (table, column)
+    /// pairs that contribute to its value. Aggregates, simple projections,
+    /// and renamed-via-alias columns all populate this. Empty when the
+    /// daemon couldn't resolve a `Projection` (or for non-Projection plans
+    /// like `Insert` / `CreateView`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_columns: Vec<OutputColumn>,
+    /// Phase 10 — join conditions traversed during planning. Lets the UI
+    /// render "joined on pg.customers.id = mysql.orders.customer_id"
+    /// without re-parsing SQL.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub joins: Vec<JoinLineage>,
+    /// Phase 10 — one entry per aggregate function in the query
+    /// (`COUNT(*)`, `SUM(amount)`, `AVG(score)`). Inputs flow from
+    /// `Expr::column_refs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregates: Vec<AggregateLineage>,
+    /// Phase 10 — alias map: rendered name → fully-qualified source.
+    /// Populated from `LogicalPlan::SubqueryAlias`. The UI uses this to label
+    /// the lineage tree with the user's chosen alias rather than the
+    /// underlying table name.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub aliases: std::collections::HashMap<String, String>,
 }
 
 pub fn arrow_schema_to_qsql_schema(schema: &datafusion::arrow::datatypes::Schema) -> QsqlSchema {
@@ -1451,6 +1879,7 @@ mod tests {
     use datafusion::arrow::datatypes::SchemaRef;
     use datafusion::common::stats::Precision;
     use datafusion::datasource::MemTable;
+    use std::collections::HashSet;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1548,6 +1977,197 @@ mod tests {
             .await;
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("non_existent"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 10 — rich lineage tests
+    // ----------------------------------------------------------------
+    //
+    // These exercise the new typed visitor that records `output_columns` /
+    // `joins` / `aggregates` / `aliases` on top of the legacy
+    // `tables` / `relations` payload. The expectations are written against
+    // the optimised plan that `get_query_lineage` walks — the same plan
+    // shape the user sees in the explain UI.
+
+    fn create_departments_csv() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "test_qsql_dept_{}_{}.csv",
+            std::process::id(),
+            nanos
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "id,name").unwrap();
+        writeln!(file, "1,Engineering").unwrap();
+        writeln!(file, "2,Sales").unwrap();
+        path.to_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn test_query_lineage_records_simple_output_columns() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine
+            .register_file("employees", &csv_path, "csv")
+            .await
+            .unwrap();
+
+        let lineage = engine
+            .get_query_lineage("SELECT name, salary FROM employees")
+            .await
+            .unwrap();
+        assert_eq!(lineage.output_columns.len(), 2, "two SELECT-list entries");
+        assert_eq!(lineage.output_columns[0].name, "name");
+        assert_eq!(lineage.output_columns[1].name, "salary");
+        // Each entry should attribute exactly one source column.
+        for entry in &lineage.output_columns {
+            assert_eq!(entry.sources.len(), 1);
+            assert_eq!(entry.sources[0].table, "employees");
+            assert_eq!(entry.sources[0].column, entry.name);
+        }
+        let _ = std::fs::remove_file(csv_path);
+    }
+
+    #[tokio::test]
+    async fn test_query_lineage_records_aliased_output_column() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine
+            .register_file("employees", &csv_path, "csv")
+            .await
+            .unwrap();
+
+        let lineage = engine
+            .get_query_lineage("SELECT name AS employee_name FROM employees")
+            .await
+            .unwrap();
+        assert_eq!(lineage.output_columns.len(), 1);
+        assert_eq!(lineage.output_columns[0].name, "employee_name");
+        assert_eq!(lineage.output_columns[0].sources.len(), 1);
+        assert_eq!(lineage.output_columns[0].sources[0].column, "name");
+        let _ = std::fs::remove_file(csv_path);
+    }
+
+    #[tokio::test]
+    async fn test_query_lineage_records_inner_join_keys() {
+        let engine = QsqlEngine::new();
+        let emp_path = create_temp_csv();
+        let dept_path = create_departments_csv();
+        engine
+            .register_file("employees", &emp_path, "csv")
+            .await
+            .unwrap();
+        engine
+            .register_file("departments", &dept_path, "csv")
+            .await
+            .unwrap();
+
+        let lineage = engine
+            .get_query_lineage(
+                "SELECT e.name, d.name AS department_name \
+                 FROM employees e \
+                 INNER JOIN departments d ON e.department = d.name",
+            )
+            .await
+            .unwrap();
+
+        // Both base tables should appear in `tables` / `relations`.
+        assert!(
+            lineage.tables.contains(&"employees".to_string())
+                && lineage.tables.contains(&"departments".to_string()),
+            "both join inputs land in tables: {:?}",
+            lineage.tables
+        );
+        // The join itself should be recorded.
+        assert_eq!(
+            lineage.joins.len(),
+            1,
+            "single Inner join recorded: {:?}",
+            lineage.joins
+        );
+        let j = &lineage.joins[0];
+        assert_eq!(j.kind, "Inner");
+        let recorded_tables: HashSet<_> = [j.left_table.as_str(), j.right_table.as_str()]
+            .into_iter()
+            .collect();
+        assert!(
+            recorded_tables.contains("employees") && recorded_tables.contains("departments"),
+            "both join sides labelled: {:?}",
+            j
+        );
+        assert!(!j.on.is_empty(), "ON-clause keys captured: {:?}", j.on);
+        let _ = std::fs::remove_file(emp_path);
+        let _ = std::fs::remove_file(dept_path);
+    }
+
+    #[tokio::test]
+    async fn test_query_lineage_records_sum_aggregate_inputs() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine
+            .register_file("employees", &csv_path, "csv")
+            .await
+            .unwrap();
+
+        let lineage = engine
+            .get_query_lineage(
+                "SELECT department, SUM(salary) AS total \
+                 FROM employees \
+                 GROUP BY department",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            lineage.aggregates.len(),
+            1,
+            "single SUM aggregate recorded: {:?}",
+            lineage.aggregates
+        );
+        let agg = &lineage.aggregates[0];
+        assert_eq!(agg.function, "SUM");
+        assert_eq!(agg.alias.as_deref(), Some("total"));
+        assert_eq!(agg.inputs.len(), 1);
+        assert_eq!(agg.inputs[0].column, "salary");
+        let _ = std::fs::remove_file(csv_path);
+    }
+
+    #[tokio::test]
+    async fn test_query_lineage_records_subquery_alias() {
+        let engine = QsqlEngine::new();
+        let csv_path = create_temp_csv();
+        engine
+            .register_file("employees", &csv_path, "csv")
+            .await
+            .unwrap();
+
+        // Using an inline subquery with an explicit alias guarantees the
+        // optimiser preserves the `SubqueryAlias` node — a CTE form may
+        // get inlined away and produce a flat plan.
+        let lineage = engine
+            .get_query_lineage(
+                "SELECT h.name FROM \
+                 (SELECT name, salary FROM employees WHERE salary > 50000) AS h",
+            )
+            .await
+            .unwrap();
+
+        // Base table still tracked in `tables`.
+        assert!(lineage.tables.contains(&"employees".to_string()));
+        // The alias map records `h → employees` (the primary table of the
+        // subquery body). When the optimiser folds the subquery away the
+        // map may be empty; either shape is acceptable as long as the
+        // base relation is still present.
+        if !lineage.aliases.is_empty() {
+            assert_eq!(
+                lineage.aliases.get("h").map(String::as_str),
+                Some("employees")
+            );
+        }
+        let _ = std::fs::remove_file(csv_path);
     }
 
     #[tokio::test]

@@ -1,128 +1,135 @@
-# QuiverSQL Phase 9: Arrow IPC Result Pages
+# QuiverSQL Phase 10: Rich Explain, Lineage, And Performance Visibility
 
-Phase 8 (Fixed-Width File Support) landed in commit `307ef69`. Phase 9 extends the paged result-delivery path so callers can opt into base64-encoded Arrow IPC streams instead of the verbose `Vec<serde_json::Value>` payload. JSON stays the default; IPC is a transparent transport optimisation that preserves Arrow types end-to-end (no more `i64 → f64` precision loss, no lossy decimal/timestamp coercion, faster encode + smaller payload for big pages).
+Phase 9 (Arrow IPC Result Pages) landed in commit `d9478d1`. Phase 10 upgrades lineage from "which tables and columns were touched" to a richer per-query story — output columns with source attribution, alias maps, join conditions, aggregate inputs — and surfaces real DataFusion runtime metrics + full-scan warnings + pushdown reasoning when the user opts into EXPLAIN ANALYZE.
 
 ## Decisions Locked In
 
-- **End-to-end IPC in VS Code, type-aware grid**. Adds `apache-arrow` (~500KB) on the TypeScript side; typed Arrow Vectors flow through to the cell renderer for full fidelity (int64, decimal, timestamp, null preserved through the wire).
-- **Single-knob opt-in**: new `qsql.resultFormat: 'json' | 'arrow_ipc'` VS Code setting, default `'json'`. No per-request override surface — keeps the API clean and the VS Code UX consistent.
-- **Base64-over-stdio for v1**. Locked in by `implementation_plan.md`'s Key Technical Decisions section. TCP / gRPC alternatives stay deferred to Phase 11.
-- **Additive wire shape**. `QueryPage.data` (JSON array) stays unchanged; new optional `data_ipc: Option<String>` carries the base64 IPC blob; new optional `result_format: Option<String>` echoes the chosen format. Both skip-if-none — existing JSON clients stay byte-identical on the wire.
-- **No new top-level Rust dep**: `arrow-ipc` 58.3.0 is already a transitive of DataFusion 53.1.0; `base64` v0.22.1 is transitive via postgres-protocol.
+- **EXPLAIN ANALYZE gating** = scan-guard enforced + explicit `analyze: Option<bool>` opt-in flag. ANALYZE runs through the same `remoteScanMaxRows` / `remoteScanMaxBytes` budget as the regular execution path; failure surfaces the standard `-32100 Scan Budget Exceeded` error with the existing suggestion banner (Phase 7 UX). No new budget knob.
+- **Lineage scope** = output-column resolution + alias map + join conditions + aggregate inputs. Walk `Projection` / `Join` / `Aggregate` / `SubqueryAlias` in addition to `TableScan`. Existing `relations` field stays for back-compat; new fields are additive (skip-if-none).
+- **VS Code metrics overlay** = default off; toggle in the legend bar; disabled with tooltip when the page is planner-only.
+- **CodeLens visibility** = `qsql.explainAnalyzeEnabled` setting (default `false`); the `🔍 Explain (ANALYZE)` lens only appears when the user has explicitly opted in. Keeps the UX from accidentally running expensive queries for users who don't know what ANALYZE means.
+- **No new top-level Rust dep**: every API needed (`ExecutionPlan::metrics()`, `Expr::column_refs`) is already in DataFusion 53.1.0.
+- **No new top-level TS dep**: lineage tree + metrics overlay reuse VS Code's `TreeDataProvider` and the existing webview SVG/HTML.
 
 ## Execution Order
 
 Sub-phases sequenced into waves to maximise parallel work — see the Parallelization Plan section below.
 
-- [x] **1. Daemon IPC serializer + format negotiation (9A)**
-  - [x] Add `result_format: Option<String>` to `QueryStartRequest` and `QueryPageRequest` (`qsql-core/src/models.rs`) with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Document accepted values: `"json"` (default) and `"arrow_ipc"`.
-  - [x] Add `serialize_batches_to_ipc_base64(batches, start, len, schema) -> Result<String, String>` next to `record_batches_to_json_rows` in `qsql-core/src/engine.rs` (or split into `qsql-core/src/result_ipc.rs` if it grows past ~80 LOC). Uses `arrow::ipc::writer::StreamWriter<Vec<u8>>` (reachable via `datafusion::arrow::ipc::writer`); slices buffered batches by row range; base64-encodes the finalised IPC buffer.
-  - [x] Extend `QueryResultHandle::page(...)` signature with `result_format: Option<&str>`. Branch:
-      - `None | Some("json")` → existing `record_batches_to_json_rows` path.
-      - `Some("arrow_ipc")` → `serialize_batches_to_ipc_base64` path.
-      - Anything else → structured `QueryError { code: -32602, message: "Invalid result_format: …" }`.
-  - [x] Daemon `query_start` / `query_page` handler arms in `qsql-daemon/src/lib.rs` thread `result_format` from the request through to `handle.page(...)`. Persist on `QuerySession::Streaming` so subsequent `query_page` calls reuse the same format without re-passing it.
+- [ ] **1. QueryLineage model + serde golden (10A)**
+  - [ ] Extend `QueryLineage` in `qsql-core/src/engine.rs` with `output_columns: Vec<OutputColumn>`, `joins: Vec<JoinLineage>`, `aggregates: Vec<AggregateLineage>`, `aliases: HashMap<String, String>` (all `skip_serializing_if = empty / none`).
+  - [ ] New nested types: `OutputColumn { name, sources: Vec<ColumnRef>, expression_summary }`, `JoinLineage { kind, left_table, right_table, on: Vec<JoinKey> }`, `AggregateLineage { function, alias, inputs: Vec<ColumnRef> }`, `ColumnRef { table, column }`, `JoinKey { left_col, right_col }`.
+  - [ ] Mirror in `qsql-vscode/src/lineageProvider.ts` (or `models.ts` if a generic mirror file is preferred — match existing convention).
+  - [ ] Update `qsql-core/tests/serde_golden_tests.rs` golden for `QueryLineage` — existing test stays unchanged (new fields skip-if-empty); new `test_query_lineage_golden_with_outputs_and_joins` asserts the populated shape.
 
-- [x] **2. QueryPage model widening + TS mirror (9B)**
-  - [x] Add `data_ipc: Option<String>` and `result_format: Option<String>` to `QueryPage` in `qsql-core/src/models.rs`, both skip-if-none.
-  - [x] Update the inline page assembly in `QueryResultHandle::page` (`qsql-core/src/engine.rs` lines ~307-322) to populate the right field based on `result_format`. Mutual-exclusion invariant: when IPC mode is on, `data` is empty (`Vec::new()`) and `data_ipc` is `Some(...)`; when JSON mode is on, the inverse.
-  - [x] Mirror in `qsql-vscode/src/models.ts` — extend the `QueryPage` interface with `data_ipc?: string` and `result_format?: string`.
-  - [x] Update the existing `serde_golden_tests.rs` `QueryPage` case to assert the new optional fields stay skipped when None.
+- [ ] **2. Engine-side lineage walk (10B)**
+  - [ ] Refactor `extract_lineage` in `qsql-core/src/engine.rs:1073-1101` from "match-TableScan-only-and-recurse" into a typed visitor:
+    - `LogicalPlan::Projection(proj)` → for each `proj.expr`, derive `(output_name, source_columns, expression_summary)` and push to `output_columns`.
+    - `LogicalPlan::Join(j)` → record `JoinLineage` from `j.join_type`, `j.on`, and the recovered left/right table names; recurse left + right.
+    - `LogicalPlan::Aggregate(a)` → for each entry in `a.aggr_expr`, derive `(function, alias, input cols)` and push to `aggregates`; walk `a.group_expr` so grouped columns also appear in `output_columns`.
+    - `LogicalPlan::SubqueryAlias(s)` → insert `s.alias.table → fully-qualified-subtree-summary` into the `aliases` map; recurse into `s.input`.
+  - [ ] Use `Expr::column_refs` (DataFusion built-in) for column attribution per expression.
+  - [ ] New `expression_summary(&Expr) -> String` (~50 LOC) for the common shapes — bare column, literal, `BinaryOp`, `ScalarFunction`, `Aggregate`. Anything exotic falls back to `format!("{expr}")` truncated to 120 chars.
 
-- [x] **3. VS Code type-aware grid (9C)**
-  - [x] Add `apache-arrow` to `qsql-vscode/package.json` dependencies (pin to v17.x — compatible with the Node 18 target).
-  - [x] New module `qsql-vscode/src/resultPage.ts` with:
-      - `RenderablePage` discriminated union: `{ kind: 'json', schema, rows, ... } | { kind: 'arrow', schema, table, ... }` (carries query_id, page_index, page_size, is_last, metrics, warning).
-      - `decodeResultPage(raw: QueryPage): RenderablePage` — when `result_format === 'arrow_ipc'`, base64-decode `data_ipc` (`Buffer.from(s, 'base64')`) and `tableFromIPC(bytes)` from apache-arrow; otherwise pass through as `kind: 'json'`.
-  - [x] Refactor `formatCellValue` (`qsql-vscode/src/webviewPanel.ts`) to take an optional `dataType?: arrow.DataType | string`:
-      - `arrow.DataType.Int64` (or `'int64'` from JSON schema) → render as exact string (avoids JS Number precision loss).
-      - `arrow.DataType.Decimal*` → pass through (already string-typed in apache-arrow).
-      - `arrow.DataType.Timestamp` / `Date32` / `Date64` → ISO 8601 string.
-      - `arrow.DataType.Bool` → `"true"` / `"false"`.
-      - Null / undefined → `<span class="cell-null">(null)</span>`.
-      - Everything else → existing fallback (`String(value)` + HTML-escape).
-    When called without `dataType`, behaviour is unchanged (JSON path stays byte-identical).
-  - [x] Refactor `renderQueryPageHtml` to take a `RenderablePage` (back-compat: still accepts a raw `QueryPage` and decodes lazily so existing tests stay valid). Row iteration branches on `page.kind`:
-      - `arrow`: column-major access — `for i in 0..table.numRows { fields.forEach((f, ci) => formatCellValue(table.getChildAt(ci).get(i), table.schema.fields[ci].type)) }`.
-      - `json`: unchanged row-iteration path.
-  - [x] `daemonClient.ts` — read `vscode.workspace.getConfiguration('qsql').get<string>('resultFormat', 'json')` once at `query_start` time and thread through. Subsequent `query_page` calls reuse the daemon-side session state (no need to re-pass).
+- [ ] **3. Lineage tests (10C)**
+  - [ ] Rust unit tests in `engine.rs`:
+    - Simple projection: `SELECT name, salary FROM employees` → `output_columns.len() == 2`, each entry has a single `ColumnRef`.
+    - Aliased column: `SELECT name AS employee_name FROM employees` → `output_columns[0].name == "employee_name"`, `sources[0]` → `employees.name`.
+    - Inner join with on-clause: asserts `joins[0].kind == "Inner"`, both tables present, on-clause keys recorded.
+    - Aggregate: `SELECT department_id, SUM(salary) AS total FROM employees GROUP BY department_id` → `aggregates[0].function == "SUM"`, inputs include `employees.salary`.
+    - CTE / `SubqueryAlias`: `WITH high AS (SELECT … WHERE salary > 100k) SELECT * FROM high` → `aliases` populated, `tables` still contains `employees`.
+  - [ ] Daemon integration test (new `qsql-daemon/tests/lineage_tests.rs`) over JSON-RPC: registers quickstart samples, sends `get_lineage` for a multi-source JOIN query, asserts the new fields propagate end-to-end.
 
-- [x] **4. Settings registration (9D)**
-  - [x] Add `qsql.resultFormat` to `qsql-vscode/package.json` `contributes.configuration.properties` with `enum: ["json", "arrow_ipc"]`, default `"json"`, description explaining it's a transport opt-in for large pages.
+- [ ] **4. PlanMetrics runtime fields + serde golden (10D)**
+  - [ ] Add `actual_rows: Option<u64>`, `elapsed_compute_ms: Option<u64>`, `mem_used_bytes: Option<u64>` to `PlanMetrics` (`qsql-core/src/models.rs:175-180`), each skip-if-none.
+  - [ ] Existing `serde_golden_tests::test_explain_query_models_golden` stays byte-identical via skip-if-none.
+  - [ ] New `test_plan_metrics_golden_with_runtime_fields` asserts the populated shape.
 
-- [x] **5. Rust unit tests (9E)**
-  - [x] `serialize_batches_to_ipc_base64` round-trip: encode → base64-decode → `arrow::ipc::reader::StreamReader` → assert schema + every cell value matches the input batches.
-  - [x] Slice correctness: feed two 100-row batches, request rows 50..150; assert decoded IPC has exactly 100 rows in expected order.
-  - [x] Empty range: `start == end` produces a valid empty IPC stream (schema-only, zero batches).
-  - [x] Result-format validation: `QueryResultHandle::page(..., Some("totally_unknown"))` returns a structured invalid-params error.
-  - [x] Mutual-exclusion invariant: `result_format="arrow_ipc"` → `QueryPage.data` empty + `data_ipc.is_some()`; `result_format="json"` → inverse.
+- [ ] **5. Daemon ANALYZE dispatch (10E)**
+  - [ ] Add `analyze: Option<bool>` to `ExplainQueryRequest` in `qsql-core/src/models.rs`, skip-if-none.
+  - [ ] New `engine.execute_physical_plan_collect_metrics(physical_plan, cancellation_token, timeout)` in `qsql-core/src/engine.rs`. Drains the physical plan through `execute_stream()`, discards `RecordBatch`es, records `ExecutionPlan::metrics()` keyed by a stable node id derived from the physical-plan traversal order. Reuses the existing scan-guard envelope so over-budget queries surface `-32100`.
+  - [ ] Daemon `explain_query` handler in `qsql-daemon/src/lib.rs:680-820`: when `req.analyze == Some(true)`, call the new method after `create_physical_plan_for_explain` and before `build_plan_graph_with_broadcast`; pass the resulting `metrics_by_node_id` map into the plan-graph builder so per-node `PlanMetrics` gets stamped with `actual_rows` / `elapsed_compute_ms` / `mem_used_bytes`.
 
-- [x] **6. Daemon integration tests (9F)**
-  - [x] New `qsql-workspace/qsql-daemon/tests/arrow_ipc_tests.rs`:
-      - Register `employees.csv`, run `query_start` with `result_format: "arrow_ipc"`, decode the page's IPC payload via `StreamReader`, assert row count + first/last row values match a parallel `result_format: "json"` run.
-      - Multi-page test: 250 synthesised rows / 100-row pages over arrow_ipc; assert pages 0 and 1 carry IPC bytes and page 2 has `is_last == true`.
-      - Confirm `quickstart_samples_tests` keeps passing (JSON path unchanged — no `result_format` field on the request).
+- [ ] **6. Full-scan + pushdown_reason attributes (10F)**
+  - [ ] In `qsql-daemon/src/explain.rs::plan_attributes` (`TableScan` branch, line 985-1010): after stamping existing `filters` / `limit` attrs, compute `is_full_scan` from the captured `remote_sql` (when present) or the unfiltered/unlimited shape (when local).
+  - [ ] New `classify_pushdown_reason(scan, remote_sqls)` → one of `multi_source_join` / `unsupported_expression` / `local_file_scan`. Stamped on `TableScan` and on the `Filter` directly above it.
+  - [ ] Webview rendering (`qsql-vscode/src/planVisualizationPanel.ts::nodeLines`): when `is_full_scan === 'true'`, push a `"Full scan ⚠"` line (`cls: 'node-warn'`); when `pushdown_reason` is set, push a small muted info line.
+  - [ ] Update the legend bar to explain the new badges.
 
-- [x] **7. TypeScript tests (9G)**
-  - [x] `qsql-vscode/src/test/detectQueries.test.ts` adds:
-      - `testResultPageDecodeJsonPassThrough` — `QueryPage` without `data_ipc` passes through to `{ kind: 'json', rows }`.
-      - `testResultPageDecodeArrowIpcRoundTrip` — synthesise an Arrow table in-memory via `apache-arrow`, write to IPC, base64-encode, feed through `decodeResultPage`, assert column count + schema.
-      - `testFormatCellValueInt64PreservesPrecision` — `9_007_199_254_740_993n` renders as the exact string.
-      - `testFormatCellValueTimestampRendersIso` — `Timestamp(UTC)` → ISO 8601.
-      - `testFormatCellValueNullRendersMuted` — null cell carries `class="cell-null"`.
-      - `testRenderQueryPageHtmlArrowMode` — Arrow mode produces same column headers + type-aware cells.
+- [ ] **7. Lineage tree view rewrite (10G)**
+  - [ ] `qsql-vscode/src/lineageProvider.ts::buildTree` rewritten to handle the new shape:
+    - Root level: `Output Columns (N)`, `Sources (N)`, `Joins (N)`, `Aggregates (N)` — each collapsible.
+    - Each `OutputColumn` expands to a list of `ColumnRef` children with the `symbol-field` icon.
+    - Each `JoinLineage` shows the join kind + tables, expandable to its on-clause keys.
+    - Each `AggregateLineage` shows `function(inputs) AS alias`.
+  - [ ] Forward-compat fall-back: when the daemon response lacks the new fields (older daemon binary), keep the existing flat `tables → columns` layout.
+  - [ ] Keep the existing cursor-move / edit-debounce refresh triggers in `extension.ts:230-248`.
 
-- [x] **8. Benchmark (9H)**
-  - [x] New groups in `qsql-workspace/qsql-daemon/benches/phase0_benchmarks.rs`:
-      - `query_page_serialize_to_json_100k_rows` — baseline.
-      - `query_page_serialize_to_ipc_base64_100k_rows` — measure encode time + payload byte size.
-  - [x] No CI gate; just a regression watch.
+- [ ] **8. VS Code metrics overlay (10H)**
+  - [ ] `qsql-vscode/src/planVisualizationPanel.ts`: add a `Metrics` toggle button to the legend bar.
+  - [ ] When toggled on AND any plan node has non-None `actual_rows`, render an extra muted line per node: `actual: 1.2M rows · 3.4ms`.
+  - [ ] Toggle is disabled with a hover tooltip when the page is planner-only ("Re-run with Explain (ANALYZE) to see runtime metrics").
 
-- [x] **9. Documentation (9I)**
-  - [x] `docs/JSON_RPC_FRAMING.md` — new "Binary Result Format" section describing `result_format`, the `data_ipc` base64-encoded Arrow IPC stream, and the mutual-exclusion invariant.
-  - [x] `USER_GUIDE.md` — short Settings note pointing users at `qsql.resultFormat` for big-result perf; transparent to query authoring.
-  - [x] `README.md` — capability matrix new "Arrow IPC result pages" row Supported; roadmap Phase 9 Complete; intro paragraph updated.
-  - [x] `CHANGELOG.md` — Phase 9 bullet under the running `0.3.1-alpha.0 - Unreleased` block.
-  - [x] `implementation_plan.md` — Phase 9 section status flipped `Current → Complete` on landing.
-  - [x] `current_phase_task.md` — this file; checkboxes flipped as work lands.
+- [ ] **9. CodeLens + setting (10I)**
+  - [ ] New `qsql.explainAnalyzeEnabled: boolean` (default `false`) in `qsql-vscode/package.json` `contributes.configuration.properties`. Description explains the cost trade-off and points at the scan guard.
+  - [ ] `qsql-vscode/src/extension.ts` CodeLens provider: when the setting is on, add a third lens per query block: `🔍 Explain (ANALYZE)` → new command `qsql.explainAnalyze` that calls `daemonClient.explainQuery(sql, { analyze: true })` and opens the plan panel.
+  - [ ] `daemonClient.ts::explainQuery`: extend signature to accept `{ analyze?: boolean }` and forward.
 
-- [x] **10. Final clippy + verification + commit (9J)**
-  - [x] `cargo fmt --all -- --check` clean.
-  - [x] `cargo clippy --locked --workspace --all-targets -- -D warnings` clean.
-  - [x] `cargo test --locked --workspace` — all existing green + ≥10 new IPC tests pass.
-  - [x] `cargo check --locked -p qsql-daemon --benches` clean.
-  - [x] `npm run typecheck && npm run lint && npm run test` — existing tests green + 6 new Arrow tests pass.
-  - [x] Stage everything except `.claude/settings.local.json`; commit with a Phase-9 message in the same style as the Phase 8 commit (`feat(phase 9): arrow IPC result pages with type-aware VS Code grid`).
+- [ ] **10. Tests (10J)**
+  - [ ] Rust unit (`engine.rs`): 3 new tests for `execute_physical_plan_collect_metrics` covering happy path, scan-guard refusal, cancellation.
+  - [ ] Rust integration (new `qsql-daemon/tests/explain_analyze_tests.rs`, 3 tests): parity-vs-plain-explain (planner output identical), ANALYZE failure under scan guard (assert `-32100`), full-scan attribute stamped on a `SELECT * FROM employees` shape.
+  - [ ] TypeScript (`qsql-vscode/src/test/detectQueries.test.ts`, 4 tests):
+    - `testLineageTreeFallbackForLegacyShape` — daemon response without the new fields keeps the old layout.
+    - `testLineageTreeRendersOutputColumnsSection` — new shape renders the four root sections.
+    - `testPlanMetricsOverlayRendersActualRows` — when `actual_rows.is_some()`, the muted line appears.
+    - `testExplainAnalyzeCodeLensVisibilityFollowsSetting` — lens absent by default, present after toggling the setting.
+
+- [ ] **11. Documentation (10L)**
+  - [ ] `USER_GUIDE.md` — new "Explain (ANALYZE) & Lineage" section walking through the CodeLens, the metrics-overlay toggle, the lineage tree's new sections, and the full-scan badge.
+  - [ ] `README.md` — capability matrix gains `EXPLAIN ANALYZE`, `Column-level lineage`, `Full-scan warnings` rows; roadmap Phase 10 Complete.
+  - [ ] `CHANGELOG.md` — Phase 10 bullet under the running `0.3.1-alpha.0 - Unreleased` block.
+  - [ ] `docs/JSON_RPC_FRAMING.md` — short "EXPLAIN ANALYZE Result Shape" section noting the additive runtime metrics + the scan-guard semantics.
+  - [ ] `implementation_plan.md` — Phase 10 status flipped `Current → Complete` on landing.
+  - [ ] `current_phase_task.md` — this file; checkboxes flipped as work lands.
+
+- [ ] **12. Final clippy + verification + commit (10M)**
+  - [ ] `cargo fmt --all -- --check` clean.
+  - [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings` clean.
+  - [ ] `cargo test --locked --workspace` — existing green + ≥12 new tests pass.
+  - [ ] `cargo check --locked -p qsql-daemon --benches` clean.
+  - [ ] `npm run typecheck && npm run lint && npm run test` — existing green + 4 new TS tests pass.
+  - [ ] Stage everything except `.claude/settings.local.json`; commit `feat(phase 10): rich explain, lineage, and performance visibility`.
 
 ## Parallelization Plan
 
 | Wave | Sub-phases (parallel) | Reason |
 |------|------------------------|--------|
-| **Wave 1** | 9A · 9B · 9D | All independent: 9A is pure-core + daemon-handler signature, 9B only widens the wire model, 9D is a single package.json key. |
-| **Wave 2** | 9C (TS decoder + type-aware grid) | Needs 9B's wire shape + 9D's setting key. |
-| **Wave 3** | 9E · 9F · 9H | Need 9A's serializer; daemon-integration test (9F) also needs the model widening from 9B. |
-| **Wave 4** | 9G (TS tests) | Needs 9C in place. |
-| **Wave 5** | 9I docs + final clippy + commit (9J) | Locks everything in. |
+| **Wave 1** | 10K · 10A · 10D | Doc-tracker reset independent; 10A is pure-model; 10D is a single skip-if-none field addition on `PlanMetrics`. |
+| **Wave 2** | 10B · 10E · 10F | 10B (lineage walk) needs 10A's model; 10E (ANALYZE dispatch) needs 10D's runtime fields; 10F (attributes) is pure `explain.rs`, independent. |
+| **Wave 3** | 10C · 10G · 10H · 10I | 10C lineage tests need 10B; 10G TS lineage tree needs 10A/10B model; 10H metrics overlay needs 10D/10E wire; 10I CodeLens + settings is independent. |
+| **Wave 4** | 10J (all remaining tests) | Needs everything else wired. |
+| **Wave 5** | 10L docs + 10M final verify + commit | Locks in. |
 
 ## Tests And Acceptance
 
-- [x] `cargo fmt --all -- --check` — clean.
-- [x] `cargo clippy --locked --workspace --all-targets -- -D warnings` — clean.
-- [x] `cargo test --locked --workspace` — all existing green + ≥10 new IPC tests pass (5 unit + 3 integration + 2 golden).
-- [x] `cargo check --locked -p qsql-daemon --benches` — IPC benches compile.
-- [x] `npm run typecheck && npm run lint && npm run test` — TypeScript clean; 6 new Arrow tests pass.
-- [x] Acceptance: `query_start` with `result_format: "arrow_ipc"` on a 100-row table returns a `QueryPage` where `data == []`, `data_ipc.is_some()`, and decoding the IPC yields the same rows the JSON path returns.
-- [x] Acceptance: `qsql.resultFormat = "arrow_ipc"` in VS Code settings makes the result grid render `SELECT 9007199254740993 AS big_id` as the exact string (no JS Number precision loss).
-- [x] Acceptance: Default-setting smoke run shows existing JSON grid behaviour byte-identical.
-- [x] Acceptance: An unknown `result_format` (e.g. `"avro"`) returns a structured `-32602 Invalid params` error.
+- [ ] `cargo fmt --all -- --check` — clean.
+- [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings` — clean.
+- [ ] `cargo test --locked --workspace` — all existing green + ≥12 new tests pass (5 lineage unit, 3 daemon lineage integration, 3 daemon ANALYZE integration, 3 ANALYZE engine unit, 2 golden).
+- [ ] `cargo check --locked -p qsql-daemon --benches` — benches compile.
+- [ ] `npm run typecheck && npm run lint && npm run test` — TypeScript clean; 4 new TS tests pass.
+- [ ] Acceptance: `get_lineage` over a multi-source JOIN query returns the new `output_columns` / `joins` / `aggregates` / `aliases` fields populated correctly.
+- [ ] Acceptance: `explain_query` with `analyze: true` on a quickstart query returns plan-graph nodes whose `metrics.actual_rows` and `metrics.elapsed_compute_ms` are populated.
+- [ ] Acceptance: `qsql.remoteScanMaxRows = 2` + `explain_query` with `analyze: true` on a 6-row query → standard `-32100 Scan Budget Exceeded` error.
+- [ ] Acceptance: `SELECT * FROM employees` (no WHERE / LIMIT) → plan-graph `TableScan` carries `is_full_scan = "true"`, webview renders the `Full scan ⚠` badge.
+- [ ] Acceptance: VS Code Lineage tree shows the four new root sections (Output Columns, Sources, Joins, Aggregates) for the Phase 7 Section 4 federated query.
 
-## Defaults (carried forward from Phase 7 + 8)
+## Defaults (carried forward from Phase 7 + 8 + 9)
 
-- Remote scan guard defaults: 1,000,000 rows and 1 GiB per source scan (unchanged; not applied to file providers).
+- Remote scan guard defaults: 1,000,000 rows and 1 GiB per source scan.
 - Schema cache TTL: 5 minutes.
 - Source operation timeouts: SQLite 5s, Postgres/MySQL/MariaDB 30s, schema introspection 5s.
 - Plan graph node cap: 500 nodes.
 - Table discovery page size/cap: 5,000.
 - `SCAN_GUARD_ERROR_CODE = -32100`.
-- `FixedWidthExec` default batch size = 8192 rows (matches DataFusion's default).
-- New in Phase 9: `qsql.resultFormat` (default `"json"`), `result_format` accepted values `"json"` | `"arrow_ipc"`.
+- `FixedWidthExec` default batch size = 8192 rows.
+- `qsql.resultFormat` (default `"json"`).
+- New in Phase 10: `qsql.explainAnalyzeEnabled` (default `false`); `analyze: Option<bool>` accepted on `explain_query`.

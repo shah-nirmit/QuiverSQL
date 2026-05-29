@@ -44,6 +44,11 @@
         "icon": "$(search)"
       },
       {
+        "command": "qsql.explainAnalyze",
+        "title": "QuiverSQL: Explain (ANALYZE)",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "qsql.showVersion",
         "title": "QuiverSQL: Show Version"
       },
@@ -96,6 +101,11 @@
           "enum": ["json", "arrow_ipc"],
           "default": "json",
           "description": "Transport format for paged query results. `json` (default) returns row objects as JSON in the response — easy to inspect, lossy for int64 / decimal / timestamp. `arrow_ipc` returns a base64-encoded Arrow IPC stream and decodes type-aware on the client — meaningfully faster + smaller for large pages, with full Arrow type fidelity. Setting takes effect on the next query_start; in-flight queries keep their current format."
+        },
+        "qsql.explainAnalyzeEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, query blocks gain a third CodeLens — `🔍 Explain (ANALYZE)` — that drives the physical plan to completion under the existing scan-guard envelope and overlays per-operator runtime metrics (actual rows, elapsed compute) on the plan tree. Off by default because ANALYZE actually executes the query, which can be expensive on large remote sources. The scan guard still applies, so `qsql.remoteScanMaxRows` and `qsql.remoteScanMaxBytes` continue to cap accidental full-source pulls."
         }
       }
     },
