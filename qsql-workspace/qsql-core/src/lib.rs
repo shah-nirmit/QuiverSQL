@@ -2,6 +2,7 @@ pub mod broadcast;
 pub mod engine;
 pub mod fixed_width;
 pub mod models;
+pub mod result_ipc;
 pub mod sql_types;
 pub mod table_refs;
 

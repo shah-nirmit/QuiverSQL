@@ -13,6 +13,11 @@ async-trait = "0.1"
 tokio = { version = "1.36", features = ["full"] }
 tokio-util = "0.7"
 sqlparser = { version = "0.62.0", features = ["visitor"] }
+# Phase 9 — needed by `result_ipc::serialize_batches_to_ipc_base64` to encode
+# the Arrow IPC stream as a base64 string for the JSON-RPC payload. The
+# transitive base64 we get via postgres-protocol is not reachable from the
+# qsql-core build graph, so we pin it directly.
+base64 = "0.22"
 
 [features]
 default = []

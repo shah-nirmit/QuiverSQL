@@ -30,6 +30,10 @@ mysql_async = "0.34"
 once_cell = "1.19"
 memory-stats = "1.2"
 sysinfo = { version = "0.30", default-features = false }
+# Phase 9 — `tests/arrow_ipc_tests.rs` decodes the base64-wrapped Arrow IPC
+# payload to assert parity vs the JSON path; same pin as qsql-core's
+# production dep so we don't drag in two versions.
+base64 = "0.22"
 
 [[bench]]
 name = "phase0_benchmarks"

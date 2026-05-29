@@ -46,7 +46,14 @@ export interface QueryPage {
     page_index: number;
     page_size: number;
     is_last: boolean;
+    /** Row payload when result_format === 'json' (the default). Mutually
+     *  exclusive with data_ipc — exactly one is populated per page. */
     data: Record<string, any>[];
+    /** Phase 9 — base64-encoded Arrow IPC stream payload when
+     *  result_format === 'arrow_ipc'. */
+    data_ipc?: string;
+    /** Phase 9 — echoes the format the daemon used to encode this page. */
+    result_format?: string;
     metrics: PerformanceMetrics;
     warning?: string;
 }
@@ -84,12 +91,19 @@ export interface QueryStartRequest {
     sql: string;
     page_size?: number;
     timeout_ms?: number;
+    /** Phase 9 — 'json' (default) or 'arrow_ipc'. Persisted on the daemon
+     *  session so subsequent query_page calls reuse the same format. */
+    result_format?: string;
 }
 
 export interface QueryPageRequest {
     query_id: string;
     page_index?: number;
     page_size?: number;
+    /** Phase 9 — per-page override for the daemon's session-level format
+     *  default. Rarely set in practice; the VS Code client only sends it on
+     *  query_start. */
+    result_format?: string;
 }
 
 export interface QueryCancelRequest {

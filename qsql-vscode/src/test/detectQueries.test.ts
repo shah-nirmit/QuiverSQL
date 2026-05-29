@@ -685,6 +685,146 @@ function testFixedWidthIconRegistryStillCoversKind() {
 }
 
 // -------------------------------------------------------------
+// 3f. Phase 9 — Arrow IPC Result Page Tests
+// -------------------------------------------------------------
+
+import * as arrow from 'apache-arrow';
+import { decodeResultPage, columnsForPage, rowCount } from '../resultPage';
+// `formatCellValue` + `renderQueryPageHtml` are already imported at the top
+// of this file from '../webviewPanel'; tests here reuse those bindings.
+
+function makeIpcPage(): QueryPage {
+    // Build a tiny Arrow table in-memory, serialise to IPC, base64-encode.
+    // The daemon's wire shape is what `decodeResultPage` consumes — this
+    // exercises the round-trip end-to-end without needing the live daemon.
+    const ids = new BigInt64Array([1n, 2n, 9007199254740993n]); // last one > 2^53
+    const names = ['Alice', 'Bob', 'Carol'];
+    const table = arrow.tableFromArrays({
+        id: ids,
+        name: names,
+    });
+    const ipcBytes = arrow.tableToIPC(table, 'stream');
+    const b64 = Buffer.from(ipcBytes).toString('base64');
+    return {
+        query_id: 'q_ipc_test',
+        schema: {
+            fields: [
+                { name: 'id', data_type: 'Int64', nullable: false },
+                { name: 'name', data_type: 'Utf8', nullable: false },
+            ],
+        },
+        page_index: 0,
+        page_size: 10,
+        is_last: true,
+        data: [],
+        data_ipc: b64,
+        result_format: 'arrow_ipc',
+        metrics: {
+            planning_time_ms: 1,
+            execution_time_ms: 2,
+            first_page_time_ms: 3,
+            rows_produced: 3,
+            rows_returned: 3,
+        },
+    };
+}
+
+function testResultPageDecodeJsonPassThrough() {
+    // A page without `data_ipc` keeps its row data unchanged.
+    const page: QueryPage = {
+        query_id: 'q_json',
+        schema: { fields: [{ name: 'id', data_type: 'Int64', nullable: false }] },
+        page_index: 0,
+        page_size: 10,
+        is_last: true,
+        data: [{ id: 1 }, { id: 2 }],
+        metrics: {
+            planning_time_ms: 0,
+            execution_time_ms: 0,
+            first_page_time_ms: 0,
+            rows_produced: 2,
+            rows_returned: 2,
+        },
+    };
+    const decoded = decodeResultPage(page);
+    assert.strictEqual(decoded.kind, 'json');
+    if (decoded.kind === 'json') {
+        assert.strictEqual(decoded.rows.length, 2);
+        assert.strictEqual(decoded.rows[0].id, 1);
+    }
+    console.log("OK testResultPageDecodeJsonPassThrough passed!");
+}
+
+function testResultPageDecodeArrowIpcRoundTrip() {
+    const ipcPage = makeIpcPage();
+    const decoded = decodeResultPage(ipcPage);
+    assert.strictEqual(decoded.kind, 'arrow');
+    if (decoded.kind === 'arrow') {
+        assert.strictEqual(decoded.table.numRows, 3);
+        // Column names survive via the Arrow schema.
+        const cols = columnsForPage(decoded);
+        assert.deepStrictEqual(cols, ['id', 'name']);
+        assert.strictEqual(rowCount(decoded), 3);
+    }
+    console.log("OK testResultPageDecodeArrowIpcRoundTrip passed!");
+}
+
+function testFormatCellValueInt64PreservesPrecision() {
+    // Arrow Int64 cells come back as native bigints. The formatter must
+    // emit the exact base-10 string, not the JS-Number-lossy float repr.
+    const big = 9007199254740993n; // 2^53 + 1
+    const out = formatCellValue(big, new arrow.Int64());
+    assert.strictEqual(out, '9007199254740993', `got: ${out}`);
+
+    // The JSON path (no dataType) should still handle bigints by stringifying.
+    const fallback = formatCellValue(big);
+    assert.strictEqual(fallback, '9007199254740993');
+    console.log("OK testFormatCellValueInt64PreservesPrecision passed!");
+}
+
+function testFormatCellValueTimestampRendersIso() {
+    // 2024-01-15T10:30:00.000Z — apache-arrow timestamp cells are
+    // milliseconds since epoch (number or bigint depending on unit).
+    const ms = Date.UTC(2024, 0, 15, 10, 30, 0);
+    const tsType = new arrow.Timestamp(arrow.TimeUnit.MILLISECOND, null);
+    const out = formatCellValue(ms, tsType);
+    assert.ok(
+        out.startsWith('2024-01-15T10:30:00'),
+        `expected ISO 8601 timestamp, got: ${out}`,
+    );
+    console.log("OK testFormatCellValueTimestampRendersIso passed!");
+}
+
+function testFormatCellValueNullRendersMuted() {
+    // With Arrow type context → muted class span.
+    const arrowOut = formatCellValue(null, new arrow.Utf8());
+    assert.ok(arrowOut.includes('cell-null'), `expected cell-null class, got: ${arrowOut}`);
+    assert.ok(arrowOut.includes('(null)'));
+
+    // Without Arrow type context → legacy <em>null</em> (unchanged).
+    const legacyOut = formatCellValue(null);
+    assert.strictEqual(legacyOut, '<em>null</em>');
+    console.log("OK testFormatCellValueNullRendersMuted passed!");
+}
+
+function testRenderQueryPageHtmlArrowMode() {
+    // Arrow-mode page renders the same column headers as the JSON path,
+    // with type-aware cells.
+    const ipcPage = makeIpcPage();
+    const html = renderQueryPageHtml(ipcPage, 5);
+    assert.ok(html.includes('<th>id</th>'), 'expected `id` column header');
+    assert.ok(html.includes('<th>name</th>'), 'expected `name` column header');
+    // The big int64 from makeIpcPage must appear as the exact string in
+    // the rendered HTML — that's the Phase 9 fidelity win.
+    assert.ok(
+        html.includes('9007199254740993'),
+        'expected exact-precision int64 cell',
+    );
+    assert.ok(html.includes('Alice'), 'expected utf8 cell');
+    console.log("OK testRenderQueryPageHtmlArrowMode passed!");
+}
+
+// -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
 async function runAll() {
@@ -720,6 +860,12 @@ async function runAll() {
         testPlanVisualizationGracefulWhenNoRemoteSources();
         testFixedWidthSourceProfileShape();
         testFixedWidthIconRegistryStillCoversKind();
+        testResultPageDecodeJsonPassThrough();
+        testResultPageDecodeArrowIpcRoundTrip();
+        testFormatCellValueInt64PreservesPrecision();
+        testFormatCellValueTimestampRendersIso();
+        testFormatCellValueNullRendersMuted();
+        testRenderQueryPageHtmlArrowMode();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

@@ -283,11 +283,94 @@ Phase 8 turns the existing `SourceKind::FixedWidth` enum variant (already mirror
 | Wave 4 | 8G daemon-integration + VS Code tests | Wave 3 |
 | Wave 5 | 8I docs + final clippy + amend | All above |
 
-### Phase 9: Arrow IPC Result Pages
-- Add Arrow IPC for large/requested result pages (base64 initially over stdio).
-- Negotiate result format through `query_start`/`query_page`.
-- Keep JSON rows as default for small results.
-- Tests: Arrow IPC round-trip, JSON-vs-Arrow parity, schema fidelity, fallback-to-JSON.
+### Phase 9: Arrow IPC Result Pages - Complete
+
+Phase 9 extends the paged result-delivery path so callers can opt into base64-encoded Arrow IPC streams instead of the verbose `Vec<serde_json::Value>` payload. JSON stays the default; IPC is a transparent transport optimisation that preserves Arrow types end-to-end (no more `i64 → f64` precision loss, no lossy decimal/timestamp coercion) and is materially faster + smaller for big pages.
+
+**Key technical fact**: `arrow-ipc` 58.3.0 is already a transitive dependency of DataFusion 53.1.0 — no new top-level Rust dep needed. `base64` v0.22.1 is transitive via postgres-protocol. The only new package is `apache-arrow` (~500KB) on the VS Code side for typed IPC decoding.
+
+#### 9A: Daemon IPC Serializer + Format Negotiation
+- Add `result_format: Option<String>` to `QueryStartRequest` and `QueryPageRequest` ([qsql-core/src/models.rs:178-193](qsql-workspace/qsql-core/src/models.rs)) with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Accepted values: `"json"` (default) and `"arrow_ipc"`.
+- Add `serialize_batches_to_ipc_base64(batches, start, len, schema) -> Result<String, String>` next to `record_batches_to_json_rows` in [qsql-core/src/engine.rs](qsql-workspace/qsql-core/src/engine.rs) (lines 1210-1289), or split into `qsql-core/src/result_ipc.rs` if it exceeds ~80 LOC. Uses `arrow::ipc::writer::StreamWriter<Vec<u8>>`.
+- Extend `QueryResultHandle::page(...)` signature with `result_format: Option<&str>`. Branch: `None | Some("json")` → existing JSON path; `Some("arrow_ipc")` → new IPC path; anything else → structured `QueryError { code: -32602, … }`.
+- Daemon `query_start` / `query_page` handlers ([qsql-daemon/src/lib.rs](qsql-workspace/qsql-daemon/src/lib.rs) lines 813-950) thread `result_format` from the request through to `handle.page(...)`. Persist on `QuerySession::Streaming` so subsequent `query_page` calls reuse the same format.
+
+#### 9B: QueryPage Model Widening + TS Mirror
+- Add `data_ipc: Option<String>` and `result_format: Option<String>` to `QueryPage` ([qsql-core/src/models.rs:73-82](qsql-workspace/qsql-core/src/models.rs)), both skip-if-none.
+- Update inline page assembly in `QueryResultHandle::page` (engine.rs lines 307-322) for the mutual-exclusion invariant: IPC mode → `data` empty, `data_ipc` Some; JSON mode → inverse.
+- Mirror in `qsql-vscode/src/models.ts`.
+- Update `qsql-core/tests/serde_golden_tests.rs` `QueryPage` case to assert the new optionals stay skipped when None.
+
+#### 9C: VS Code Type-Aware Grid
+- Add `apache-arrow` v17.x to `qsql-vscode/package.json` dependencies.
+- New module `qsql-vscode/src/resultPage.ts` with `RenderablePage` discriminated union (`{kind:'json', rows} | {kind:'arrow', table}`) + `decodeResultPage(raw: QueryPage): RenderablePage` (base64-decode + `tableFromIPC` when `result_format === 'arrow_ipc'`).
+- Refactor `formatCellValue` ([qsql-vscode/src/webviewPanel.ts](qsql-vscode/src/webviewPanel.ts)) to take an optional Arrow `DataType`:
+  - `Int64` → exact string (no JS Number precision loss).
+  - `Decimal*` → pass through.
+  - `Timestamp` / `Date32` / `Date64` → ISO 8601 string.
+  - `Bool` → `"true"` / `"false"`.
+  - Null → `<span class="cell-null">(null)</span>`.
+  - Everything else → existing fallback. JSON-mode callers stay on the no-dataType overload — zero behavioural change.
+- Refactor `renderQueryPageHtml` to take a `RenderablePage`; row iteration branches on `page.kind`. Column headers + cancel/next-page UI unchanged.
+- `daemonClient.ts` reads `vscode.workspace.getConfiguration('qsql').get<string>('resultFormat', 'json')` at query_start; threads through. Daemon-side session persistence (9A) means subsequent pages don't need the field again.
+
+#### 9D: Settings Registration
+- Add `qsql.resultFormat` to `qsql-vscode/package.json` `contributes.configuration.properties` with `enum: ["json", "arrow_ipc"]`, default `"json"`.
+
+#### 9E: Rust Unit Tests
+- `serialize_batches_to_ipc_base64` round-trip via `StreamReader` → assert schema + every cell value.
+- Slice correctness: rows 50..150 over two 100-row batches.
+- Empty range yields schema-only IPC stream.
+- Unknown `result_format` → `-32602` invalid-params.
+- Mutual-exclusion invariant on `QueryPage` for both formats.
+
+#### 9F: Daemon Integration Tests
+- New `qsql-workspace/qsql-daemon/tests/arrow_ipc_tests.rs`:
+  - Register sample, query_start with arrow_ipc, decode via `StreamReader`, assert parity vs a parallel json run.
+  - Multi-page test (250 rows / 100-row pages over arrow_ipc) — `is_last == true` on the final page.
+  - Confirm existing `quickstart_samples_tests` stays green (JSON path unchanged).
+
+#### 9G: TypeScript Tests
+- `qsql-vscode/src/test/detectQueries.test.ts` adds:
+  - `testResultPageDecodeJsonPassThrough` (JSON pass-through).
+  - `testResultPageDecodeArrowIpcRoundTrip` (in-memory IPC encode + decode).
+  - `testFormatCellValueInt64PreservesPrecision` (`9_007_199_254_740_993n` as exact string).
+  - `testFormatCellValueTimestampRendersIso`.
+  - `testFormatCellValueNullRendersMuted`.
+  - `testRenderQueryPageHtmlArrowMode` (parity with JSON path).
+
+#### 9H: Benchmark
+- Add `query_page_serialize_to_json_100k_rows` + `query_page_serialize_to_ipc_base64_100k_rows` groups to [qsql-daemon/benches/phase0_benchmarks.rs](qsql-workspace/qsql-daemon/benches/phase0_benchmarks.rs).
+
+#### 9I: Documentation
+- `docs/JSON_RPC_FRAMING.md` — new "Binary Result Format" section.
+- `USER_GUIDE.md` — Settings note pointing users at `qsql.resultFormat`.
+- `README.md` — capability matrix "Arrow IPC result pages" row Supported; roadmap Phase 9 Complete; intro updated.
+- `CHANGELOG.md` — Phase 9 bullet under `0.3.1-alpha.0 - Unreleased`.
+- `implementation_plan.md` — this section status flipped Current → Complete on landing.
+- `current_phase_task.md` — checkboxes flipped on landing.
+
+#### 9J: Final Clippy + Verification + Commit
+- `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace` clean.
+- `cargo check --locked -p qsql-daemon --benches` clean.
+- `npm run typecheck && npm run lint && npm run test` clean.
+- Stage everything except `.claude/settings.local.json`; commit with a Phase-9 message in the Phase 8 style.
+
+#### 9 Parallelization Plan
+| Wave | Sub-phases (parallel) | Depends on |
+|------|------------------------|------------|
+| Wave 1 | 9A · 9B · 9D | none — all independent |
+| Wave 2 | 9C (TS grid) | Wave 1 (9B wire shape, 9D setting key) |
+| Wave 3 | 9E · 9F · 9H | Wave 1 (need 9A's serializer + 9B's payload shape) |
+| Wave 4 | 9G (TS tests) | 9C |
+| Wave 5 | 9I docs + final clippy + commit (9J) | All above |
+
+#### 9 Verification
+- All clippy / fmt / cargo test / cargo check / npm typecheck/lint/test green.
+- Acceptance: `query_start` with `result_format: "arrow_ipc"` on a 100-row table returns `data == []`, `data_ipc.is_some()`, decoded IPC yields the same rows the JSON path returns.
+- Acceptance: `qsql.resultFormat = "arrow_ipc"` makes the grid render `SELECT 9007199254740993 AS big_id` as the exact string (no precision loss).
+- Acceptance: Default-setting smoke run shows existing JSON grid behaviour byte-identical (no regression for current users).
+- Acceptance: An unknown `result_format` returns `-32602 Invalid params`.
 
 ### Phase 10: Rich Explain, Lineage, And Performance Visibility
 - Upgrade lineage to include source columns, output columns, aliases, joins, aggregates, and CTEs.

@@ -1,5 +1,14 @@
 import * as vscode from 'vscode';
+import * as arrow from 'apache-arrow';
 import { QueryPage, QueryError, isScanGuardError } from './models';
+import {
+    decodeResultPage,
+    columnsForPage,
+    rowCount,
+    arrowTypeForColumn,
+    cellAt,
+    RenderablePage,
+} from './resultPage';
 
 export class ResultGridPanel {
     public static currentPanel: ResultGridPanel | undefined;
@@ -252,9 +261,67 @@ export class ResultGridPanel {
     }
 }
 
-export function formatCellValue(value: any): string {
+/**
+ * Formats a cell value for HTML rendering. The optional second arg is the
+ * Arrow `DataType` of the column when the page came over IPC; it drives
+ * type-aware formatting (Phase 9):
+ *
+ *   - Int64 (`bigint`)          → exact base-10 string, no precision loss.
+ *   - Float32/Float64           → standard JS `String(n)` with NaN/∞ handling.
+ *   - Decimal128/256            → string passthrough (apache-arrow gives us a string).
+ *   - Date32 / Date64           → ISO-8601 date string (`YYYY-MM-DD`).
+ *   - Timestamp                 → ISO-8601 datetime, UTC.
+ *   - Bool                      → `"true"` / `"false"`.
+ *   - Utf8 / LargeUtf8          → HTML-escaped string.
+ *   - Null / undefined          → muted `(null)` span.
+ *   - Anything else             → fallback to legacy `String(value)`.
+ *
+ * When called without `dataType` (the JSON path), behaviour matches the
+ * pre-Phase-9 formatter exactly so existing tests stay byte-identical.
+ */
+export function formatCellValue(value: unknown, dataType?: arrow.DataType): string {
     if (value === null || value === undefined) {
-        return '<em>null</em>';
+        return dataType
+            ? '<span class="cell-null">(null)</span>'
+            : '<em>null</em>';
+    }
+
+    if (dataType) {
+        // bigint check first — apache-arrow returns Int64 cells as native
+        // bigints, which JSON.stringify would otherwise blow up on.
+        if (typeof value === 'bigint') {
+            return escapeHtml(value.toString());
+        }
+        // arrow.DataType has a `typeId` enum we can switch on; the apache-arrow
+        // type-id values are stable across minor versions.
+        if (arrow.DataType.isTimestamp(dataType)) {
+            // Cell values come back as milliseconds since epoch (`number`)
+            // or `bigint` for the larger time units. Coerce both to a Date
+            // and emit ISO. We assume UTC unless the timezone metadata
+            // says otherwise — apache-arrow normalises this already.
+            const ms = typeof value === 'bigint' ? Number(value) : Number(value);
+            return escapeHtml(new Date(ms).toISOString());
+        }
+        if (arrow.DataType.isDate(dataType)) {
+            const ms =
+                typeof value === 'bigint' ? Number(value) : Number(value as number);
+            return escapeHtml(new Date(ms).toISOString().slice(0, 10));
+        }
+        if (arrow.DataType.isBool(dataType)) {
+            return value ? 'true' : 'false';
+        }
+        if (arrow.DataType.isDecimal(dataType)) {
+            // apache-arrow may return Decimal cells as `Uint32Array` (raw
+            // bytes) when the precision exceeds 53 bits; coerce via the
+            // arrow utility when available, else fall back to String().
+            return escapeHtml(String(value));
+        }
+    }
+
+    if (typeof value === 'bigint') {
+        // Even on the JSON path, the daemon never emits bigint today — but
+        // future callers (or test fixtures) might. Stringify deterministically.
+        return escapeHtml(value.toString());
     }
 
     if (typeof value === 'object') {
@@ -264,6 +331,12 @@ export function formatCellValue(value: any): string {
     return escapeHtml(String(value));
 }
 
+/**
+ * Legacy column-name helper, kept for callers that hand a raw `QueryPage`
+ * (notably the test fixture in `detectQueries.test.ts`). New call sites
+ * inside the renderer pipeline use `columnsForPage(RenderablePage)`
+ * directly.
+ */
 export function getQueryPageColumns(page: QueryPage): string[] {
     if (page.schema.fields.length > 0) {
         return page.schema.fields.map(field => field.name);
@@ -273,24 +346,57 @@ export function getQueryPageColumns(page: QueryPage): string[] {
 }
 
 export function renderQueryPageHtml(page: QueryPage, durationMs: number): string {
-    const columns = getQueryPageColumns(page);
+    // Decode at the boundary so every downstream branch operates on the
+    // RenderablePage discriminated union. JSON pages are a no-op pass-through;
+    // Arrow IPC pages get base64-decoded + parsed once here.
+    let decoded: RenderablePage;
+    try {
+        decoded = decodeResultPage(page);
+    } catch (e: any) {
+        // Surface decode errors as a structured page-level warning rather
+        // than silently falling back to JSON. The Phase 9 plan explicitly
+        // rules out auto-fallback (a malformed IPC payload is always a bug
+        // we want to surface).
+        const reason = e?.message ?? String(e);
+        decoded = {
+            kind: 'json',
+            query_id: page.query_id,
+            schema: page.schema,
+            page_index: page.page_index,
+            page_size: page.page_size,
+            is_last: page.is_last,
+            rows: page.data ?? [],
+            metrics: page.metrics,
+            warning: `Failed to decode Arrow IPC page: ${reason}. Falling back to legacy JSON rows for this page only.`,
+        };
+    }
+
+    const columns = columnsForPage(decoded);
     const tableHeaders = ['<th></th>']
         .concat(columns.map(col => `<th>${escapeHtml(col)}</th>`))
         .join('');
-    const startRowNumber = page.page_index * page.page_size;
-    const tableRows = page.data.map((row, index) => {
+    const startRowNumber = decoded.page_index * decoded.page_size;
+    const totalRows = rowCount(decoded);
+    const rowMarkup: string[] = [];
+    for (let i = 0; i < totalRows; i++) {
         const cells = columns
-            .map(col => `<td>${formatCellValue(row[col])}</td>`)
+            .map(col => {
+                const value = cellAt(decoded, i, col);
+                const arrowType = arrowTypeForColumn(decoded, col);
+                return `<td>${formatCellValue(value, arrowType)}</td>`;
+            })
             .join('');
-        return `<tr><td class="row-num">${startRowNumber + index + 1}</td>${cells}</tr>`;
-    }).join('');
-    const emptyState = page.data.length === 0
-        ? '<div class="empty-state">No rows returned.</div>'
+        rowMarkup.push(
+            `<tr><td class="row-num">${startRowNumber + i + 1}</td>${cells}</tr>`,
+        );
+    }
+    const tableRows = rowMarkup.join('');
+    const emptyState =
+        totalRows === 0 ? '<div class="empty-state">No rows returned.</div>' : '';
+    const warning = decoded.warning
+        ? `<div class="warning">${escapeHtml(decoded.warning)}</div>`
         : '';
-    const warning = page.warning
-        ? `<div class="warning">${escapeHtml(page.warning)}</div>`
-        : '';
-    const nextDisabled = page.is_last ? ' disabled' : '';
+    const nextDisabled = decoded.is_last ? ' disabled' : '';
 
     return `<!DOCTYPE html>
     <html lang="en">
@@ -414,7 +520,7 @@ export function renderQueryPageHtml(page: QueryPage, durationMs: number): string
         </div>
         ${warning}
         <div class="toolbar">
-            <span>Page ${page.page_index + 1}</span>
+            <span>Page ${decoded.page_index + 1}</span>
             <button id="nextPage"${nextDisabled}>Next Page</button>
             <button id="cancelQuery">Cancel</button>
         </div>
@@ -427,10 +533,10 @@ export function renderQueryPageHtml(page: QueryPage, durationMs: number): string
         </div>
         <div id="messages" class="tab-content">
             <div class="messages-view">
-                (${page.metrics.rows_returned} row(s) returned on this page, ${page.metrics.rows_produced} total row(s) produced)<br/><br/>
-                Planning time: ${page.metrics.planning_time_ms}ms<br/>
-                Execution time: ${page.metrics.execution_time_ms}ms<br/>
-                First page time: ${page.metrics.first_page_time_ms}ms<br/>
+                (${decoded.metrics.rows_returned} row(s) returned on this page, ${decoded.metrics.rows_produced} total row(s) produced)<br/><br/>
+                Planning time: ${decoded.metrics.planning_time_ms}ms<br/>
+                Execution time: ${decoded.metrics.execution_time_ms}ms<br/>
+                First page time: ${decoded.metrics.first_page_time_ms}ms<br/>
                 Total UI round trip: 00:00:00.${durationMs.toString().padStart(3, '0')}
             </div>
         </div>
@@ -447,15 +553,15 @@ export function renderQueryPageHtml(page: QueryPage, durationMs: number): string
             document.getElementById('nextPage')?.addEventListener('click', () => {
                 vscode.postMessage({
                     type: 'nextPage',
-                    queryId: ${JSON.stringify(page.query_id)},
-                    pageIndex: ${page.page_index + 1},
-                    pageSize: ${page.page_size}
+                    queryId: ${JSON.stringify(decoded.query_id)},
+                    pageIndex: ${decoded.page_index + 1},
+                    pageSize: ${decoded.page_size}
                 });
             });
             document.getElementById('cancelQuery')?.addEventListener('click', () => {
                 vscode.postMessage({
                     type: 'cancelQuery',
-                    queryId: ${JSON.stringify(page.query_id)}
+                    queryId: ${JSON.stringify(decoded.query_id)}
                 });
             });
         </script>

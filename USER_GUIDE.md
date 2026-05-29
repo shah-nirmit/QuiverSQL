@@ -202,6 +202,26 @@ Let's test the dynamic **Scan Guard** feature.
 
 Notice that changing the VS Code settings hot-restarts the daemon invisibly in the background, applying your new guard limits instantly without requiring an editor reload!
 
+### B. Arrow IPC Result Pages (`qsql.resultFormat`)
+
+By default QuiverSQL ships query results as JSON rows — easy to read, lossy for big integers (`int64` truncates above 2^53), decimals, and timestamps. Flip the new `qsql.resultFormat` setting to `arrow_ipc` and the daemon serialises each page as a base64-encoded Arrow IPC stream that the VS Code client decodes type-aware.
+
+```jsonc
+// settings.json
+"qsql.resultFormat": "arrow_ipc"
+```
+
+Effects of opting in:
+
+- `int64` values render with full precision — `SELECT 9007199254740993 AS big_id` shows the exact digits.
+- `timestamp` / `date` cells render as ISO-8601 strings instead of platform-specific date repr.
+- `decimal` cells preserve their scale (no float coercion).
+- Large pages encode/decode noticeably faster — the cell-by-cell `serde_json` loop is replaced with a single Arrow IPC stream write.
+
+The setting is transparent to query authoring — you don't change your SQL. The daemon persists the chosen format on each query session, so subsequent `query_page` calls inherit it. Setting takes effect on the next `query_start`; queries already in flight keep their current format.
+
+The full wire-shape is documented in [`docs/JSON_RPC_FRAMING.md`](docs/JSON_RPC_FRAMING.md) under "Binary Result Format". Unknown values for `result_format` yield a structured `-32602 Invalid params` error.
+
 ---
 
 ## 8. Inspecting Pushdowns in the Explain Plan

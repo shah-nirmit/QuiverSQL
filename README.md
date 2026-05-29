@@ -115,6 +115,7 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] Paged JSON result delivery
 - [x] VS Code result grid
 - [x] Federated `EXPLAIN` with per-table pushed-down SQL, Remote EXPLAIN, and DataFusion physical plan
+- [x] Arrow IPC result pages (opt-in via `qsql.resultFormat`) with type-aware grid rendering
 - [x] Plan-graph badges for broadcast and sort pushdowns (multi-surface, evidence-driven)
 - [x] Basic table/column lineage from resolved logical plans
 - [x] Basic joins across registered file, SQLite, Postgres, and MySQL/MariaDB tables
@@ -340,7 +341,7 @@ The daemon exposes a JSON-RPC `version` method with product, daemon, core, conne
 | Phase 6 | Complete | Database-level registration, architecture-review remediation (streaming runtime, scan guards, broadcast-join rewrite, schema cache, generation counters, credential redaction at the JSON-RPC boundary, LSP-style framing). |
 | Phase 7 | Complete | Sort / top-k pushdown formalisation, scan-guard structured error code + UX, evidence-driven broadcast & sort badges, per-table pushed-down SQL cards in the Explain panel, provider-specific icons in the Data Sources explorer. |
 | Phase 8 | Complete | Fixed-width file support: JSON layout sidecar, streaming `TableProvider`/`ExecutionPlan`, two-file VS Code wizard branch, source-profile persistence + replay, parity tests against the CSV equivalent, 100K-row medium-fixture smoke. |
-| Phase 9 | Planned | Arrow IPC result pages with JSON fallback. |
+| Phase 9 | Complete | Arrow IPC result pages: base64-over-stdio transport opt-in (`qsql.resultFormat`), additive `data_ipc` wire field (skip-if-none), VS Code type-aware grid via `apache-arrow` (int64 / decimal / timestamp / null render with full fidelity), daemon-side `serialize_batches_to_ipc_base64` slicing the buffered RecordBatch queue per page, daemon integration tests + 6 TS tests + Criterion bench. |
 | Phase 10 | Planned | Aggregate pushdown, cost-aware federated optimizer, lineage graph view. |
 | Phase 11 | Planned | Packaging, release artifacts, benchmark report gates, and installer smoke tests. |
 

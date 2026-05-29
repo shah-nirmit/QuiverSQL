@@ -140,6 +140,10 @@ enum QuerySession {
         cancellation_token: CancellationToken,
         page_size: usize,
         warning: Option<String>,
+        /// Phase 9 — persisted result format from the initial `query_start`
+        /// so subsequent `query_page` calls reuse the same encoding without
+        /// re-passing it on every request.
+        result_format: Option<String>,
     },
 }
 
@@ -851,6 +855,7 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 Ok(handle) => Arc::new(AsyncMutex::new(handle)),
                 Err(error) => return make_query_error(error),
             };
+            let session_result_format = start_req.result_format.clone();
             {
                 let mut sessions = state.sessions.lock().unwrap();
                 sessions.insert(
@@ -860,19 +865,21 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                         cancellation_token: cancellation_token.clone(),
                         page_size,
                         warning: warning.clone(),
+                        result_format: session_result_format.clone(),
                     },
                 );
             }
 
             let mut handle_guard = handle.lock().await;
             match handle_guard
-                .page(
+                .page_with_format(
                     query_id.clone(),
                     0,
                     page_size,
                     warning,
                     cancellation_token,
                     start_req.timeout_ms,
+                    session_result_format.as_deref(),
                 )
                 .await
             {
@@ -903,7 +910,7 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 });
             };
 
-            let (handle, cancellation_token, default_page_size, warning) = {
+            let (handle, cancellation_token, default_page_size, warning, session_format) = {
                 let sessions = state.sessions.lock().unwrap();
                 let Some(session) = sessions.get(&page_req.query_id) else {
                     return make_query_error(QueryError {
@@ -918,11 +925,13 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                         cancellation_token,
                         page_size,
                         warning,
+                        result_format,
                     } => (
                         handle.clone(),
                         cancellation_token.clone(),
                         *page_size,
                         warning.clone(),
+                        result_format.clone(),
                     ),
                 }
             };
@@ -933,15 +942,20 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
                 },
                 None => (default_page_size, None),
             };
+            // Per-request override wins over the session-level default; if
+            // neither set, falls through to JSON (the engine canonicaliser
+            // treats None as "json").
+            let effective_format = page_req.result_format.clone().or(session_format);
             let mut handle_guard = handle.lock().await;
             match handle_guard
-                .page(
+                .page_with_format(
                     page_req.query_id,
                     page_req.page_index.unwrap_or(0),
                     page_size,
                     request_warning.or(warning),
                     cancellation_token,
                     None,
+                    effective_format.as_deref(),
                 )
                 .await
             {

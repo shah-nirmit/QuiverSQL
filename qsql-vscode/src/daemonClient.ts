@@ -252,10 +252,17 @@ export class DaemonClient {
     }
 
     public startQuery(sql: string, options: { pageSize?: number; timeoutMs?: number } = {}): Promise<QueryPage> {
+        // Phase 9 — opt into Arrow IPC pages when the user has flipped the
+        // setting. The daemon persists this choice on the streaming session
+        // so subsequent `query_page` calls inherit it without re-passing.
+        const resultFormat = vscode.workspace
+            .getConfiguration('qsql')
+            .get<string>('resultFormat', 'json');
         const request: QueryStartRequest = {
             sql,
             page_size: options.pageSize,
-            timeout_ms: options.timeoutMs
+            timeout_ms: options.timeoutMs,
+            ...(resultFormat && resultFormat !== 'json' ? { result_format: resultFormat } : {}),
         };
         return this.sendRequest<QueryPage>('query_start', request);
     }

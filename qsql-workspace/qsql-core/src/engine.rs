@@ -271,6 +271,8 @@ impl QueryResultHandle {
         &self.broadcast_info
     }
 
+    /// Convenience wrapper for the long-standing JSON-default path; forwards
+    /// to [`Self::page_with_format`] with `result_format = None`.
     pub async fn page(
         &mut self,
         query_id: impl Into<String>,
@@ -280,6 +282,50 @@ impl QueryResultHandle {
         cancellation_token: CancellationToken,
         timeout_ms: Option<u64>,
     ) -> Result<QueryPage, QueryError> {
+        self.page_with_format(
+            query_id,
+            page_index,
+            page_size,
+            warning,
+            cancellation_token,
+            timeout_ms,
+            None,
+        )
+        .await
+    }
+
+    /// Streams one page of rows out of the buffered `RecordBatch` queue.
+    ///
+    /// `result_format` selects the wire shape (Phase 9). Accepted values are
+    /// `None` / `Some("json")` (default, populates `QueryPage.data`) and
+    /// `Some("arrow_ipc")` (populates `QueryPage.data_ipc` with a base64
+    /// Arrow IPC stream and leaves `data` empty). Anything else returns a
+    /// structured `-32602 Invalid params` error so callers can surface a
+    /// clean error to end users.
+    ///
+    /// The argument list mirrors the long-standing `page()` shape plus one
+    /// new opt-in field. Grouping them into a struct would only churn every
+    /// caller for no expressiveness gain, so we just opt out of the lint.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn page_with_format(
+        &mut self,
+        query_id: impl Into<String>,
+        page_index: usize,
+        page_size: usize,
+        warning: Option<String>,
+        cancellation_token: CancellationToken,
+        timeout_ms: Option<u64>,
+        result_format: Option<&str>,
+    ) -> Result<QueryPage, QueryError> {
+        let canonical_format = crate::result_ipc::canonicalise_result_format(result_format)
+            .map_err(|bad| QueryError {
+                code: -32602,
+                message: format!(
+                    "Invalid result_format: '{bad}'. Accepted values are 'json' and 'arrow_ipc'."
+                ),
+                details: None,
+            })?;
+
         let query_id = query_id.into();
         let end = page_index.saturating_add(1).saturating_mul(page_size);
         let read_target = end.saturating_add(1);
@@ -288,10 +334,59 @@ impl QueryResultHandle {
 
         let start = page_index.saturating_mul(page_size);
         let end = end.min(self.buffered_rows);
-        let data = if start >= self.buffered_rows {
-            Vec::new()
+        let slice_len = end.saturating_sub(start);
+
+        // Build the format-specific payload. The mutual-exclusion invariant
+        // is enforced here: JSON mode populates `data` and leaves `data_ipc`
+        // None; IPC mode does the inverse. The wire shape's
+        // `skip_serializing_if` keeps existing JSON clients byte-identical
+        // for the default path.
+        let (data, data_ipc, echo_format) = if canonical_format
+            == crate::result_ipc::RESULT_FORMAT_ARROW_IPC
+        {
+            // Convert the QSQL schema mirror back into an Arrow SchemaRef
+            // expected by the IPC writer. The buffered batches already carry
+            // a SchemaRef on each batch's metadata, so reuse the first
+            // batch's schema if available (every batch in the queue shares
+            // the same schema by construction); fall back to the first
+            // batch we have.
+            let arrow_schema =
+                self.batches
+                    .front()
+                    .map(|b| b.schema())
+                    .ok_or_else(|| QueryError {
+                        // We can't synthesise an Arrow schema from the QSQL
+                        // mirror without parsing data-type strings — but in
+                        // practice we always have at least one batch by the
+                        // time a page is requested, even if it's empty. Surface
+                        // a clean error if that invariant breaks.
+                        code: -32603,
+                        message: "Cannot encode Arrow IPC page: no schema buffered yet".to_string(),
+                        details: None,
+                    })?;
+            let payload = crate::result_ipc::serialize_batches_to_ipc_base64(
+                &self.batches,
+                start,
+                slice_len,
+                &arrow_schema,
+            )
+            .map_err(|e| QueryError {
+                code: -32603,
+                message: format!("Failed to encode Arrow IPC page: {e}"),
+                details: None,
+            })?;
+            (
+                Vec::new(),
+                Some(payload),
+                Some(crate::result_ipc::RESULT_FORMAT_ARROW_IPC.to_string()),
+            )
         } else {
-            record_batches_to_json_rows(&self.batches, start, end.saturating_sub(start))?
+            let data = if start >= self.buffered_rows {
+                Vec::new()
+            } else {
+                record_batches_to_json_rows(&self.batches, start, slice_len)?
+            };
+            (data, None, None)
         };
 
         if page_index == 0 && self.first_page_time_ms.is_none() {
@@ -311,12 +406,14 @@ impl QueryResultHandle {
             page_size,
             is_last: self.terminal && end >= self.buffered_rows,
             data,
+            data_ipc,
+            result_format: echo_format,
             metrics: PerformanceMetrics {
                 planning_time_ms: self.planning_time_ms,
                 execution_time_ms: elapsed_ms(self.execution_start),
                 first_page_time_ms,
                 rows_produced,
-                rows_returned: end.saturating_sub(start) as u64,
+                rows_returned: slice_len as u64,
             },
             warning,
         })

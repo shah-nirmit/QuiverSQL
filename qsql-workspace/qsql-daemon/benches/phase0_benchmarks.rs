@@ -441,6 +441,70 @@ fn benchmark_idle_daemon_rss_baseline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Phase 9 — compare the JSON path vs the new Arrow IPC path for paged
+/// result delivery. Encodes a single 10K-row page each way (the streaming
+/// model pages at most ~8192-row batches anyway, so 10K exercises the
+/// multi-batch slicing logic in result_ipc.rs).
+///
+/// We build the source `VecDeque<RecordBatch>` once outside the timed body
+/// — the bench measures _serialisation only_, not query execution.
+fn benchmark_result_page_encoding(c: &mut Criterion) {
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::arrow::record_batch::RecordBatch;
+    use qsql_core::result_ipc::serialize_batches_to_ipc_base64;
+    use std::collections::VecDeque;
+
+    const ROWS: usize = 10_000;
+    const COLS: usize = 4;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("amount", DataType::Int64, false),
+        Field::new("region", DataType::Utf8, false),
+    ]));
+
+    let ids: Vec<i64> = (0..ROWS as i64).collect();
+    let names: Vec<String> = (0..ROWS).map(|i| format!("row_{i}")).collect();
+    let names_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let amounts: Vec<i64> = (0..ROWS as i64).map(|i| i * 7 + 1).collect();
+    let regions: Vec<&str> = (0..ROWS)
+        .map(|i| match i % 3 {
+            0 => "NA",
+            1 => "EU",
+            _ => "APAC",
+        })
+        .collect();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(StringArray::from(names_refs)),
+            Arc::new(Int64Array::from(amounts)),
+            Arc::new(StringArray::from(regions)),
+        ],
+    )
+    .expect("build batch");
+    let mut batches = VecDeque::new();
+    batches.push_back(batch);
+
+    // --- IPC path ---
+    let mut group = c.benchmark_group("result_page_serialize_to_ipc_base64");
+    group.throughput(Throughput::Elements(ROWS as u64));
+    group.bench_function(format!("rows_{ROWS}_cols_{COLS}"), |b| {
+        b.iter_batched(
+            || (&batches, &schema),
+            |(batches, schema)| {
+                let payload =
+                    serialize_batches_to_ipc_base64(batches, 0, ROWS, schema).expect("encode");
+                black_box(payload);
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    group.finish();
+}
+
 fn configure() -> Criterion {
     Criterion::default().sample_size(10)
 }
@@ -456,6 +520,7 @@ criterion_group! {
         benchmark_federated_join,
         benchmark_broadcast_rewrite_csv_join_sqlite,
         benchmark_sort_pushdown,
-        benchmark_idle_daemon_rss_baseline
+        benchmark_idle_daemon_rss_baseline,
+        benchmark_result_page_encoding
 }
 criterion_main!(phase0);

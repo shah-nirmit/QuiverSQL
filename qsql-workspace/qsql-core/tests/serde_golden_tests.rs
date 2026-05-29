@@ -148,6 +148,10 @@ fn test_query_page_golden() {
             json!({ "id": 1, "name": "Alice" }),
             json!({ "id": 2, "name": "Bob" }),
         ],
+        // Phase 9 — the new optional fields stay `None` for the JSON-default
+        // path. Skip-if-none keeps existing JSON-RPC consumers byte-identical.
+        data_ipc: None,
+        result_format: None,
         metrics: PerformanceMetrics {
             planning_time_ms: 3,
             execution_time_ms: 8,
@@ -184,6 +188,64 @@ fn test_query_page_golden() {
             "rows_returned": 2
         },
         "warning": "Page size was clamped."
+    });
+
+    assert_eq!(serde_json::to_value(&page).unwrap(), expected);
+    let deserialized: QueryPage = serde_json::from_value(expected).unwrap();
+    assert_eq!(deserialized, page);
+}
+
+#[test]
+fn test_query_page_arrow_ipc_serialises_with_data_ipc_and_result_format() {
+    // Phase 9 — the IPC-mode page emits the base64 stream under `data_ipc`
+    // and echoes the chosen format under `result_format`. `data` is empty
+    // (mutual-exclusion invariant) and the existing `warning` semantics are
+    // unchanged.
+    let page = QueryPage {
+        query_id: "q_456".to_string(),
+        schema: Schema {
+            fields: vec![SchemaField {
+                name: "id".to_string(),
+                data_type: "Int64".to_string(),
+                nullable: false,
+            }],
+        },
+        page_index: 0,
+        page_size: 100,
+        is_last: true,
+        data: Vec::new(),
+        data_ipc: Some("QVJSCkLAAA==".to_string()), // synthetic base64 marker
+        result_format: Some("arrow_ipc".to_string()),
+        metrics: PerformanceMetrics {
+            planning_time_ms: 1,
+            execution_time_ms: 2,
+            first_page_time_ms: 3,
+            rows_produced: 1,
+            rows_returned: 1,
+        },
+        warning: None,
+    };
+
+    let expected = json!({
+        "query_id": "q_456",
+        "schema": {
+            "fields": [
+                { "name": "id", "data_type": "Int64", "nullable": false }
+            ]
+        },
+        "page_index": 0,
+        "page_size": 100,
+        "is_last": true,
+        "data": [],
+        "data_ipc": "QVJSCkLAAA==",
+        "result_format": "arrow_ipc",
+        "metrics": {
+            "planning_time_ms": 1,
+            "execution_time_ms": 2,
+            "first_page_time_ms": 3,
+            "rows_produced": 1,
+            "rows_returned": 1
+        }
     });
 
     assert_eq!(serde_json::to_value(&page).unwrap(), expected);
@@ -286,6 +348,9 @@ fn test_query_requests_and_cancel_result_golden() {
         sql: "SELECT * FROM employees".to_string(),
         page_size: Some(500),
         timeout_ms: Some(10_000),
+        // Phase 9 — `result_format` is `skip_serializing_if = "Option::is_none"`
+        // so the JSON expected below remains byte-identical with `None`.
+        result_format: None,
     };
     let start_expected = json!({
         "sql": "SELECT * FROM employees",
@@ -300,6 +365,7 @@ fn test_query_requests_and_cancel_result_golden() {
         query_id: "q_1".to_string(),
         page_index: Some(1),
         page_size: Some(500),
+        result_format: None,
     };
     let page_expected = json!({
         "query_id": "q_1",

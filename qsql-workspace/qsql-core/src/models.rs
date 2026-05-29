@@ -76,7 +76,21 @@ pub struct QueryPage {
     pub page_index: usize,
     pub page_size: usize,
     pub is_last: bool,
+    /// Row payload when `result_format == "json"` (the default). Mutually
+    /// exclusive with `data_ipc` — exactly one of the two is populated per
+    /// page.
     pub data: Vec<serde_json::Value>,
+    /// Base64-encoded Arrow IPC stream payload when `result_format ==
+    /// "arrow_ipc"`. Skip-if-none keeps the JSON wire shape byte-identical
+    /// for callers that never opted in (Phase 9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_ipc: Option<String>,
+    /// Echoes back the result format the daemon used to encode this page so
+    /// clients know which of `data` / `data_ipc` to read. Omitted when the
+    /// JSON default is in effect, again preserving byte-identical responses
+    /// for callers that didn't opt in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_format: Option<String>,
     pub metrics: PerformanceMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
@@ -181,6 +195,12 @@ pub struct QueryStartRequest {
     pub page_size: Option<usize>,
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// Phase 9 — opt-in transport format. Accepted values: `"json"` (default
+    /// when None or unset) and `"arrow_ipc"`. The daemon persists the
+    /// chosen format on the streaming session so subsequent `query_page`
+    /// calls reuse it without re-passing the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +210,11 @@ pub struct QueryPageRequest {
     pub page_index: Option<usize>,
     #[serde(default)]
     pub page_size: Option<usize>,
+    /// Phase 9 — same semantics as on [`QueryStartRequest`]. When set on
+    /// `query_page`, overrides the format the session was started with for
+    /// just this page. Omit to inherit the session default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_format: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +283,11 @@ pub fn build_query_page(
         page_size,
         is_last: end >= result.data.len(),
         data,
+        // Phase 9 — `build_query_page` is the legacy non-streaming helper
+        // that only ever produces the JSON path; IPC requires the
+        // streaming `QueryResultHandle::page_with_format` path.
+        data_ipc: None,
+        result_format: None,
         metrics,
         warning,
     }

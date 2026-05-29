@@ -90,6 +90,12 @@
           "type": "integer",
           "default": 30,
           "description": "The timeout (in seconds) for executing remote database queries."
+        },
+        "qsql.resultFormat": {
+          "type": "string",
+          "enum": ["json", "arrow_ipc"],
+          "default": "json",
+          "description": "Transport format for paged query results. `json` (default) returns row objects as JSON in the response — easy to inspect, lossy for int64 / decimal / timestamp. `arrow_ipc` returns a base64-encoded Arrow IPC stream and decodes type-aware on the client — meaningfully faster + smaller for large pages, with full Arrow type fidelity. Setting takes effect on the next query_start; in-flight queries keep their current format."
         }
       }
     },
@@ -173,5 +179,8 @@
     "eslint": "^10.4.0",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.59.4"
+  },
+  "dependencies": {
+    "apache-arrow": "^17.0.0"
   }
 }
