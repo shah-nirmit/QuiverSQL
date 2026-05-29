@@ -16,6 +16,12 @@ Changes since `0.3.0-alpha.0`. Finalises Phase 7 (Sort/Top-K Pushdown + Scan-Gua
 - Added a collapsible `DataFusion Physical Plan` section to the Source tab (collapsed by default) and a legend bar above the plan graph explaining badge colours.
 - Added an `Explain Plan` walkthrough (`USER_GUIDE.md` §8) covering provider icons, the per-table card layout, click-through from Tree to Source, and how each pushdown surfaces visually.
 - The daemon honours `QSQL_EXPLAIN_TRACE=1` as a developer diagnostic that emits one stderr line per physical-plan node during Explain — useful for future Explain capture issues, not exposed as a VS Code setting.
+- **Phase 8 — Fixed-Width File Support.** Custom streaming `TableProvider` + `ExecutionPlan` (`qsql-core/src/fixed_width.rs`) driven by a JSON layout sidecar describing each column's byte-offset, length, SQL type, and nullability. Honours projection + limit pushdown; filter pushdown returns `Unsupported` so DataFusion wraps the scan in `FilterExec`.
+- `RegisterFileRequest` gains an additive `options: Option<HashMap>` field (`#[serde(skip_serializing_if = "Option::is_none")]` for wire compatibility). Daemon engine exposes `register_file` (3-arg shim) plus `register_file_with_options` (full 4-arg form) so existing callers stay untouched.
+- VS Code connect wizard gains a "Fixed-width File" branch with a two-file picker (data + layout). `PersistentSourceProfile.details` gains an optional `layoutPath`; source replay resends `register_file` with `options.layout_path` so persisted fixed-width sources auto-restore across Extension Host restarts.
+- Quickstart sample pair: `samples/quickstart/employees_fwf.txt` (six 79-byte rows mirroring `employees.csv`) + `employees_fwf.layout.json`. New `USER_GUIDE.md` Section 2.C walks through attaching them.
+- Relocated `sql_type_to_arrow` and `schema_from_fields` from `qsql-connectors/src/sql.rs` to `qsql-core/src/sql_types.rs` so the fixed-width module can reuse them without a cross-crate cycle. `qsql-connectors` re-exports the symbols verbatim — existing callers stay byte-identical.
+- New tests: 13 `fixed_width.rs` unit (layout parse, validation, type mapping) + 5 `qsql-daemon/tests/fixed_width_tests.rs` integration (registration + parity vs CSV + 100K-row medium-fixture smoke + missing/bad layout error paths) + 6 `qsql-core/src/sql_types.rs` unit + 2 TypeScript (profile shape, icon registry).
 
 ## 0.3.0-alpha.0 - Unreleased
 

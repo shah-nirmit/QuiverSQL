@@ -679,18 +679,37 @@ impl QsqlEngine {
         }
     }
 
-    /// Registers a local file as a virtual table in the DataFusion context.
+    /// Convenience wrapper for callers that have no format-specific options
+    /// (CSV / JSON / NDJSON / Parquet). Forwards to
+    /// [`Self::register_file_with_options`] with `options = None`.
     pub async fn register_file(
         &self,
         table_name: &str,
         file_path: &str,
         format: &str,
     ) -> Result<String, String> {
+        self.register_file_with_options(table_name, file_path, format, None)
+            .await
+    }
+
+    /// Registers a local file as a virtual table in the DataFusion context.
+    ///
+    /// `options` carries format-specific extras (Phase 8). CSV/JSON/Parquet
+    /// ignore it; the fixed-width arm reads `options["layout_path"]` to
+    /// locate the JSON layout sidecar that describes column spans + types.
+    pub async fn register_file_with_options(
+        &self,
+        table_name: &str,
+        file_path: &str,
+        format: &str,
+        options: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> Result<String, String> {
         let kind = match format.to_lowercase().as_str() {
             "csv" => crate::models::SourceKind::Csv,
             "parquet" => crate::models::SourceKind::Parquet,
             "json" => crate::models::SourceKind::Json,
             "ndjson" => crate::models::SourceKind::Ndjson,
+            "fixed_width" => crate::models::SourceKind::FixedWidth,
             _ => return Err(format!("Unsupported format: {}", format)),
         };
 
@@ -717,7 +736,38 @@ impl QsqlEngine {
                 .await
                 .map_err(|e| format!("Failed to register JSON: {}", e))?;
             }
-            _ => unreachable!(),
+            crate::models::SourceKind::FixedWidth => {
+                // Phase 8 — the fixed-width TableProvider lives in
+                // `crate::fixed_width`. Layout sidecar path comes in via
+                // `options["layout_path"]`; the provider parses the data
+                // file lazily through a streaming ExecutionPlan, so this
+                // arm only builds the provider, not a materialised table.
+                let layout_path = options
+                    .and_then(|m| m.get("layout_path"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        "Fixed-width registration requires options[\"layout_path\"] pointing at a JSON layout file".to_string()
+                    })?;
+                let layout = crate::fixed_width::FixedWidthLayout::from_json_path(layout_path)?;
+                let provider = std::sync::Arc::new(
+                    crate::fixed_width::FixedWidthTableProvider::new(layout, file_path.to_string())?,
+                );
+                // Unlike SQL providers, file-based providers are not wrapped
+                // in `GuardedTableProvider` — same treatment as CSV/Parquet/
+                // NDJSON. A follow-up phase could add file-budget enforcement
+                // uniformly across local file providers.
+                ctx.register_table(table_name, provider)
+                    .map_err(|e| format!("Failed to register fixed-width table: {}", e))?;
+            }
+            // The leading `format` match guarantees no other variant can
+            // reach this point — `register_file_with_options` only deals
+            // with file-backed kinds.
+            crate::models::SourceKind::Sqlite
+            | crate::models::SourceKind::Postgres
+            | crate::models::SourceKind::Mysql
+            | crate::models::SourceKind::Mariadb => unreachable!(
+                "register_file_with_options received a non-file SourceKind — the format-string match above should have rejected it"
+            ),
         }
 
         let provider = ctx
@@ -727,13 +777,33 @@ impl QsqlEngine {
         let provider_schema = provider.schema();
         let qsql_schema = arrow_schema_to_qsql_schema(provider_schema.as_ref());
 
+        // Persisted connection_details — include layout_path so source replay
+        // can find the sidecar on activation (Phase 8E).
+        let mut details = serde_json::Map::new();
+        details.insert(
+            "path".to_string(),
+            serde_json::Value::String(file_path.to_string()),
+        );
+        details.insert(
+            "format".to_string(),
+            serde_json::Value::String(format.to_string()),
+        );
+        if matches!(kind, crate::models::SourceKind::FixedWidth) {
+            if let Some(layout_path) = options
+                .and_then(|m| m.get("layout_path"))
+                .and_then(|v| v.as_str())
+            {
+                details.insert(
+                    "layout_path".to_string(),
+                    serde_json::Value::String(layout_path.to_string()),
+                );
+            }
+        }
+
         let source = CatalogSource {
             name: table_name.to_string(),
             kind,
-            connection_details: serde_json::json!({
-                "path": file_path,
-                "format": format,
-            }),
+            connection_details: serde_json::Value::Object(details),
             schema: Some(qsql_schema),
             capabilities: None,
             status: "ready".to_string(),

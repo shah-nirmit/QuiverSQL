@@ -34,6 +34,49 @@ pub fn generate_medium_csv(path: &Path, rows: usize) {
     }
 }
 
+/// Writes a fixed-width file alongside a JSON layout sidecar.
+///
+/// Data file shape (78-byte rows, newline-terminated):
+///   id     (6 bytes, right-justified INTEGER)
+///   label  (22 bytes, left-justified VARCHAR, "item_<id>")
+///   amount (16 bytes, right-justified DOUBLE, id * 1.5)
+///   filler (34 bytes of spaces — exercises the parser on trailing whitespace)
+///
+/// `path` is the data file; the layout JSON is written to `path` with the
+/// `.layout.json` suffix appended (e.g. `foo.fwf` → `foo.fwf.layout.json`).
+/// Returns the layout path so the caller can pass it as `options.layout_path`.
+pub fn generate_medium_fwf(path: &Path, rows: usize) -> PathBuf {
+    let mut file = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("create FWF {}: {e}", path.display()));
+    for i in 1..=rows {
+        // 6 + 22 + 16 = 44 bytes of data, then 34 trailing spaces for total 78.
+        let line = format!(
+            "{:>6}{:<22}{:>16.1}{:<34}",
+            i,
+            format!("item_{i}"),
+            i as f64 * 1.5,
+            ""
+        );
+        debug_assert_eq!(line.len(), 78);
+        writeln!(file, "{line}").unwrap();
+    }
+
+    let layout_path = path.with_extension(format!(
+        "{}.layout.json",
+        path.extension().and_then(|e| e.to_str()).unwrap_or("dat")
+    ));
+    let layout_json = r#"{
+        "fields": [
+            { "name": "id",     "start": 0,  "length": 6,  "type": "INTEGER", "nullable": false },
+            { "name": "label",  "start": 6,  "length": 22, "type": "VARCHAR", "nullable": false },
+            { "name": "amount", "start": 28, "length": 16, "type": "DOUBLE",  "nullable": false }
+        ]
+    }"#;
+    std::fs::write(&layout_path, layout_json)
+        .unwrap_or_else(|e| panic!("write layout {}: {e}", layout_path.display()));
+    layout_path
+}
+
 /// Creates a SQLite database at `path` with a single table `table_name` and
 /// schema `(id INTEGER, label TEXT, amount REAL)`.
 /// Rows: `id` from 1..=rows, `label = "item_<id>"`, `amount = id * 1.5`.

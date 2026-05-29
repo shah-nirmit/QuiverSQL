@@ -98,6 +98,45 @@ fn benchmark_file_scans(c: &mut Criterion) {
         });
     });
     group.finish();
+
+    // Phase 8 — fixed-width file scan benchmark. Uses the same quickstart
+    // fixture (`employees_fwf.txt` + `employees_fwf.layout.json`) so all
+    // file-format benchmarks read 6 rows of equivalent data.
+    let fwf_engine = RT.block_on(async {
+        let engine = QsqlEngine::new();
+        let mut opts = std::collections::HashMap::new();
+        opts.insert(
+            "layout_path".to_string(),
+            serde_json::Value::String(sample_path("employees_fwf.layout.json")),
+        );
+        engine
+            .register_file_with_options(
+                "employees_fwf",
+                &sample_path("employees_fwf.txt"),
+                "fixed_width",
+                Some(&opts),
+            )
+            .await
+            .expect("register fixed_width");
+        engine
+    });
+
+    let mut group = c.benchmark_group("fixed_width_file_scan_to_json");
+    group.throughput(Throughput::Elements(5));
+    group.bench_function("ordered_limit_5", |b| {
+        b.iter(|| {
+            RT.block_on(async {
+                let result = fwf_engine
+                    .execute_sql_to_json(
+                        "SELECT id, name, salary FROM employees_fwf ORDER BY id LIMIT 5",
+                    )
+                    .await
+                    .expect("query fixed_width");
+                black_box(result);
+            });
+        });
+    });
+    group.finish();
 }
 
 fn benchmark_sqlite_scan(c: &mut Criterion) {

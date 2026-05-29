@@ -93,8 +93,8 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 - [x] SQLite
 - [x] Postgres
 - [x] MySQL / MariaDB
+- [x] Fixed-width files
 - [ ] Excel `.xlsx`
-- [ ] Fixed-width files
 - [ ] SQL Server
 - [ ] Oracle
 - [ ] Snowflake
@@ -155,6 +155,7 @@ The repository implements the early VSIX plus local daemon slice of this diagram
 | SQLite tables | Supported now | SQLite tables register through a DataFusion `TableProvider` with projection/filter/limit SQL pushdown. |
 | Postgres tables | Supported now | Tables can be registered through the daemon and VS Code wizard. Live tests are env-gated with `QSQL_POSTGRES_URL`. |
 | MySQL / MariaDB tables | Supported now | Tables can be registered through a shared MySQL/MariaDB connector. Live tests are env-gated with `QSQL_MYSQL_URL`. |
+| Fixed-width files | Supported now | Custom streaming `TableProvider` + `ExecutionPlan` driven by a JSON layout sidecar (column name, byte-offset, length, SQL type). Honours projection + limit pushdown; filter pushdown is `Unsupported` so DataFusion wraps the scan in a `FilterExec`. |
 | Quickstart sample data | Supported now | CSV, NDJSON, JSON, Parquet, and SQLite samples live in `samples/quickstart/`. |
 | Runtime catalog | Supported now | Daemon tracks source metadata, schema, status, and connector capabilities. |
 | Persisted source replay | Supported now | VS Code stores source profiles and replays them on activation. Database connection strings are stored in SecretStorage. |
@@ -338,7 +339,7 @@ The daemon exposes a JSON-RPC `version` method with product, daemon, core, conne
 | Phase 5 | Complete | Query plan visualization: federated plan graph, Tree/Table/Source tabs, native source plans, truncation safeguards. |
 | Phase 6 | Complete | Database-level registration, architecture-review remediation (streaming runtime, scan guards, broadcast-join rewrite, schema cache, generation counters, credential redaction at the JSON-RPC boundary, LSP-style framing). |
 | Phase 7 | Complete | Sort / top-k pushdown formalisation, scan-guard structured error code + UX, evidence-driven broadcast & sort badges, per-table pushed-down SQL cards in the Explain panel, provider-specific icons in the Data Sources explorer. |
-| Phase 8 | Planned | Fixed-width file provider and wizard support. |
+| Phase 8 | Complete | Fixed-width file support: JSON layout sidecar, streaming `TableProvider`/`ExecutionPlan`, two-file VS Code wizard branch, source-profile persistence + replay, parity tests against the CSV equivalent, 100K-row medium-fixture smoke. |
 | Phase 9 | Planned | Arrow IPC result pages with JSON fallback. |
 | Phase 10 | Planned | Aggregate pushdown, cost-aware federated optimizer, lineage graph view. |
 | Phase 11 | Planned | Packaging, release artifacts, benchmark report gates, and installer smoke tests. |

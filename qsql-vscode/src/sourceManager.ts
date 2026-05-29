@@ -5,10 +5,11 @@ export interface PersistentSourceProfile {
     name: string;
     kind: 'file' | 'sqlite' | 'postgres' | 'mysql' | 'mariadb';
     details: {
-        path?: string;      // for file
-        format?: string;    // for file
-        dbPath?: string;    // for sqlite
-        schema?: string;    // for SQL database schema/database
+        path?: string;        // for file
+        format?: string;      // for file
+        layoutPath?: string;  // for fixed_width file (Phase 8)
+        dbPath?: string;      // for sqlite
+        schema?: string;      // for SQL database schema/database
     };
     secretKey?: string;
 }
@@ -95,11 +96,18 @@ export class SourceManager {
                 }
 
                 if (profile.kind === 'file') {
-                    await this.daemonClient.sendRequest('register_file', {
+                    // Fixed-width files carry an extra layout sidecar — pass it
+                    // through as `options.layout_path` so the daemon's
+                    // `register_file_with_options` arm can find the schema.
+                    const payload: Record<string, unknown> = {
                         table_name: profile.name,
                         path: profile.details.path,
                         format: profile.details.format
-                    });
+                    };
+                    if (profile.details.format === 'fixed_width' && profile.details.layoutPath) {
+                        payload.options = { layout_path: profile.details.layoutPath };
+                    }
+                    await this.daemonClient.sendRequest('register_file', payload);
                 } else if (profile.kind === 'sqlite') {
                     await this.daemonClient.sendRequest('register_sqlite', {
                         db_path: profile.details.dbPath,

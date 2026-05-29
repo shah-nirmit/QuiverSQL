@@ -206,11 +206,82 @@ Lands the Phase 7 finalisation. Replaces structural pattern-matching of the logi
 - Acceptance: `sort: true` in golden JSON; parity tests confirm ORDER BY arrives at SQLite layer; scan guard returns code `-32100`; VS Code renders suggestion banner for guard errors.
 - Acceptance: Section 8 of `USER_GUIDE.md` walks end-to-end through the federated demo and confirms (a) provider icons in the Data Sources tree and on Tree-tab `TableScan` nodes, (b) per-table cards in the Source tab carrying the *actual* pushed-down SQL, (c) the broadcast badge surfaces on the remote scan + Join + local scan even when the post-rewrite optimiser folds the synthesised Filter, (d) the sort badge fires only when every leaf's captured SQL contains `ORDER BY`.
 
-### Phase 8: Fixed-Width File Support
-- Add fixed-width file registration with required layout metadata.
-- Implement custom DataFusion `TableProvider` for fixed-width parsing.
-- Add VS Code connect wizard flow for fixed-width data file plus layout file.
-- Tests: layout parse tests, malformed layout tests, fixed-width query tests, type coercion tests, malformed-row tests, wizard validation tests.
+### Phase 8: Fixed-Width File Support - Complete
+
+Phase 8 turns the existing `SourceKind::FixedWidth` enum variant (already mirrored in TypeScript, the sidebar icon set, and the explain-plan provider-kind table) into a real source. The format dispatch in `engine.rs::register_file` is the only missing arm — Phase 8 adds it, plus the streaming `ExecutionPlan`, layout file format, VS Code wizard branch, sample fixtures, tests, benchmark, and docs.
+
+**Key technical fact**: DataFusion's built-in readers (CSV/Parquet/JSON) infer schemas; fixed-width has no headers, so the layout must be user-supplied. The chosen approach uses a JSON layout file alongside the data file. A streaming `ExecutionPlan` keeps memory bounded the same way `CsvExec` does today.
+
+#### 8A: Layout File + Arrow Schema
+- New module `qsql-workspace/qsql-core/src/fixed_width.rs` with `FixedWidthLayout { fields: Vec<FixedWidthField> }` + serde derives.
+- `FixedWidthField { name, start, length, type, nullable, trim }`.
+- `FixedWidthLayout::from_json_path(path)` / `from_json_str(s)` / `arrow_schema() -> SchemaRef`.
+- Validation: overlapping spans, zero/negative `length`, unknown `type`, empty `fields` list.
+- Relocate `sql_type_to_arrow` from `qsql-connectors/src/sql.rs:99-200` to a new `qsql-core/src/sql_types.rs` and have `qsql-connectors` re-export to avoid a crate cycle.
+
+#### 8B: Streaming TableProvider + ExecutionPlan
+- `FixedWidthTableProvider { layout, path }` impl `TableProvider` — returns `Unsupported` for filter pushdown in v1; honours projection + limit via the exec.
+- `FixedWidthExec` impl `ExecutionPlan` — single partition, `Bounded`, `Incremental`, `DisplayAs` prints `FixedWidthExec path=… rows_read=…`.
+- `FixedWidthRowStream` impl `RecordBatchStream` — `BufReader<File>`, batch size 8192, byte-offset slicing, projection applied during column-building, limit honoured as row counter, parse errors include row + column + offending slice.
+
+#### 8C: Daemon `register_file` Payload Extension
+- Extend `RegisterFileRequest` ([qsql-daemon/src/lib.rs:59](qsql-workspace/qsql-daemon/src/lib.rs)) with `options: Option<HashMap<String, serde_json::Value>>` (skip-if-none for wire compat).
+- Extend `QsqlEngine::register_file` ([qsql-core/src/engine.rs:683](qsql-workspace/qsql-core/src/engine.rs)) with the same `options` argument; CSV/JSON/Parquet arms ignore it.
+- New `"fixed_width"` arm: reads `options["layout_path"]`, loads `FixedWidthLayout`, constructs `FixedWidthTableProvider`, calls `register_table_entry` (not wrapped in `GuardedTableProvider` — same treatment as other local file providers).
+- Mirror `options` in `qsql-vscode/src/models.ts` + `qsql-vscode/src/daemonClient.ts`.
+
+#### 8D: VS Code Wizard Branch (Two-File Picker)
+- Add `Fixed-width File` to the `qsql.connectWizard` quickpick at `qsql-vscode/src/extension.ts:478-486`.
+- New branch: `showOpenDialog` for data file → `showOpenDialog` for layout file (filter `.json`) → `showInputBox` for alias → `register_file` RPC with `format: 'fixed_width'` and `options: { layout_path }`.
+- Bad-file errors → `vscode.window.showErrorMessage` + bail (matches the SQLite picker pattern).
+
+#### 8E: SourceProfile Persistence + Replay
+- Extend `PersistentSourceProfile.details` ([sourceManager.ts:4-14](qsql-vscode/src/sourceManager.ts)) with optional `layoutPath?: string`.
+- Add a `fixed_width` arm to `replaySources()` (`sourceManager.ts:84-132`) resending the same `register_file` payload.
+
+#### 8F: Sample Fixtures
+- `samples/quickstart/employees_fwf.txt` mirroring `employees.csv` row-for-row.
+- `samples/quickstart/employees_fwf.layout.json` describing the spans.
+- Extend `qsql-workspace/qsql-connectors/examples/generate_quickstart_samples.rs` to emit both from the same source rows.
+
+#### 8G: Tests
+- **Layout unit** (`fixed_width.rs`): JSON round-trip; overlapping-spans / zero-length / unknown-type / empty-fields rejection; type-mapping coverage (INTEGER, BIGINT, REAL, DOUBLE, VARCHAR/TEXT, BOOLEAN, DATE, TIMESTAMP).
+- **Stream unit** (`fixed_width.rs`): tiny layout + `Cursor` → expected batches; projection trims columns; limit truncates; UTF-8 multi-byte rows; ragged-row → error with row index.
+- **Daemon integration** (new `qsql-workspace/qsql-daemon/tests/fixed_width_tests.rs`): JSON-RPC `register_file` with `format: "fixed_width"`, then `execute` confirms row-set parity vs the CSV equivalent.
+- **Medium fixture smoke** (Phase 7E pattern): `generate_medium_fwf(path, rows)` added to `tests/common/fixtures.rs`; 100K rows; `SELECT id FROM t ORDER BY id DESC LIMIT 3`; first `id == 100_000`.
+- **VS Code** (`detectQueries.test.ts`): wizard payload carries `format: 'fixed_width'` + `options.layout_path`.
+
+#### 8H: Benchmark
+- Add `fixed_width_file_scan_1k_rows` and `fixed_width_file_scan_to_json` groups to `qsql-workspace/qsql-daemon/benches/phase0_benchmarks.rs`, mirroring the existing CSV pattern.
+
+#### 8I: Documentation
+- `USER_GUIDE.md` — new Section 2.C with layout JSON example + smoke query.
+- `README.md` — `Fixed-width files` row Planned → Supported; intro paragraph updated.
+- `CHANGELOG.md` — Phase 8 bullet under the running `0.3.1-alpha.0 - Unreleased` block.
+- `implementation_plan.md` — this section's status flipped `Current → Complete` on landing.
+- `current_phase_task.md` — checkboxes ticked as work lands.
+
+#### 8J: Clippy + Housekeeping
+- Roll in the two pre-existing clippy fixes from the previous turn: `qsql-connectors/src/lib.rs` (move `mod tests` to end of file) and `qsql-daemon/src/lib.rs:1563` (drop `.clone()` on the Copy `ConnectorErrorKind`).
+- Re-run `cargo clippy --locked --workspace --all-targets -- -D warnings` after each wave; the gate stays green throughout Phase 8.
+
+#### 8 Verification
+- `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace` green.
+- `cargo check --locked -p qsql-daemon --benches` benchmark compile smoke.
+- `npm run typecheck && npm run lint && npm run test` green.
+- Acceptance: `register_file` with `format: "fixed_width"` + `options.layout_path` registers a queryable table; rows match the CSV equivalent under `ORDER BY id`.
+- Acceptance: Explain on the fixed-width table shows `provider_kind: "fixed_width"` and renders the fixed-width glyph on the `TableScan` node.
+- Acceptance: Restarting the Extension Host replays the persisted fixed-width source with no re-prompt.
+- Acceptance: An overlapping-spans layout, a zero-length field, and an unknown type each produce a descriptive `register_file` error (not a panic).
+
+#### 8 Parallelization Plan
+| Wave | Sub-phases (parallel) | Depends on |
+|------|------------------------|------------|
+| Wave 1 | 8A · 8C · 8F · 8J | none — all independent |
+| Wave 2 | 8B · 8D | Wave 1 (8B needs 8A's schema builder; 8D needs 8C's payload field) |
+| Wave 3 | 8E · 8G layout+stream · 8H | Wave 2 |
+| Wave 4 | 8G daemon-integration + VS Code tests | Wave 3 |
+| Wave 5 | 8I docs + final clippy + amend | All above |
 
 ### Phase 9: Arrow IPC Result Pages
 - Add Arrow IPC for large/requested result pages (base64 initially over stdio).

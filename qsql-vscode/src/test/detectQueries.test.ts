@@ -645,6 +645,46 @@ function testPlanVisualizationGracefulWhenNoRemoteSources() {
 }
 
 // -------------------------------------------------------------
+// 3e. Phase 8 — Fixed-Width Source Tests
+// -------------------------------------------------------------
+
+import {
+    PersistentSourceProfile,
+} from '../sourceManager';
+
+function testFixedWidthSourceProfileShape() {
+    // The Phase 8 layout sidecar lives in `details.layoutPath`. The test
+    // pins the shape so the daemon side (which reads
+    // `options.layout_path`) stays in lockstep with the persisted profile.
+    const profile: PersistentSourceProfile = {
+        name: 'employees_fwf',
+        kind: 'file',
+        details: {
+            path: '/sample/employees_fwf.txt',
+            format: 'fixed_width',
+            layoutPath: '/sample/employees_fwf.layout.json',
+        },
+    };
+    assert.strictEqual(profile.details.format, 'fixed_width');
+    assert.strictEqual(profile.details.layoutPath, '/sample/employees_fwf.layout.json');
+    // Round-trip through JSON to guarantee the optional field is serialisable
+    // exactly the way `globalState.update` will persist it.
+    const roundTripped = JSON.parse(JSON.stringify(profile));
+    assert.strictEqual(roundTripped.details.layoutPath, '/sample/employees_fwf.layout.json');
+    console.log("OK testFixedWidthSourceProfileShape passed!");
+}
+
+function testFixedWidthIconRegistryStillCoversKind() {
+    // The provider-icon registry was authored in Phase 7H; this test guards
+    // against silently losing fixed-width during a future refactor.
+    const kinds = allIconKinds();
+    assert.ok(kinds.includes('fixed_width' as any));
+    assert.strictEqual(labelFor('fixed_width'), 'Fixed-width');
+    assert.strictEqual(iconSymbolIdFor('fixed_width'), 'icon-fixed_width');
+    console.log("OK testFixedWidthIconRegistryStillCoversKind passed!");
+}
+
+// -------------------------------------------------------------
 // 4. Test Suite Execution
 // -------------------------------------------------------------
 async function runAll() {
@@ -678,6 +718,8 @@ async function runAll() {
         testSvgSymbolsLibraryEmbedsAllKinds();
         testPlanVisualizationRendersPerTableCards();
         testPlanVisualizationGracefulWhenNoRemoteSources();
+        testFixedWidthSourceProfileShape();
+        testFixedWidthIconRegistryStillCoversKind();
         console.log("\nALL SCANNER TESTS PASSED SUCCESSFULLY!");
     } catch (err) {
         console.error("\nTEST FAILURE DETECTED:");

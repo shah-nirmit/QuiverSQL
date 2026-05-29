@@ -4,10 +4,14 @@
 //! `datafusion-table-providers` and `datafusion-federation`. This module keeps
 //! only QuiverSQL-owned dialect metadata needed for catalog capabilities,
 //! source-native explain labels, and lightweight schema helpers.
+//!
+//! Type-name → Arrow mapping moved to `qsql_core::sql_types` in Phase 8 so the
+//! new fixed-width module can reuse it; re-exported below for backward
+//! compatibility with existing connector code.
 
-use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+
+pub use qsql_core::sql_types::{schema_from_fields, sql_type_to_arrow};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -96,122 +100,17 @@ pub fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-pub fn sql_type_to_arrow(sql_type: &str) -> Result<DataType, String> {
-    let upper = sql_type.trim().to_uppercase();
-
-    // Detect and strip UNSIGNED/SIGNED modifier (may appear after a length spec
-    // e.g. "TINYINT(1) UNSIGNED").
-    let (without_modifier, unsigned) = if upper.ends_with(" UNSIGNED") {
-        (&upper[..upper.len() - 9], true)
-    } else if upper.ends_with(" SIGNED") {
-        (&upper[..upper.len() - 7], false)
-    } else {
-        (upper.as_str(), false)
-    };
-
-    // Strip length/precision suffix: VARCHAR(255) → VARCHAR, DECIMAL(10,2) → DECIMAL
-    let base = match without_modifier.find('(') {
-        Some(idx) => without_modifier[..idx].trim(),
-        None => without_modifier.trim(),
-    };
-
-    match base {
-        // ── Boolean ──────────────────────────────────────────────────────────
-        "BOOL" | "BOOLEAN" => Ok(DataType::Boolean),
-
-        // ── Integers ─────────────────────────────────────────────────────────
-        "TINYINT" | "INT1" => {
-            if unsigned {
-                Ok(DataType::UInt8)
-            } else {
-                Ok(DataType::Int8)
-            }
-        }
-        "SMALLINT" | "INT2" | "SMALLSERIAL" | "SERIAL2" => {
-            if unsigned {
-                Ok(DataType::UInt16)
-            } else {
-                Ok(DataType::Int16)
-            }
-        }
-        "MEDIUMINT" | "INT" | "INTEGER" | "INT4" | "SERIAL" | "SERIAL4" => {
-            if unsigned {
-                Ok(DataType::UInt32)
-            } else {
-                Ok(DataType::Int32)
-            }
-        }
-        "BIGINT" | "INT8" | "BIGSERIAL" | "SERIAL8" => {
-            if unsigned {
-                Ok(DataType::UInt64)
-            } else {
-                Ok(DataType::Int64)
-            }
-        }
-        "YEAR" => Ok(DataType::Int16),
-
-        // ── OID / system types ───────────────────────────────────────────────
-        "OID" | "XID" | "XID8" | "CID" | "REGCLASS" | "REGTYPE" | "REGPROC" => Ok(DataType::UInt32),
-
-        // ── Floating point ───────────────────────────────────────────────────
-        "REAL" | "FLOAT" | "FLOAT4" => Ok(DataType::Float32),
-        "DOUBLE" | "DOUBLE PRECISION" | "FLOAT8" => Ok(DataType::Float64),
-        // TODO: use Decimal128(precision, scale) once the parametrised form is parsed
-        "NUMERIC" | "DECIMAL" | "DEC" | "MONEY" => Ok(DataType::Float64),
-
-        // ── Date / time ──────────────────────────────────────────────────────
-        "DATE" => Ok(DataType::Date32),
-        "TIME" | "TIME WITHOUT TIME ZONE" | "TIMETZ" | "TIME WITH TIME ZONE" => {
-            Ok(DataType::Time64(TimeUnit::Microsecond))
-        }
-        "TIMESTAMP" | "TIMESTAMP WITHOUT TIME ZONE" | "DATETIME" => {
-            Ok(DataType::Timestamp(TimeUnit::Microsecond, None))
-        }
-        "TIMESTAMP WITH TIME ZONE" | "TIMESTAMPTZ" => Ok(DataType::Timestamp(
-            TimeUnit::Microsecond,
-            Some("UTC".into()),
-        )),
-        "INTERVAL" => Ok(DataType::Duration(TimeUnit::Microsecond)),
-
-        // ── Binary ───────────────────────────────────────────────────────────
-        "BYTEA" | "BINARY" | "VARBINARY" | "TINYBLOB" | "BLOB" | "MEDIUMBLOB" | "LONGBLOB"
-        | "BIT" | "VARBIT" | "BIT VARYING" => Ok(DataType::Binary),
-
-        // ── Text / string ────────────────────────────────────────────────────
-        "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" | "CHAR" | "VARCHAR"
-        | "CHARACTER VARYING" | "CHARACTER" | "NCHAR" | "NVARCHAR" | "JSON" | "JSONB"
-        | "JSONPATH" | "UUID" | "INET" | "CIDR" | "MACADDR" | "MACADDR8" | "XML" | "TSVECTOR"
-        | "TSQUERY" | "ENUM" | "SET" | "PG_LSN" | "PG_SNAPSHOT" => Ok(DataType::Utf8),
-
-        // ── Geometry / spatial ───────────────────────────────────────────────
-        "GEOMETRY" | "POINT" | "LINESTRING" | "POLYGON" | "MULTIPOINT" | "MULTILINESTRING"
-        | "MULTIPOLYGON" | "GEOMETRYCOLLECTION" | "LINE" | "LSEG" | "BOX" | "PATH" | "CIRCLE" => {
-            Ok(DataType::Binary)
-        }
-
-        // ── SQLite typeless columns return an empty string ───────────────────
-        "" => Ok(DataType::Utf8),
-
-        _ => Err(format!(
-            "Unrecognised SQL type: '{}'. Cannot determine Arrow DataType.",
-            sql_type
-        )),
-    }
-}
-
-pub fn schema_from_fields(fields: Vec<(String, String, bool)>) -> Result<SchemaRef, String> {
-    let arrow_fields = fields
-        .into_iter()
-        .map(|(name, sql_type, nullable)| {
-            sql_type_to_arrow(&sql_type).map(|dt| Field::new(name, dt, nullable))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Arc::new(Schema::new(arrow_fields)))
-}
+// `sql_type_to_arrow` and `schema_from_fields` live in `qsql_core::sql_types`
+// (re-exported above). See that module for unit tests covering type mapping
+// and schema construction.
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests use Arrow types directly to assert the re-exported
+    // `sql_type_to_arrow` / `schema_from_fields` mappings; importing locally
+    // since the parent module no longer needs these symbols at all.
+    use datafusion::arrow::datatypes::{DataType, TimeUnit};
 
     #[test]
     fn quotes_reserved_and_mixed_case_identifiers() {

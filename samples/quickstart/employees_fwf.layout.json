@@ -1,0 +1,10 @@
+{
+  "fields": [
+    { "name": "id",            "start": 0,  "length": 6,  "type": "INTEGER", "nullable": false },
+    { "name": "name",          "start": 6,  "length": 24, "type": "VARCHAR", "nullable": false },
+    { "name": "department_id", "start": 30, "length": 2,  "type": "INTEGER", "nullable": false },
+    { "name": "role",          "start": 32, "length": 25, "type": "VARCHAR", "nullable": false },
+    { "name": "salary",        "start": 57, "length": 6,  "type": "INTEGER", "nullable": false },
+    { "name": "location",      "start": 63, "length": 16, "type": "VARCHAR", "nullable": false }
+  ]
+}

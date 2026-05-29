@@ -47,6 +47,49 @@ In the **Extension Development Host**, open the QuiverSQL sidebar by clicking th
 4. Open the Command Palette and run **QuiverSQL: Attach SQLite Database**.
 5. Select `samples/quickstart/demo.sqlite` and provide the alias `sqlite`.
 
+### C. Attaching a Fixed-Width File
+
+Fixed-width text files have no header row, so QuiverSQL needs a JSON **layout sidecar** that describes each column's byte-offset, length, type, and nullability. The repository ships a sample pair under `samples/quickstart/`:
+
+- `employees_fwf.txt` — the data file, six 79-byte rows mirroring `employees.csv` row-for-row.
+- `employees_fwf.layout.json` — the matching layout. Each entry binds a column name to a byte span and a SQL type:
+
+  ```json
+  {
+    "fields": [
+      { "name": "id",            "start": 0,  "length": 6,  "type": "INTEGER", "nullable": false },
+      { "name": "name",          "start": 6,  "length": 24, "type": "VARCHAR", "nullable": false },
+      { "name": "department_id", "start": 30, "length": 2,  "type": "INTEGER", "nullable": false },
+      { "name": "role",          "start": 32, "length": 25, "type": "VARCHAR", "nullable": false },
+      { "name": "salary",        "start": 57, "length": 6,  "type": "INTEGER", "nullable": false },
+      { "name": "location",      "start": 63, "length": 16, "type": "VARCHAR", "nullable": false }
+    ]
+  }
+  ```
+
+  Type names accept any SQL spelling that QuiverSQL's connectors already understand — `INTEGER`, `BIGINT`, `VARCHAR`, `DOUBLE`, `BOOLEAN`, `TIMESTAMP`, etc. Strings are ASCII-trimmed by default; flip `"trim": false` per field if you need the literal padded value.
+
+To attach the sample:
+
+1. Open the Command Palette and run **QuiverSQL: Connect Data Source**.
+2. Pick **Fixed-width File**.
+3. Select `samples/quickstart/employees_fwf.txt` as the data file.
+4. Select `samples/quickstart/employees_fwf.layout.json` as the layout JSON.
+5. Confirm the table alias `employees_fwf`.
+
+Smoke query (run from a new `.sql` buffer):
+
+```sql
+SELECT id, name, role, salary
+FROM employees_fwf
+WHERE salary > 90000
+ORDER BY salary DESC;
+```
+
+Returns the same three high earners as the CSV-backed `employees` table — that's the row-for-row parity the daemon integration test asserts (`fixed_width_matches_csv_equivalent_row_for_row` in `qsql-daemon/tests/fixed_width_tests.rs`).
+
+If the layout file has overlapping spans, an unknown type, a zero-length field, or an empty `fields` array, registration fails with a descriptive error pointing at the offending field — the wizard surfaces this through a standard error banner so you can fix the layout and retry without touching the daemon.
+
 ### B. Connecting Remote Databases
 1. Click the **+** (Connect Data Source) icon in the Data Sources view header (or run **QuiverSQL: Connect Data Source**).
 2. Connect PostgreSQL:

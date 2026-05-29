@@ -1,0 +1,6 @@
+     1Alice Rao               10Data Engineer             98000New York        
+     2Bob Chen                20Account Executive         72000Chicago         
+     3Carla Mendes            10Analytics Engineer        91000Austin          
+     4Dev Patel               30Marketing Manager         83000San Francisco   
+     5Emma Brooks             40People Partner            76000Chicago         
+     6Finn Morgan             10Platform Engineer        105000Seattle         

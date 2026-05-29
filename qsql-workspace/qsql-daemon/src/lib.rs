@@ -60,6 +60,12 @@ struct RegisterFileRequest {
     table_name: String,
     path: String,
     format: String,
+    /// Format-specific extras. CSV/JSON/Parquet ignore it; the fixed-width
+    /// path consumes `options["layout_path"]` to locate the JSON layout
+    /// sidecar (Phase 8). Omitted on the wire when None so existing clients
+    /// stay byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    options: Option<HashMap<String, serde_json::Value>>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -450,7 +456,12 @@ pub async fn handle_request(req: RpcRequest, state: DaemonState) -> RpcResponse 
             };
             match state
                 .engine
-                .register_file(&file_req.table_name, &file_req.path, &file_req.format)
+                .register_file_with_options(
+                    &file_req.table_name,
+                    &file_req.path,
+                    &file_req.format,
+                    file_req.options.as_ref(),
+                )
                 .await
             {
                 Ok(res) => make_success(serde_json::Value::String(res)),

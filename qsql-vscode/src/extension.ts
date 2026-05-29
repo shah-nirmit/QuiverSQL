@@ -479,6 +479,7 @@ export async function activate(context: vscode.ExtensionContext) {
             { label: '$(file) CSV File', description: 'Attach a local Comma-Separated Values file', type: 'csv' },
             { label: '$(file-binary) Parquet File', description: 'Attach a local binary Parquet file', type: 'parquet' },
             { label: '$(json) JSON File', description: 'Attach a local JSON or NDJSON file', type: 'json' },
+            { label: '$(file-text) Fixed-width File', description: 'Attach a fixed-width text file plus a JSON layout sidecar describing column spans', type: 'fixed_width' },
             { label: '$(database) SQLite Database', description: 'Attach a SQLite database file', type: 'sqlite' },
             { label: '$(database) Postgres', description: 'Attach a Postgres database or schema using a connection string', type: 'postgres' },
             { label: '$(database) MySQL', description: 'Attach a MySQL database using a connection string', type: 'mysql' },
@@ -575,6 +576,60 @@ export async function activate(context: vscode.ExtensionContext) {
             } catch (e: any) {
                 vscode.window.showErrorMessage(`Failed to attach ${engineLabel} database: ${e.message || JSON.stringify(e)}`);
             }
+        } else if (type === 'fixed_width') {
+            // Fixed-width files need an extra JSON layout sidecar describing
+            // each column's byte-span and SQL type. The wizard collects both
+            // files plus an alias, then sends register_file with
+            // options.layout_path so the daemon can build a
+            // FixedWidthTableProvider (Phase 8B).
+            const dataFileUri = await vscode.window.showOpenDialog({
+                canSelectMany: false,
+                openLabel: 'Select fixed-width data file',
+                filters: {
+                    'Fixed-width Data': ['txt', 'dat', 'fwf'],
+                    'All Files': ['*']
+                }
+            });
+            if (!dataFileUri || dataFileUri.length === 0) return;
+            const dataPath = dataFileUri[0].fsPath;
+
+            const layoutFileUri = await vscode.window.showOpenDialog({
+                canSelectMany: false,
+                openLabel: 'Select layout JSON file (column spans + types)',
+                filters: {
+                    'Layout JSON': ['json']
+                }
+            });
+            if (!layoutFileUri || layoutFileUri.length === 0) return;
+            const layoutPath = layoutFileUri[0].fsPath;
+
+            const defaultAlias = dataPath.split(/[\\/]/).pop()?.split('.')[0] || 'fwf_table';
+            const alias = await vscode.window.showInputBox({
+                prompt: 'Enter Table Alias for this fixed-width file',
+                placeHolder: defaultAlias,
+                value: defaultAlias,
+                validateInput: (value) => value.trim().length === 0 ? 'Alias is required' : null
+            });
+            if (!alias) return;
+
+            try {
+                const result = await daemonClient.sendRequest('register_file', {
+                    table_name: alias,
+                    path: dataPath,
+                    format: 'fixed_width',
+                    options: { layout_path: layoutPath }
+                });
+                vscode.window.showInformationMessage(result);
+
+                await sourceManager.addSource(alias, 'file', {
+                    path: dataPath,
+                    format: 'fixed_width',
+                    layoutPath: layoutPath
+                });
+                dataSourcesProvider.refresh();
+            } catch (e: any) {
+                vscode.window.showErrorMessage(`Failed to attach fixed-width file: ${e.message || JSON.stringify(e)}`);
+            }
         } else {
             // File Connection Steps
             // Step 2a: Select File
@@ -612,7 +667,7 @@ export async function activate(context: vscode.ExtensionContext) {
                     format: type
                 });
                 vscode.window.showInformationMessage(result);
-                
+
                 // Persist the source and refresh
                 await sourceManager.addSource(alias, 'file', {
                     path: filePath,
